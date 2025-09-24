@@ -1,0 +1,23 @@
+2025/08/15-09:02:51.496 49f4 Reusing MANIFEST C:\Users\OptiPlex 7080\Desktop\Agendador\.wwebjs_auth\session\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/08/15-09:02:51.496 49f4 Recovering log #448
+2025/08/15-09:02:51.525 49f4 Reusing old log C:\Users\OptiPlex 7080\Desktop\Agendador\.wwebjs_auth\session\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000448.log 
+2025/08/15-09:02:51.525 49f4 Delete type=2 #442
+2025/08/15-09:02:51.525 49f4 Delete type=2 #443
+2025/08/15-09:02:51.525 49f4 Delete type=2 #444
+2025/08/15-09:02:51.525 49f4 Delete type=2 #445
+2025/08/15-09:02:51.525 49f4 Delete type=2 #446
+2025/08/15-09:02:52.960 3a60 Level-0 table #457: started
+2025/08/15-09:02:52.965 3a60 Level-0 table #457: 247566 bytes OK
+2025/08/15-09:02:52.967 3a60 Delete type=0 #448
+2025/08/15-09:02:52.967 3a60 Manual compaction at level-0 from '\x00\x1c\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x1d\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/08/15-09:02:52.967 3a60 Manual compaction at level-1 from '\x00\x1c\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x1d\x00\x00\x00' @ 0 : 0; will stop at '\x00\x1c\x00\x00\x05' @ 1756501 : 1
+2025/08/15-09:02:52.967 3a60 Compacting 1@1 + 5@2 files
+2025/08/15-09:02:53.016 3a60 Generated table #458@1: 40721 keys, 2201628 bytes
+2025/08/15-09:02:53.043 3a60 Generated table #459@1: 2618 keys, 2157035 bytes
+2025/08/15-09:02:53.070 3a60 Generated table #460@1: 6992 keys, 2155180 bytes
+2025/08/15-09:02:53.130 3a60 Generated table #461@1: 39124 keys, 2259460 bytes
+2025/08/15-09:02:53.157 3a60 Generated table #462@1: 27885 keys, 910504 bytes
+2025/08/15-09:02:53.157 3a60 Compacted 1@1 + 5@2 files => 9683807 bytes
+2025/08/15-09:02:53.158 3a60 compacted to: files[ 0 0 5 0 0 0 0 ]
+2025/08/15-09:02:53.159 3a60 Delete type=2 #457
+2025/08/15-09:02:53.159 3a60 Manual compaction at level-1 from '\x00\x1c\x00\x00\x05' @ 1756501 : 1 .. '\x00\x1d\x00\x00\x00' @ 0 : 0; will stop at (end)

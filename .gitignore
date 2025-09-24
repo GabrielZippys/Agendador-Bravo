@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.log
+
+# Build/instaladores
+dist/
+build/
+*.exe
+*.msi
+*.dll
+*.pdb
+
+# Logs do app
+AgendadorBravo/logs/
+*.log
+
+# Node / WhatsApp
+wa/node_modules/
+wa/.local-chromium/
+node_modules/
