@@ -12,6 +12,39 @@ icon=['Logo.ico'],
 # --- AUTOUPDATE (com aviso na UI) -------------------------------------------
 import urllib.request, hashlib, tempfile
 
+# --- CONECTIVIDADE / FILA DE ATUALIZAÇÕES ----------------------------------
+NET_CHECK_EVERY_SEC = int(os.getenv("AGENDADOR_NET_EVERY_SEC", "10"))
+NET_FLAP_STABLE = int(os.getenv("AGENDADOR_NET_STABLE", "2"))
+UPDATE_QUEUE_MAX = 50
+
+def is_online(timeout=3) -> bool:
+    try:
+        urllib.request.urlopen("https://www.gstatic.com/generate_204", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STABLE):
+    def worker():
+        last = None
+        same = 0
+        while True:
+            ok = is_online()
+            if ok == last:
+                same += 1
+            else:
+                same = 0
+                last = ok
+            if same >= stable and app_ref and app_ref.winfo_exists():
+                try:
+                    app_ref.after(0, lambda s=ok: app_ref.on_net_status_change(s))
+                except Exception:
+                    pass
+            time.sleep(max(2, int(interval)))
+    threading.Thread(target=worker, daemon=True).start()
+# --- /CONECTIVIDADE ----------------------------------------------------------
+
+
 APP_VERSION = "2025.09.15.0"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
@@ -91,6 +124,7 @@ def fetch_update_info() -> tuple[bool, dict | str]:
     except Exception as e:
         return (False, f"Falha ao checar: {e}")
 
+
 def apply_update_now(info: dict) -> tuple[bool, str]:
     """
     Baixa e troca o EXE. Em modo dev (não frozen), só informa.
@@ -112,22 +146,35 @@ def apply_update_now(info: dict) -> tuple[bool, str]:
         return (False, f"Falha ao aplicar: {e}")
 
 def start_auto_update_thread(app_ref):
-    """Checa no início e depois periodicamente; avisa a UI se houver nova versão."""
+    """Checa no início e depois periodicamente; se offline, enfileira a checagem."""
     def worker():
         time.sleep(20)  # deixa a UI abrir
-        for _ in range(2):  # checa agora e logo depois agenda
+        def _enqueue_check():
+            try:
+                if app_ref and app_ref.winfo_exists():
+                    app_ref.enqueue_update("check")  # dedupe automático
+            except Exception:
+                pass
+
+        # tentativa imediata (ou fila se offline)
+        if app_ref and getattr(app_ref, "net_online", True):
             has, data = fetch_update_info()
             if has and app_ref and app_ref.winfo_exists():
-                # passa o dict para a UI criar o aviso
                 app_ref.after(0, lambda d=data: app_ref.on_update_available(d))
-            break
+        else:
+            _enqueue_check()
+
         # ciclo
         while True:
             time.sleep(max(60, UPDATE_CHECK_EVERY_MIN * 60))
-            has, data = fetch_update_info()
-            if has and app_ref and app_ref.winfo_exists():
-                app_ref.after(0, lambda d=data: app_ref.on_update_available(d))
+            if app_ref and getattr(app_ref, "net_online", True):
+                has, data = fetch_update_info()
+                if has and app_ref and app_ref.winfo_exists():
+                    app_ref.after(0, lambda d=data: app_ref.on_update_available(d))
+            else:
+                _enqueue_check()
     threading.Thread(target=worker, daemon=True).start()
+
 # --- /AUTOUPDATE -------------------------------------------------------------
 
 # Tema opcional
@@ -1073,46 +1120,67 @@ class SettingsDialog(tk.Toplevel):
 # ======================================================================================
 
 class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title(APP_NAME)
-        self.geometry("1060x600")
-        self.attributes("-alpha", 0.0)  # fade-in
-        ensure_dirs()
-        self.data = load_data()
-        self.scheduler = BackgroundScheduler(job_defaults={"max_instances": 1, "coalesce": True})
-        self.jobs = {}
 
-        # Estilos
-        style = ttk.Style(self)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", padding=4)
-        style.configure("TLabel", font=("Segoe UI", 9))
+     # ===== Conectividade / Fila de updates =====
+    def on_net_status_change(self, online: bool):
+        if online == getattr(self, "net_online", None):
+            return
+        self.net_online = online
+        self.update_net_indicator()
+        if online:
+            self.set_status_line("Conexão restaurada. Processando fila de atualizações…")
+            self.process_update_queue()
+        else:
+            self.set_status_line("Sem internet. Atualizações pausadas.")
+        self.data["update_queue"] = self.update_queue
+        save_data(self.data)
 
-        # Cabeçalho (logo + título + tema)
-        header = ttk.Frame(self, padding=(8, 6))
-        header.pack(fill="x")
+    def update_net_indicator(self):
+        self.lbl_net.config(foreground=self._status_color(bool(self.net_online)))
 
-        # --- Banner de atualização (inicialmente oculto) ---
-        self._update_info = None
-        self._update_banner = ttk.Frame(self, padding=(8, 6))
-        self._update_banner.pack(fill="x")
-        self._update_banner.pack_forget()
+    def enqueue_update(self, op: str, info: dict | None = None, dedup=True) -> bool:
+        if dedup and op == "check" and any(x.get("op") == "check" for x in self.update_queue):
+            return False
+        self.update_queue.append({"op": op, "info": info or {}, "ts": now_str()})
+        if len(self.update_queue) > UPDATE_QUEUE_MAX:
+            del self.update_queue[:-UPDATE_QUEUE_MAX]
+        self.data["update_queue"] = self.update_queue
+        save_data(self.data)
+        try:
+            self.status_label.config(text=f"Atualizações enfileiradas: {len(self.update_queue)}")
+        except Exception:
+            pass
+        return True
 
-        self._lbl_update = ttk.Label(self._update_banner, text="", font=("Segoe UI", 10, "bold"))
-        self._lbl_update.pack(side="left")
+    def process_update_queue(self):
+        if self._update_processing or not self.net_online or not self.update_queue:
+            return
+        self._update_processing = True
+        item = self.update_queue.pop(0)
+        self.data["update_queue"] = self.update_queue
+        save_data(self.data)
 
-        btns_up = ttk.Frame(self._update_banner)
-        btns_up.pack(side="right")
-        ttk.Button(btns_up, text="Atualizar agora", command=self.apply_update_from_banner).pack(side="left", padx=4)
-        ttk.Button(btns_up, text="Mais tarde", command=lambda: self._update_banner.pack_forget()).pack(side="left", padx=4)
+        def _do():
+            try:
+                op = item.get("op")
+                if op == "check":
+                    has, data = fetch_update_info()
+                    if has and self.winfo_exists():
+                        self.after(0, lambda d=data: self.on_update_available(d))
+                elif op == "apply":
+                    ok, msg = apply_update_now(item.get("info") or {})
+                    if self.winfo_exists():
+                        self.after(0, lambda m=msg: messagebox.showinfo("Atualizações", m))
+                time.sleep(8)
+            finally:
+                if self.winfo_exists():
+                    self.after(0, self._process_queue_finish)
+        threading.Thread(target=_do, daemon=True).start()
 
-        # ... (o resto do seu __init__ permanece igual)
-
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        # inicia checagem automática de atualização
-        start_auto_update_thread(self)
+    def _process_queue_finish(self):
+        self._update_processing = False
+        if self.update_queue and self.net_online:
+            self.after(3000, self.process_update_queue)
 
     # ===== avisos de atualização =====
     def on_update_available(self, info: dict):
@@ -1153,6 +1221,11 @@ class App(tk.Tk):
         # Deixa explícito (1 instância por job, coalesce)
         self.scheduler = BackgroundScheduler(job_defaults={"max_instances": 1, "coalesce": True})
         self.jobs = {}
+        # Estado de rede / fila de updates
+        self.net_online = is_online()
+        self._update_processing = False
+        self.update_queue = self.data.setdefault("update_queue", [])  # persiste no JSON
+
 
         # Estilos
         style = ttk.Style(self)
@@ -1312,6 +1385,8 @@ class App(tk.Tk):
         # --------- Status bar ----------
         status = ttk.Frame(self, relief="groove", padding=(6,3)); status.pack(fill="x")
         self.status_label = ttk.Label(status, text="Pronto."); self.status_label.pack(side="left")
+        self.lbl_net = ttk.Label(status, text="Internet ●")
+        self.lbl_net.pack(side="right", padx=(0,12))
         self.lbl_mail = ttk.Label(status, text="E-mail ●"); self.lbl_mail.pack(side="right", padx=(0,12))
         self.lbl_wa   = ttk.Label(status, text="WhatsApp ●"); self.lbl_wa.pack(side="right", padx=(0,12))
         self.pbar = ttk.Progressbar(status, mode="indeterminate", length=160); self.pbar.pack(side="right")
@@ -1320,6 +1395,7 @@ class App(tk.Tk):
         self.refresh_table()
         self.reschedule_all()
         self.update_status_indicators()
+        self.update_net_indicator()
         self._apply_theme(False)
         self._fade_in()
         self._pulse_status()
