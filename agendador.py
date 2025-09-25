@@ -983,6 +983,16 @@ class SettingsDialog(tk.Toplevel):
         ttk.Separator(frm).grid(row=row, column=0, columnspan=3, pady=8, sticky="we"); row += 1
 
         up = ttk.LabelFrame(frm, text="Atualizações", padding=(6,6))
+        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, pady=8, sticky="we"); row += 1
+
+        backups = ttk.LabelFrame(frm, text="Backup e migração (configurações + tarefas)", padding=(6, 6))
+        backups.grid(row=row, column=0, columnspan=3, sticky="we"); row += 1
+
+        ttk.Button(backups, text="Exportar…", command=self.export_all)\
+            .grid(row=0, column=0, padx=(0, 8), pady=2, sticky="w")
+        ttk.Button(backups, text="Importar…", command=self.import_all)\
+            .grid(row=0, column=1, padx=(0, 8), pady=2, sticky="w")
+
         up.grid(row=row, column=0, columnspan=3, sticky="we"); row += 1
         ttk.Label(up, text=f"Versão instalada: v{self._current_version}").grid(row=0, column=0, sticky="w")
         ttk.Button(up, text="Verificar se há atualização", command=self._check_updates)\
@@ -1005,6 +1015,103 @@ class SettingsDialog(tk.Toplevel):
         d = filedialog.askdirectory(title="Selecione a pasta do Pentaho (data-integration)")
         if d:
             self.var_pdi.set(d)
+
+        # ===== Backup / Migração =====
+    def export_all(self):
+        """Exporta configurações + tarefas para um JSON."""
+        try:
+            # Garante que a prévia atual da tela seja usada
+            settings_preview = self.get_result_preview()
+            app = self.master  # App()
+            payload = {
+                "app_name": APP_NAME,
+                "version": APP_VERSION,
+                "exported_at": now_str(),
+                "settings": settings_preview,
+                "tasks": list(app.data.get("tasks", [])),
+            }
+
+            fname = filedialog.asksaveasfilename(
+                title="Salvar backup",
+                defaultextension=".json",
+                initialfile=f"AgendadorBravo-backup-{datetime.now():%Y%m%d}.json",
+                filetypes=[("JSON", "*.json")]
+            )
+            if not fname:
+                return
+            Path(fname).write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            messagebox.showinfo("Backup", "Backup exportado com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Backup", f"Falha ao exportar:\n{e}")
+
+    def import_all(self):
+        """Importa configurações + tarefas de um JSON (sobrescreve as atuais)."""
+        try:
+            fname = filedialog.askopenfilename(
+                title="Abrir backup",
+                filetypes=[("JSON", "*.json")]
+            )
+            if not fname:
+                return
+            data = json.loads(Path(fname).read_text(encoding="utf-8"))
+
+            # Aceita tanto payload completo quanto parcial
+            new_settings = data.get("settings", {})
+            new_tasks = data.get("tasks", [])
+
+            if not new_settings and not new_tasks:
+                messagebox.showwarning("Importar", "Arquivo não contém 'settings' ou 'tasks'.")
+                return
+
+            if not messagebox.askyesno(
+                "Confirmar importação",
+                "Isto irá sobrescrever as configurações e/ou tarefas atuais. Deseja continuar?"
+            ):
+                return
+
+            app = self.master  # App()
+
+            # Aplica SETTINGS (e reflete nos campos da tela)
+            if new_settings:
+                app.data["settings"] = new_settings
+                self._apply_settings_to_vars(new_settings)
+
+            # Aplica TASKS (reescalona)
+            if new_tasks:
+                app.data["tasks"] = new_tasks
+
+            app.save(silent=True)
+            app.refresh_table()
+            app.reschedule_all()
+            app.update_status_indicators()
+
+            messagebox.showinfo("Importar", "Importação concluída!")
+        except Exception as e:
+            messagebox.showerror("Importar", f"Falha ao importar:\n{e}")
+
+    def _apply_settings_to_vars(self, s):
+        """Atualiza os campos da UI a partir do dicionário de settings."""
+        # PDI
+        self.var_pdi.set(s.get("pdi_home", r"C:\Pentaho\data-integration"))
+
+        # E-mail
+        em = s.get("email", {})
+        self.var_mail_on.set(bool(em.get("enabled", False)))
+        self.var_host.set(em.get("smtp_host", "smtp.gmail.com"))
+        self.var_port.set(str(em.get("smtp_port", 587)))
+        self.var_user.set(em.get("username", ""))
+        self.var_pass.set(em.get("password", ""))
+        self.var_from.set(em.get("from_email", ""))
+        self.var_to.set(",".join(em.get("to_emails", [])))
+
+        # WhatsApp
+        wa = s.get("whatsapp", {})
+        self.var_wa_on.set(bool(wa.get("enabled", False)))
+        self.var_node_path.set(wa.get("node_path", r"C:\Program Files\nodejs\node.exe"))
+        self.var_script.set(wa.get("webjs_script", str(resource_path("wa", "wa_send.js"))))
+        self.var_my_number.set(wa.get("my_number", ""))
+        self.var_to_targets.set(",".join(wa.get("to_targets", [])))
+        
 
     def _pick(self, var, file=True):
         p = filedialog.askopenfilename(title="Selecionar arquivo") if file \
