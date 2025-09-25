@@ -1,0 +1,13 @@
+codigo para gerar o executável 
+
+pip install --upgrade pyinstaller pillow apscheduler psutil sv-ttk
+pyinstaller `
+  --noconfirm `
+  --windowed `
+  --icon "Logo.ico" `
+  --name "AgendadorBravo" `
+  --add-data "Logo.ico;." `
+  --add-data "wa;wa" `
+  agendador.py
+
+

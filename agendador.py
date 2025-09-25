@@ -13,7 +13,10 @@ icon=['Logo.ico'],
 import urllib.request, hashlib, tempfile
 
 APP_VERSION = "2025.09.15.0"   # << aumente em cada build
-UPDATE_MANIFEST_URL = os.getenv("AGENDADOR_UPDATE_MANIFEST", "https://SEU-LINK/manifest.json")
+UPDATE_MANIFEST_URL = os.getenv(
+    "AGENDADOR_UPDATE_MANIFEST",
+    "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
+)
 UPDATE_CHECK_EVERY_MIN = int(os.getenv("AGENDADOR_UPDATE_EVERY_MIN", "240"))  # 4h
 
 def _is_frozen():
