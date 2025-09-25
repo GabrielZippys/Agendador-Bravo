@@ -45,7 +45,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.09.15.0"   # << aumente em cada build
+APP_VERSION = "2025.09.25.1.1"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -79,27 +79,43 @@ def _sha256(p: Path) -> str:
 
 def _write_update_cmd(pid: int, src_new: Path, dst_exe: Path) -> Path:
     cmd = f"""@echo off
-setlocal
-set SRC="{src_new}"
-set DST="{dst_exe}"
-set PID={pid}
+setlocal enabledelayedexpansion
+set "SRC={src_new}"
+set "DST={dst_exe}"
+set "PID={pid}"
+set "MAXWAIT=120"
+set /a COUNT=0
+
 :wait
-timeout /t 1 >nul
-tasklist /FI "PID eq %PID%" | find "%PID%" >nul && goto wait
-copy /y %SRC% %DST% >nul
-start "" %DST%
-del %SRC% >nul 2>&1
-del "%~f0" >nul 2>&1
+>nul 2>&1 timeout /t 1
+>nul 2>&1 tasklist /FI "PID eq %PID%" | find "%PID%"
+if %ERRORLEVEL%==0 (
+  set /a COUNT+=1
+  if !COUNT! lss %MAXWAIT% goto wait
+  >nul 2>&1 taskkill /PID %PID% /T /F
+)
+
+>nul 2>&1 copy /y "%SRC%" "%DST%"
+start "" /b "%DST%"
+>nul 2>&1 del "%SRC%"
+>nul 2>&1 del "%~f0"
 """
     p = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.cmd"
     p.write_text(cmd, encoding="utf-8")
     return p
 
+
 def _apply_update_and_restart(new_exe: Path):
     flags = 0x08000000 | 0x00000008 | 0x00000200  # CREATE_NO_WINDOW | DETACHED | NEW_PROCESS_GROUP
+
     updater = _write_update_cmd(os.getpid(), new_exe, _exe_path())
-    subprocess.Popen(["cmd", "/c", str(updater)], creationflags=flags)
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0  # SW_HIDE
+
+    subprocess.Popen(["cmd", "/c", str(updater)], creationflags=flags, startupinfo=si)
     os._exit(0)
+
 
 def fetch_update_info() -> tuple[bool, dict | str]:
     """
@@ -114,12 +130,13 @@ def fetch_update_info() -> tuple[bool, dict | str]:
         if _ver_tuple(remote_v) <= _ver_tuple(APP_VERSION):
             return (False, "Já está na última versão.")
         info = {
-            "version": remote_v,
-            "exe_url": mf.get("exe_url", ""),
-            "sha256": (mf.get("sha256") or "").lower(),
+        "version": remote_v,
+        "exe_url": mf.get("exe_url") or mf.get("url") or "",
+        "sha256": (mf.get("sha256") or "").lower(),
         }
         if not info["exe_url"]:
-            return (False, "Manifesto sem 'exe_url'.")
+         return (False, "Manifesto sem 'exe_url'.")
+
         return (True, info)
     except Exception as e:
         return (False, f"Falha ao checar: {e}")
