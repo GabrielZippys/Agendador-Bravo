@@ -3,11 +3,11 @@ codigo para gerar o executável
 pip install --upgrade pyinstaller pillow apscheduler psutil sv-ttk
 pyinstaller `
   --noconfirm `
+  --clean `
   --windowed `
-  --icon "Logo.ico" `
+  --onefile `
   --name "AgendadorBravo" `
-  --add-data "Logo.ico;." `
-  --add-data "wa;wa" `
-  agendador.py
-
-
+  --icon ".\Logo.ico" `
+  --add-data ".\Logo.ico;." `
+  --add-data ".\wa;wa" `
+  .\agendador.py

@@ -5,7 +5,7 @@ a = Analysis(
     ['agendador.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('.\\Logo.ico', '.'), ('.\\wa', 'wa')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['Logo.ico'],
 )

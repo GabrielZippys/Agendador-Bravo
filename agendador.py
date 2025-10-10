@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 import re
 from tkinter import ttk, filedialog, messagebox, simpledialog
-icon=['Logo.ico'],
+
 
 # --- AUTOUPDATE (com aviso na UI) -------------------------------------------
 import urllib.request, hashlib, tempfile
@@ -64,6 +64,25 @@ def _ver_tuple(v: str):
 def _http_get_json(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=30) as r:
         return json.loads(r.read().decode("utf-8"))
+    
+def find_logo_ico() -> Path | None:
+    candidates = [
+        APP_DIR / "Logo.ico",
+        APP_DIR / "logo.ico",
+        APP_DIR / "Logo" / "Logo.ico",
+        APP_DIR / "Logo" / "logo.ico",
+        resource_path("Logo.ico"),
+        resource_path("logo.ico"),
+        resource_path("Logo", "Logo.ico"),
+        resource_path("Logo", "logo.ico"),
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            pass
+    return None
 
 def _download(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -76,6 +95,33 @@ def _sha256(p: Path) -> str:
         for chunk in iter(lambda: f.read(1<<20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+def expand_start_repeat(start_hhmm: str, every_value: int, every_unit: str, repeat_times: int) -> list[str]:
+    """
+    Gera lista de horários HH:MM para 'início + repetição'.
+    Ex.: 14:25, a cada 5 minutos, por 10 vezes  ->  ['14:25','14:30',...]
+    - 'repeat_times' = número de repetições APÓS a primeira (total = repeat_times + 1).
+    - Corta horários que ultrapassem 23:59 (não atravessa para o dia seguinte).
+    """
+    try:
+        hh, mm = map(int, start_hhmm.strip().split(":"))
+        assert 0 <= hh <= 23 and 0 <= mm <= 59
+    except Exception:
+        hh, mm = 6, 0  # fallback 06:00
+
+    step_min = int(every_value) * (60 if (every_unit or "minutes").lower() == "hours" else 1)
+    if step_min <= 0:
+        step_min = 1
+
+    t0 = hh * 60 + mm
+    out = []
+    for k in range(int(repeat_times) + 1):
+        t = t0 + k * step_min
+        if t >= 24 * 60:
+            break
+        out.append(f"{t // 60:02d}:{t % 60:02d}")
+    return out
+
 
 def _write_update_cmd(pid: int, src_new: Path, dst_exe: Path) -> Path:
     cmd = f"""@echo off
@@ -204,7 +250,7 @@ import tkinter as tk
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
+
 
 # Logos/ícones (opcional)
 try:
@@ -403,7 +449,10 @@ def build_command(task, pdi_home):
     if ext in (".bat", ".cmd"):
         return ["cmd", "/c", path] + arg_list
     if ext == ".ps1":
-        return ["powershell", "-ExecutionPolicy", "Bypass", "-File", path] + arg_list
+       # Executa PowerShell oculto
+        return ["powershell", "-NoLogo", "-NonInteractive",
+                "-WindowStyle", "Hidden",
+                "-ExecutionPolicy", "Bypass", "-File", path] + arg_list
     if ext == ".py":
         py = sys.executable
         return [py, path] + arg_list
@@ -468,6 +517,19 @@ def run_task(task, settings, progress_cb=None):
     timeout = int(task.get("timeout", "0") or 0) or None
     spawn = bool(task.get("spawn", False))
 
+        # --- Janelas ocultas no Windows ---
+    si = None
+    
+    if os.name == "nt":
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
+
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        DETACHED_PROCESS        = 0x00000008
+        CREATE_NO_WINDOW        = 0x08000000
+
+
     # força UTF-8 no filho Python
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -490,17 +552,17 @@ def run_task(task, settings, progress_cb=None):
         try:
             log_fh = open(log_file, "a", encoding="utf-8", errors="ignore")
             log_fh.write(f"# {name} @ {now_str()} (spawn)\nCMD: {' '.join(cmd)}\n\n")
-
-            popen_kwargs = dict(cwd=workdir, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
+            popen_kwargs = dict(
+                cwd=workdir, stdout=log_fh, stderr=subprocess.STDOUT, env=env
+            )
             if os.name == "nt":
-                CREATE_NEW_PROCESS_GROUP = 0x00000200
-                DETACHED_PROCESS = 0x00000008
-                CREATE_NO_WINDOW = 0x08000000
                 popen_kwargs["creationflags"] = (CREATE_NEW_PROCESS_GROUP |
                                                  DETACHED_PROCESS | CREATE_NO_WINDOW)
+                popen_kwargs["startupinfo"] = si
             else:
                 import os as _os
                 popen_kwargs["preexec_fn"] = _os.setpgrp
+
 
             proc = subprocess.Popen(cmd, **popen_kwargs)
             _write_pid(task, proc.pid)
@@ -519,9 +581,12 @@ def run_task(task, settings, progress_cb=None):
         f.write(f"# {name} @ {now_str()}\nCMD: {' '.join(cmd)}\n\n")
         try:
             proc = subprocess.Popen(
-                cmd, cwd=workdir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="ignore", bufsize=1, env=env
+                cmd, cwd=workdir,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="ignore", bufsize=1, env=env,
+                **({"startupinfo": si, "creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {})
             )
+
             while True:
                 line = proc.stdout.readline()
                 if not line and proc.poll() is not None:
@@ -582,6 +647,12 @@ class TaskDialog(tk.Toplevel):
         self.var_path = tk.StringVar(value=(task or {}).get("path", ""))
         self.var_args = tk.StringVar(value=(task or {}).get("args", ""))
         self.var_work = tk.StringVar(value=(task or {}).get("working_dir", ""))
+        # ---- "Início + repetição" (start_repeat) ----
+        self.var_sr_start      = tk.StringVar(value=(task or {}).get("sr_start", (task or {}).get("time", "06:00")))
+        self.var_sr_every_val  = tk.StringVar(value=str((task or {}).get("sr_every_value", (task or {}).get("every_value", 5))))
+        self.var_sr_every_unit = tk.StringVar(value=(task or {}).get("sr_every_unit", (task or {}).get("every_unit", "minutes")))
+        self.var_sr_count      = tk.StringVar(value=str((task or {}).get("sr_count", 5)))
+
 
         # horários (lista interna) + string para exibir
         times_seed = (task or {}).get("times")
@@ -672,6 +743,9 @@ class TaskDialog(tk.Toplevel):
                         variable=self.var_schedule).grid(row=0, column=0, padx=(0, 10))
         ttk.Radiobutton(type_row, text="Intervalo", value="interval",
                         variable=self.var_schedule).grid(row=0, column=1)
+        ttk.Radiobutton(type_row, text="Início + repetição", value="start_repeat",
+                variable=self.var_schedule).grid(row=0, column=2, padx=(10, 0))
+
 
         self.int_row = ttk.Frame(sched)
         self.int_row.grid(row=1, column=0, columnspan=4, pady=(6, 0), sticky="w")
@@ -681,6 +755,21 @@ class TaskDialog(tk.Toplevel):
         ttk.Combobox(self.int_row, textvariable=self.var_every_unit,
                      values=("minutes", "hours"), width=10, state="readonly")\
             .grid(row=0, column=2)
+        self.sr_row = ttk.Frame(sched)  # Início + repetição
+        self.sr_row.grid(row=2, column=0, columnspan=4, pady=(6, 0), sticky="w")
+
+        ttk.Label(self.sr_row, text="Início (HH:MM)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self.sr_row, textvariable=self.var_sr_start, width=8).grid(row=0, column=1, padx=(4, 12))
+
+        ttk.Label(self.sr_row, text="Repetir a cada").grid(row=0, column=2, sticky="w")
+        ttk.Entry(self.sr_row, textvariable=self.var_sr_every_val, width=6).grid(row=0, column=3, padx=(4, 6))
+        ttk.Combobox(self.sr_row, textvariable=self.var_sr_every_unit,
+             values=("minutes", "hours"), width=10, state="readonly").grid(row=0, column=4)
+
+        ttk.Label(self.sr_row, text="por").grid(row=0, column=5, padx=(10, 2))
+        ttk.Entry(self.sr_row, textvariable=self.var_sr_count, width=6).grid(row=0, column=6)
+        ttk.Label(self.sr_row, text="vezes").grid(row=0, column=7, padx=(4, 0))
+
 
         # alterna UI conforme o tipo
         self.var_schedule.trace_add("write", lambda *_: self._toggle_schedule_ui())
@@ -712,25 +801,34 @@ class TaskDialog(tk.Toplevel):
         return ", ".join(self.times) if self.times else "— nenhum —"
 
     def _toggle_schedule_ui(self):
-        mode = (self.var_schedule.get() or "cron").lower()
-        is_interval = (mode == "interval")
-        # desabilita botão e "cinza" o label quando for intervalo
-        state = ("disabled" if is_interval else "normal")
-        try:
-            self.btn_times.configure(state=state)
-            self.lbl_times.configure(foreground=("#888" if is_interval else ""))
-            self.lbl_time_title.configure(foreground=("#888" if is_interval else ""))
-        except Exception:
-            pass
-        # mostra/oculta controles do intervalo
-        if is_interval:
-            self.int_row.grid()
-        else:
-            self.int_row.grid_remove()
+     mode = (self.var_schedule.get() or "cron").lower()
+     is_interval = (mode == "interval")
+     is_sr = (mode == "start_repeat")
+
+     # Botão/label de horários só ficam ativos no modo "cron"
+     state = ("normal" if mode == "cron" else "disabled")
+     try:
+        self.btn_times.configure(state=state)
+        self.lbl_times.configure(foreground=("" if mode == "cron" else "#888"))
+        self.lbl_time_title.configure(foreground=("" if mode == "cron" else "#888"))
+     except Exception:
+        pass
+
+     # Mostra/oculta linhas específicas
+     if is_interval:
+        self.int_row.grid()
+     else:
+        self.int_row.grid_remove()
+
+     if is_sr:
+        self.sr_row.grid()
+     else:
+        self.sr_row.grid_remove()
+
 
     # ---------- Ações ----------
     def on_save(self):
-        # validações
+        # validações básicas
         if not self.var_name.get().strip():
             messagebox.showerror("Erro", "Informe o nome da tarefa.")
             return
@@ -739,12 +837,16 @@ class TaskDialog(tk.Toplevel):
             return
 
         mode = (self.var_schedule.get() or "cron").lower()
+
+        # calcula a lista de horários conforme o modo
         if mode == "cron":
             if not self.times:
                 messagebox.showerror("Erro", "Adicione pelo menos um horário.")
                 return
             times_list = list(self.times)
-        else:
+
+        elif mode == "interval":
+            # intervalo puro não usa lista de horários
             try:
                 ev = int(self.var_every_val.get())
                 assert ev > 0
@@ -753,22 +855,51 @@ class TaskDialog(tk.Toplevel):
                 return
             times_list = []
 
+        elif mode == "start_repeat":
+            # início + repetição
+            try:
+                start = parse_times(self.var_sr_start.get().strip())[0]
+                ev = int(self.var_sr_every_val.get());   assert ev > 0
+                cnt = int(self.var_sr_count.get());      assert cnt >= 0
+                unit = (self.var_sr_every_unit.get() or "minutes").lower()
+            except Exception:
+                messagebox.showerror("Erro", "Preencha Início (HH:MM), intervalo (>0) e vezes (>=0).")
+                return
+            times_list = expand_start_repeat(start, ev, unit, cnt)
+        else:
+            # fallback seguro
+            times_list = ["06:00"]
+
+        # monta o payload final
         self.result = {
             "name": self.var_name.get().strip(),
             "path": self.var_path.get().strip(),
             "args": self.var_args.get().strip(),
             "working_dir": self.var_work.get().strip(),
+
+            # horários (primeiro para compatibilidade + lista completa)
             "time": (times_list[0] if times_list else "06:00"),
             "times": times_list,
+
             "days": [v.get() for v in self.days_vars],
             "timeout": self.var_timeout.get().strip(),
             "notify_fail": self.var_notify_fail.get(),
-            "schedule_type": self.var_schedule.get(),
+            "schedule_type": mode,
+
+            # campos do modo "interval"
             "every_value": int(self.var_every_val.get() or 0),
             "every_unit": self.var_every_unit.get(),
+
+            # campos do modo "início + repetição"
+            "sr_start": self.var_sr_start.get().strip(),
+            "sr_every_value": int(self.var_sr_every_val.get() or 0),
+            "sr_every_unit": self.var_sr_every_unit.get(),
+            "sr_count": int(self.var_sr_count.get() or 0),
+
             "spawn": self.var_spawn.get(),
         }
         self.destroy()
+
 
     def pick_file(self):
         path = filedialog.askopenfilename(title="Escolha o arquivo")
@@ -891,6 +1022,114 @@ class TaskDialog(tk.Toplevel):
         ttk.Button(footer, text="Cancelar", width=10, command=_cancel).pack(side="left", padx=4)
 
 
+class AssistantDialog(tk.Toplevel):
+    """
+    Assistente rápido para sugerir uma nova tarefa.
+    Ele monta um dict básico (schedule_type=cron, 06:00, todos os dias)
+    que depois é aberto no TaskDialog para ajustes finos.
+    """
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Assistente")
+        self.resizable(False, False)
+        self.result = None
+
+        self.var_name = tk.StringVar(value="NovaTarefa")
+        self.var_path = tk.StringVar(value="")
+        self.var_args = tk.StringVar(value="")
+        self.var_work = tk.StringVar(value="")
+
+        frm = ttk.Frame(self, padding=10)
+        frm.grid(sticky="nsew")
+        frm.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(frm, text="Nome:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_name, width=42)\
+            .grid(row=row, column=1, columnspan=2, sticky="we"); row += 1
+
+        ttk.Label(frm, text="Arquivo/Comando:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_path, width=42)\
+            .grid(row=row, column=1, sticky="we")
+        ttk.Button(frm, text="Procurar...", command=self._pick_file)\
+            .grid(row=row, column=2, sticky="we"); row += 1
+
+        ttk.Label(frm, text="Argumentos (opcional):").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_args, width=42)\
+            .grid(row=row, column=1, columnspan=2, sticky="we"); row += 1
+
+        ttk.Label(frm, text="Pasta de trabalho:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_work, width=42)\
+            .grid(row=row, column=1, sticky="we")
+        ttk.Button(frm, text="Escolher...", command=self._pick_dir)\
+            .grid(row=row, column=2, sticky="we"); row += 1
+
+        btns = ttk.Frame(frm); btns.grid(row=row, column=0, columnspan=3, pady=(10,0))
+        ttk.Button(btns, text="Gerar", command=self._on_ok).grid(row=0, column=0, padx=6)
+        ttk.Button(btns, text="Cancelar", command=self.destroy).grid(row=0, column=1, padx=6)
+
+        self.grab_set()
+        self.wait_visibility()
+        self.focus_set()
+
+    # ------- helpers -------
+    def _pick_file(self):
+        path = filedialog.askopenfilename(title="Escolha o arquivo")
+        if not path:
+            return
+        self.var_path.set(path)
+        # sugere nome e pasta
+        try:
+            p = Path(path)
+            if not self.var_work.get().strip():
+                self.var_work.set(str(p.parent))
+            if not self.var_name.get().strip() or self.var_name.get() == "NovaTarefa":
+                self.var_name.set(p.stem)
+        except Exception:
+            pass
+
+    def _pick_dir(self):
+        d = filedialog.askdirectory(title="Escolha a pasta de trabalho")
+        if d:
+            self.var_work.set(d)
+
+    # ------- ação principal -------
+    def _on_ok(self):
+        name = self.var_name.get().strip()
+        path = self.var_path.get().strip()
+        if not name:
+            messagebox.showerror("Erro", "Informe o nome da tarefa."); return
+        if not path:
+            messagebox.showerror("Erro", "Escolha o arquivo/comando."); return
+
+        work = self.var_work.get().strip() or str(Path(path).parent)
+
+        # payload básico para o TaskDialog refinar
+        self.result = {
+            "name": name,
+            "path": path,
+            "args": self.var_args.get().strip(),
+            "working_dir": work,
+
+            "time": "06:00",
+            "times": ["06:00"],
+            "days": [True] * 7,
+
+            "timeout": "0",
+            "notify_fail": True,
+            "schedule_type": "cron",
+
+            "every_value": 30,
+            "every_unit": "minutes",
+
+            "sr_start": "06:00",
+            "sr_every_value": 5,
+            "sr_every_unit": "minutes",
+            "sr_count": 5,
+
+            "spawn": True,
+        }
+        self.destroy()
 
 
 
@@ -1143,9 +1382,11 @@ class SettingsDialog(tk.Toplevel):
 
         try:
             ensure_dirs()
-            creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+            si = subprocess.STARTUPINFO(); si.dwFlags |= subprocess.STARTF_USESHOWWINDOW; si.wShowWindow = 0
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
             subprocess.Popen([node, script, "--to", tos, "--message", msg],
-                             creationflags=creationflags, cwd=str(WA_DIR))
+                 creationflags=creationflags, startupinfo=si, cwd=str(WA_DIR))
+            
             messagebox.showinfo(
                 "WhatsApp",
                 "Janela aberta.\nSe for a primeira vez, leia o QR Code com o WhatsApp do número emissor."
@@ -1244,6 +1485,32 @@ class SettingsDialog(tk.Toplevel):
 # ======================================================================================
 
 class App(tk.Tk):
+
+
+    def _style_table(self):
+     dark = bool(self.var_dark.get())
+     even = "#f7f7fb" if not dark else "#1d1d1d"
+     odd  = "#ffffff" if not dark else "#151515"
+     sel_bg = "#e6f4ea" if not dark else "#244a2a"
+
+     style = ttk.Style(self)
+     # headings um pouco mais espaçosos
+     style.configure("Treeview.Heading", padding=6)
+
+     # cores alternadas
+     try:
+        self.tree.tag_configure("evenrow", background=even)
+        self.tree.tag_configure("oddrow", background=odd)
+     except Exception:
+        pass
+
+     # seleção mais visível
+     try:
+        style.map("Treeview",
+                  background=[("selected", sel_bg)])
+     except Exception:
+        pass
+
 
      # ===== Conectividade / Fila de updates =====
     def on_net_status_change(self, online: bool):
@@ -1379,55 +1646,37 @@ class App(tk.Tk):
 
 
                 # --- Ícone da janela / barra de tarefas + logo no cabeçalho ---
-        self._logo_img = None
-
-        # 1) Tenta aplicar um .ico (melhor para Windows e barra de tarefas)
-        try:
-            for ico_path in (
-                APP_DIR / "Logo.ico",
-                APP_DIR / "Logo" / "Logo.ico",
-                resource_path("Logo.ico"),
-                resource_path("Logo", "Logo.ico"),
-            ):
-                if ico_path.exists():
-                    self.iconbitmap(default=str(ico_path))
-                    break
-        except Exception:
-            pass
-
-        # 2) Mostra um PNG no cabeçalho e registra com iconphoto (fallback)
-        try:
-            for png_path in (
-                APP_DIR / "logo.png",
-                APP_DIR / "Logo" / "logo.png",
-                resource_path("logo.png"),
-                resource_path("Logo", "logo.png"),
-            ):
-                if png_path.exists() and Image and ImageTk:
-                    _img = ImageTk.PhotoImage(Image.open(png_path).resize((32, 32), Image.LANCZOS))
+                # --- Ícone da janela / barra de tarefas + logo no cabeçalho (somente .ico) ---
+                # --- Ícone da janela / barra de tarefas + logo no cabeçalho (somente .ico) ---
+        self._header_img = None
+        ico = find_logo_ico()
+        if ico:
+            try:
+                # Ícone da janela / taskbar
+                self.iconbitmap(default=str(ico))
+            except Exception:
+                pass
+            # Mostra a mesma .ico no cabeçalho (renderizada via Pillow) — apenas visual
+            try:
+                if Image and ImageTk:
+                    _pil = Image.open(ico).resize((28, 28), Image.LANCZOS)
+                    _img = ImageTk.PhotoImage(_pil)
                     ttk.Label(header, image=_img).pack(side="left")
-                    self._logo_img = _img  # evita GC
-                    try:
-                        self.iconphoto(True, _img)
-                    except Exception:
-                        pass
-                    break
-        except Exception:
-            pass
+                    self._header_img = _img  # evita GC
+            except Exception:
+                pass
+
+            # Mostra a mesma .ico no cabeçalho (renderizada via Pillow) — apenas visual
+            try:
+                if Image and ImageTk:
+                    _pil = Image.open(ico).resize((28, 28), Image.LANCZOS)
+                    _img = ImageTk.PhotoImage(_pil)
+                    ttk.Label(header, image=_img).pack(side="left")
+                    self._header_img = _img  # evita GC
+            except Exception:
+                pass
 
         ttk.Label(header, text="Agendador-Bravo", font=("Segoe UI", 12, "bold")).pack(side="left", padx=8)
-
-
-        try:
-            lf = APP_DIR / "logo.png"
-            if not lf.exists():
-                lf = resource_path("logo.png")
-            if lf.exists() and Image and ImageTk:
-                _ico = ImageTk.PhotoImage(Image.open(lf).resize((32, 32), Image.LANCZOS))
-                self.iconphoto(True, _ico)
-                self._icon_img = _ico
-        except Exception:
-            pass
 
         self.var_dark = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1435,7 +1684,6 @@ class App(tk.Tk):
             variable=self.var_dark,
             command=lambda: self._apply_theme(self.var_dark.get())
         ).pack(side="right", padx=6)
-        self._apply_theme(False)
 
         # --------- Toolbar responsiva ----------
         toolbar_outer = ttk.Frame(self); toolbar_outer.pack(fill="x")
@@ -1456,20 +1704,21 @@ class App(tk.Tk):
         self._toolbar_canvas.bind("<Shift-MouseWheel>",
                                   lambda e: (self._toolbar_canvas.xview_scroll((-1 if e.delta>0 else 1)*3, "units"),
                                              "break"))
-
+        
         bar = self._toolbar_inner
-        ttk.Button(bar, text="Nova tarefa", command=self.add_task).pack(side="left")
-        ttk.Button(bar, text="Assistente", command=self.open_assistant).pack(side="left", padx=5)
-        ttk.Button(bar, text="Editar", command=self.edit_task).pack(side="left")
-        ttk.Button(bar, text="Remover", command=self.remove_task).pack(side="left")
-        self.btn_run = ttk.Button(bar, text="Executar agora", command=self.run_now)
+        ttk.Button(bar, text="➕ Nova", command=self.add_task).pack(side="left")
+        ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant).pack(side="left", padx=5)
+        ttk.Button(bar, text="✏️ Editar", command=self.edit_task).pack(side="left")
+        ttk.Button(bar, text="🗑️ Remover", command=self.remove_task).pack(side="left")
+        self.btn_run = ttk.Button(bar, text="▶ Executar agora", command=self.run_now)
         self.btn_run.pack(side="left", padx=(10, 0))
-        ttk.Button(bar, text="Simular erro", command=self.simulate_error).pack(side="left", padx=5)
-        ttk.Button(bar, text="Configurações", command=self.open_settings).pack(side="left", padx=5)
-        ttk.Button(bar, text="Abrir pasta de logs", command=lambda: os.startfile(LOG_DIR)).pack(side="left", padx=5)
-        ttk.Button(bar, text="Ver último log", command=self.open_last_log).pack(side="left", padx=5)
-        ttk.Button(bar, text="Dicas", command=self.show_tips).pack(side="left", padx=5)
-        ttk.Button(bar, text="Salvar", command=self.save).pack(side="left", padx=5)
+        ttk.Button(bar, text="🧪 Simular erro", command=self.simulate_error).pack(side="left", padx=5)
+        ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings).pack(side="left", padx=5)
+        ttk.Button(bar, text="📂 Logs (pasta)", command=lambda: os.startfile(LOG_DIR)).pack(side="left", padx=5)
+        ttk.Button(bar, text="📄 Último log", command=self.open_last_log).pack(side="left", padx=5)
+        ttk.Button(bar, text="💡 Dicas", command=self.show_tips).pack(side="left", padx=5)
+        ttk.Button(bar, text="💾 Salvar", command=self.save).pack(side="left", padx=5)
+
 
         # --------- Layout principal ----------
         paned = ttk.Panedwindow(self, orient="horizontal")
@@ -1481,6 +1730,7 @@ class App(tk.Tk):
 
         cols = ("Nome","Hora","Dias","Arquivo","NotificarFalha","Timeout")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
+        self._style_table()
         for c in cols:
             self.tree.heading(c, text=c)
             self.tree.column(c, stretch=True)
@@ -1524,20 +1774,37 @@ class App(tk.Tk):
         self._fade_in()
         self._pulse_status()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        start_net_monitor(self)
+        start_auto_update_thread(self)
 
     # ===== Tema / animações =====
     def _apply_theme(self, dark: bool):
-        try:
-            if sv_ttk:
-                sv_ttk.use_dark_theme() if dark else sv_ttk.use_light_theme()
-        except Exception:
-            pass
-        style = ttk.Style(self)
-        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"))
-        try:
-            self.btn_run.configure(style="Accent.TButton")
-        except Exception:
-            pass
+     try:
+        if sv_ttk:
+            sv_ttk.use_dark_theme() if dark else sv_ttk.use_light_theme()
+     except Exception:
+        pass
+
+     style = ttk.Style(self)
+     style.configure("TButton", padding=6)
+     style.configure("TLabel", padding=2)
+     style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"))
+     try:
+        self.btn_run.configure(style="Accent.TButton")
+     except Exception:
+        pass
+
+     self._style_table()  # reconfigura a Treeview
+
+     # Só repinta o gráfico se o canvas já existir
+     if hasattr(self, "canvas"):
+        self.draw_chart()
+
+
+    # >>> ADICIONE ESTAS DUAS LINHAS <<<
+     self._style_table()   # reconfigura cores das linhas (even/odd/seleção)
+     self.draw_chart()     # repinta o canvas com fundo/grades corretos
 
     def _fade_in(self, target=1.0, step=0.08):
         try:
@@ -1607,68 +1874,106 @@ class App(tk.Tk):
 
     # ===== agendamento =====
     def reschedule_all(self):
+        """
+        Recria todos os jobs do APScheduler a partir das tarefas salvas.
+        Suporta:
+          - schedule_type == "cron"          -> horários fixos (lista `times`)
+          - schedule_type == "interval"      -> a cada N minutos/horas (com filtro de dias)
+          - schedule_type == "start_repeat"  -> início HH:MM + repetir a cada N por X vezes
+        """
         # limpa jobs antigos
         for job in list(self.scheduler.get_jobs()):
-            self.scheduler.remove_job(job.id)
+            try:
+                self.scheduler.remove_job(job.id)
+            except Exception:
+                pass
         self.jobs.clear()
 
+        # recria jobs
         for t in self.data.get("tasks", []):
             stype = (t.get("schedule_type") or "cron").lower()
 
+            # dias válidos
+            days = t.get("days", [True] * 7)
+            dows = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            use_days = [dows[i] for i, v in enumerate(days) if v]
+            if not use_days:
+                continue
+
+            # ------------------ INTERVALO ------------------
             if stype == "interval":
-                # a cada N minutos/horas (respeitando dias marcados)
                 try:
-                    val = int(str(t.get("every_value") or 0))
+                    val = int(t.get("every_value") or 0)
                 except Exception:
                     val = 0
                 if val <= 0:
                     continue
                 unit = (t.get("every_unit") or "minutes").lower()
 
-                days = t.get("days", [True] * 7)
-                dows = ["mon","tue","wed","thu","fri","sat","sun"]
-                use_days = [dows[i] for i, v in enumerate(days) if v]
-                if not use_days:
-                    continue
-
                 if unit == "minutes":
                     trig = CronTrigger(day_of_week=",".join(use_days), minute=f"*/{val}")
-                else:  # hours
+                else:  # "hours"
                     trig = CronTrigger(day_of_week=",".join(use_days), hour=f"*/{val}", minute=0)
-            else:
-                # horário(s) fixo(s) nos dias marcados
-                days = t.get("days", [True] * 7)
-                dows = ["mon","tue","wed","thu","fri","sat","sun"]
-                use_days = [dows[i] for i, v in enumerate(days) if v]
-                if not use_days:
-                    continue
 
-                # aceita lista "times" (novo) ou fallback para "time" único
-                times = t.get("times") or [t.get("time", "06:00")]
-                # normaliza por segurança
+                job = self.scheduler.add_job(
+                    self._job_wrapper, trigger=trig, id=t["name"], name=t["name"], args=[t]
+                )
+                self.jobs[t["name"]] = [job.id]
+                continue
+
+            # -------------- INÍCIO + REPETIÇÃO --------------
+            if stype == "start_repeat":
+                start = (t.get("sr_start") or t.get("time") or "06:00")
                 try:
-                    times = parse_times(",".join(times) if isinstance(times, list) else str(times))
+                    ev = int(t.get("sr_every_value", t.get("every_value", 5)) or 5)
                 except Exception:
+                    ev = 5
+                unit = (t.get("sr_every_unit") or t.get("every_unit") or "minutes").lower()
+                try:
+                    cnt = int(t.get("sr_count", 0) or 0)
+                except Exception:
+                    cnt = 0
+
+                times = expand_start_repeat(start, ev, unit, cnt)
+                if not times:
                     continue
 
-                # cria vários triggers (um por horário)
                 job_ids = []
                 for idx, hhmm in enumerate(times):
-                    hh, mm = map(int, hhmm.split(":"))
+                    try:
+                        hh, mm = map(int, hhmm.split(":"))
+                    except Exception:
+                        continue
                     trig = CronTrigger(day_of_week=",".join(use_days), hour=hh, minute=mm)
-                    jid = f"{t['name']}::{idx}"
+                    jid = f"{t['name']}::sr::{idx}"
                     self.scheduler.add_job(self._job_wrapper, trigger=trig, id=jid, name=t["name"], args=[t])
                     job_ids.append(jid)
                 self.jobs[t["name"]] = job_ids
-                continue  # já adicionamos todos os triggers; segue p/ próximo task
+                continue
 
-            # (para o modo intervalo, continua como antes)
-            job = self.scheduler.add_job(self._job_wrapper, trigger=trig, id=t["name"], name=t["name"], args=[t])
-            self.jobs[t["name"]] = [job.id]
+            # ----------------- HORÁRIO(S) FIXO(S) -----------------
+            times = t.get("times") or [t.get("time", "06:00")]
+            try:
+                times = parse_times(",".join(times) if isinstance(times, list) else str(times))
+            except Exception:
+                continue
 
+            job_ids = []
+            for idx, hhmm in enumerate(times):
+                try:
+                    hh, mm = map(int, hhmm.split(":"))
+                except Exception:
+                    continue
+                trig = CronTrigger(day_of_week=",".join(use_days), hour=hh, minute=mm)
+                jid = f"{t['name']}::{idx}"
+                self.scheduler.add_job(self._job_wrapper, trigger=trig, id=jid, name=t["name"], args=[t])
+                job_ids.append(jid)
+            self.jobs[t["name"]] = job_ids
 
+        # garante scheduler rodando
         if not self.scheduler.running:
             self.scheduler.start()
+
 
     def _job_wrapper(self, task):
         def progress(_):
@@ -1715,36 +2020,42 @@ class App(tk.Tk):
         self.update_idletasks()
 
     def _hora_dias_text(self, t):
-        """Texto das colunas Hora/Dias conforme o tipo de agendamento."""
-        if (t.get("schedule_type") or "cron").lower() == "interval":
-            val = t.get("every_value") or 0
-            unit = (t.get("every_unit") or "minutes").lower()
-            hora = f"cada {val} " + ("min" if unit == "minutes" else "h")
-            dias = "—"
-        else:
-            times = t.get("times") or [t.get("time", "06:00")]
-            try:
-                times = parse_times(",".join(times) if isinstance(times, list) else str(times))
-            except Exception:
-                times = [t.get("time", "06:00")]
-            hora = ", ".join(times)
-            dias = format_days_bool(t.get("days", [True]*7))
+     st = (t.get("schedule_type") or "cron").lower()
+     if st == "interval":
+        val = t.get("every_value") or 0
+        unit = (t.get("every_unit") or "minutes").lower()
+        hora = f"cada {val} " + ("min" if unit == "minutes" else "h")
+        dias = "—"
+     elif st == "start_repeat":
+        start = (t.get("sr_start") or t.get("time") or "06:00")
+        ev = int(t.get("sr_every_value", 5) or 5)
+        unit = (t.get("sr_every_unit") or "minutes").lower()
+        cnt = int(t.get("sr_count", 5) or 5)
+        times = expand_start_repeat(start, ev, unit, cnt)
+        hora = ", ".join(times)
+        dias = format_days_bool(t.get("days", [True]*7))
+     else:  # cron
+        times = t.get("times") or [t.get("time", "06:00")]
+        try:
+            times = parse_times(",".join(times) if isinstance(times, list) else str(times))
+        except Exception:
+            times = [t.get("time", "06:00")]
+        hora = ", ".join(times)
+        dias = format_days_bool(t.get("days", [True]*7))
+     return hora, dias
 
-        return hora, dias
 
     # ===== tabela & gráfico =====
     def refresh_table(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
 
-        for t in self.data.get("tasks", []):
+        for idx, t in enumerate(self.data.get("tasks", [])):
             hora, dias = self._hora_dias_text(t)
+            tag = ("evenrow" if idx % 2 == 0 else "oddrow")
             self.tree.insert(
-                "", "end", iid=t["name"], values=(
-                    t["name"],
-                    hora,
-                    dias,
-                    t["path"],
+                "", "end", iid=t["name"], tags=(tag,), values=(
+                    t["name"], hora, dias, t["path"],
                     "Sim" if t.get("notify_fail", True) else "Não",
                     t.get("timeout", "0")
                 )
@@ -1753,14 +2064,27 @@ class App(tk.Tk):
 
     def draw_chart(self):
         self.canvas.delete("all")
+        dark = bool(self.var_dark.get())
+        self.canvas.configure(bg=("#0f0f10" if dark else "#ffffff"))
+        grid = "#2a2a2a" if dark else "#e0e0e0"
+
         sel = self.tree.selection()
         if not sel:
-            self.canvas.create_text(10, 10, anchor="nw", text="Selecione uma tarefa para ver o histórico.")
+            self.canvas.create_text(
+                10, 10, anchor="nw",
+                fill=("#bfbfbf" if dark else "#000"),
+                text="Selecione uma tarefa para ver o histórico."
+            )
             return
+
         name = sel[0]
         hist = self.data.get("history", {}).get(name, [])
         if not hist:
-            self.canvas.create_text(10, 10, anchor="nw", text="Ainda sem histórico para esta tarefa.")
+            self.canvas.create_text(
+                10, 10, anchor="nw",
+                fill=("#bfbfbf" if dark else "#000"),
+                text="Ainda sem histórico para esta tarefa."
+            )
             return
 
         items = hist[-30:]
@@ -1775,32 +2099,43 @@ class App(tk.Tk):
         chart_h = H1 - pad
         max_dur = max(1.0, max(i["dur"] for i in items))
         bar_w = max(2, int(chart_w / max(N, 1) * 0.7))
-        self.canvas.create_text(pad, 8, anchor="nw", text=f"Duração (s) — últimas {N}")
-        self.canvas.create_line(pad, H1 - 10, w - pad, H1 - 10)
+        self.canvas.create_text(
+            pad, 8, anchor="nw",
+            text=f"Duração (s) — últimas {N}",
+            fill=("#bfbfbf" if dark else "#000")
+        )
+        self.canvas.create_line(pad, H1 - 10, w - pad, H1 - 10, fill=grid)
         for k in (0.25, 0.5, 0.75):
             y = (H1 - 10) - k * chart_h
-            self.canvas.create_line(pad, y, w - pad, y, fill="#e0e0e0")
+            self.canvas.create_line(pad, y, w - pad, y, fill=grid)
+
         for idx, it in enumerate(items):
             x_center = pad + (idx + 0.5) * (chart_w / N)
             bh = (it["dur"] / max_dur) * (chart_h - 6)
             y0 = (H1 - 10) - bh
             color = "#3cb371" if it["rc"] == 0 else "#dc143c"
-            self.canvas.create_rectangle(x_center - bar_w / 2, y0,
-                                         x_center + bar_w / 2, H1 - 10,
-                                         fill=color, outline="")
+            self.canvas.create_rectangle(
+                x_center - bar_w / 2, y0,
+                x_center + bar_w / 2, H1 - 10,
+                fill=color, outline=""
+            )
 
         # legenda
         self.canvas.create_rectangle(w - pad - 120, 6, w - pad - 102, 24, fill="#3cb371", outline="")
-        self.canvas.create_text(w - pad - 96, 15, text="Ok", anchor="w")
+        self.canvas.create_text(w - pad - 96, 15, text="Ok", anchor="w", fill=("#bfbfbf" if dark else "#000"))
         self.canvas.create_rectangle(w - pad - 60, 6, w - pad - 42, 24, fill="#dc143c", outline="")
-        self.canvas.create_text(w - pad - 36, 15, text="Falha", anchor="w")
+        self.canvas.create_text(w - pad - 36, 15, text="Falha", anchor="w", fill=("#bfbfbf" if dark else "#000"))
 
         # acumulado OK x Falha
         ok = sum(1 for i in items if i["rc"] == 0)
         fail = N - ok
         total = max(1, N)
         y_top = H1 + 10
-        self.canvas.create_text(pad, y_top, anchor="nw", text=f"Acertos x Falhas — últimas {N}")
+        self.canvas.create_text(
+            pad, y_top, anchor="nw",
+            text=f"Acertos x Falhas — últimas {N}",
+            fill=("#bfbfbf" if dark else "#000")
+        )
         y_bar = y_top + 18
         bar_h = max(18, h - y_bar - 14)
         full_w = w - 2 * pad
@@ -1850,10 +2185,10 @@ class App(tk.Tk):
      if not messagebox.askyesno("Confirmar", f"Remover a tarefa '{name}'?"):
         return
 
-    # remove do JSON
+     # remove do JSON
      self.data["tasks"] = [t for t in self.data["tasks"] if t["name"] != name]
 
-    # remove TODOS os jobs agendados dessa tarefa (um por horário)
+     # remove TODOS os jobs agendados dessa tarefa (um por horário)
      ids = self.jobs.get(name, [])
      for jid in ids:
         try:
@@ -1864,7 +2199,6 @@ class App(tk.Tk):
 
      self.save(silent=True)
      self.refresh_table()
-
 
     def open_last_log(self):
         sel = self.tree.selection()
