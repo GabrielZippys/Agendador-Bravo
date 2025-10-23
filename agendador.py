@@ -341,6 +341,12 @@ def load_data():
                 "webjs_script": str(resource_path("wa", "wa_send.js")),
                 "to_targets": [],
                 "my_number": ""
+            },
+            "log_cleanup": {
+                "enabled": True,
+                "keep_days": 7,
+                "schedule_day": 6,  # 0=segunda, 6=domingo
+                "schedule_time": "02:00"
             }
         },
         "tasks": [],
@@ -357,6 +363,63 @@ def append_history(data, task_name, rc, dur):
     if len(hist) > 50:
         del hist[:-50]
     save_data(data)
+
+# ======================================================================================
+#  Limpeza automática de logs
+# ======================================================================================
+
+def cleanup_logs(settings):
+    """Remove logs antigos baseado na configuração de limpeza."""
+    cleanup_cfg = settings.get("log_cleanup", {})
+    if not cleanup_cfg.get("enabled", True):
+        return
+    
+    keep_days = int(cleanup_cfg.get("keep_days", 7))
+    if keep_days <= 0:
+        return
+    
+    ensure_dirs()
+    if not LOG_DIR.exists():
+        return
+    
+    # Calcula data limite (logs mais antigos que isso serão removidos)
+    from datetime import timedelta
+    cutoff_date = datetime.now() - timedelta(days=keep_days)
+    
+    removed_count = 0
+    total_size = 0
+    
+    try:
+        # Lista todos os arquivos .log na pasta de logs
+        for log_file in LOG_DIR.glob("*.log"):
+            try:
+                # Verifica a data de modificação do arquivo
+                file_mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                
+                if file_mtime < cutoff_date:
+                    file_size = log_file.stat().st_size
+                    log_file.unlink()
+                    removed_count += 1
+                    total_size += file_size
+            except Exception:
+                # Se houver erro com um arquivo específico, continua com os outros
+                continue
+    except Exception:
+        # Se houver erro geral, não faz nada
+        pass
+    
+    # Log da limpeza (se removeu algum arquivo)
+    if removed_count > 0:
+        cleanup_log = LOG_DIR / f"cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        try:
+            size_mb = total_size / (1024 * 1024)
+            with open(cleanup_log, "w", encoding="utf-8") as f:
+                f.write(f"# Limpeza automática de logs @ {now_str()}\n")
+                f.write(f"Arquivos removidos: {removed_count}\n")
+                f.write(f"Espaço liberado: {size_mb:.2f} MB\n")
+                f.write(f"Critério: logs mais antigos que {keep_days} dias\n")
+        except Exception:
+            pass
 
 # ======================================================================================
 #  Notificações
@@ -1140,7 +1203,9 @@ class SettingsDialog(tk.Toplevel):
 
         super().__init__(master)
         self.title("Configurações")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.geometry("500x400")  # Tamanho inicial mais compacto
+        self.minsize(450, 350)    # Tamanho mínimo
         self.result = None
 
         # ----- PDI (Pentaho) -----
@@ -1164,19 +1229,39 @@ class SettingsDialog(tk.Toplevel):
         self.var_my_number  = tk.StringVar(value=wa.get("my_number", ""))
         self.var_to_targets = tk.StringVar(value=",".join(wa.get("to_targets", [])))
 
-        # ---------- LAYOUT ----------
-        frm = ttk.Frame(self, padding=10)
-        frm.grid(sticky="nsew")
+        # ----- Limpeza de logs -----
+        cleanup = settings.get("log_cleanup", {})
+        self.var_cleanup_enabled = tk.BooleanVar(value=cleanup.get("enabled", True))
+        self.var_cleanup_days = tk.StringVar(value=str(cleanup.get("keep_days", 7)))
+        self.var_cleanup_day = tk.StringVar(value=str(cleanup.get("schedule_day", 6)))
+        self.var_cleanup_time = tk.StringVar(value=cleanup.get("schedule_time", "02:00"))
+
+        # ---------- LAYOUT COM ABAS ----------
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.grid(sticky="nsew")
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+
+        # Notebook para abas
+        notebook = ttk.Notebook(main_frame)
+        notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
+
+        # === ABA 1: GERAL ===
+        tab_geral = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_geral, text="Geral")
+        
         row = 0
+        ttk.Label(tab_geral, text="PDI Home (.ktr/.kjb):").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_geral, textvariable=self.var_pdi, width=40).grid(row=row, column=1, sticky="we", padx=(5, 5))
+        ttk.Button(tab_geral, text="...", command=self.pick_pdi, width=3).grid(row=row, column=2); row += 1
 
-        ttk.Label(frm, text="PDI Home (.ktr/.kjb):").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_pdi, width=46).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Procurar...", command=self.pick_pdi).grid(row=row, column=2); row += 1
-
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, pady=8, sticky="we"); row += 1
-
-        ttk.Checkbutton(frm, text="Ativar e-mail (SMTP)", variable=self.var_mail_on)\
-            .grid(row=row, column=0, sticky="w"); row += 1
+        # === ABA 2: E-MAIL ===
+        tab_email = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_email, text="E-mail")
+        
+        row = 0
+        ttk.Checkbutton(tab_email, text="Ativar notificações por e-mail (SMTP)", variable=self.var_mail_on)\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
 
         for label, var in [
             ("SMTP host", self.var_host),
@@ -1186,60 +1271,110 @@ class SettingsDialog(tk.Toplevel):
             ("De (from)", self.var_from),
             ("Para (vírgula)", self.var_to),
         ]:
-            ttk.Label(frm, text=label + ":").grid(row=row, column=0, sticky="w")
-            ttk.Entry(frm, textvariable=var, width=46, show="*" if "Senha" in label else "")\
-                .grid(row=row, column=1, columnspan=2, sticky="we"); row += 1
+            ttk.Label(tab_email, text=label + ":").grid(row=row, column=0, sticky="w")
+            ttk.Entry(tab_email, textvariable=var, width=40, show="*" if "Senha" in label else "")\
+                .grid(row=row, column=1, columnspan=2, sticky="we", padx=(5, 0)); row += 1
 
-        ttk.Button(frm, text="Testar e-mail", command=self.test_email)\
-            .grid(row=row, column=1, sticky="w"); row += 1
+        ttk.Button(tab_email, text="Testar e-mail", command=self.test_email)\
+            .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, pady=8, sticky="we"); row += 1
+        # === ABA 3: WHATSAPP ===
+        tab_wa = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_wa, text="WhatsApp")
+        
+        row = 0
+        ttk.Checkbutton(tab_wa, text="Ativar notificações por WhatsApp", variable=self.var_wa_on)\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
 
-        ttk.Checkbutton(frm, text="Ativar WhatsApp (QR – WhatsApp Web)", variable=self.var_wa_on)\
-            .grid(row=row, column=0, sticky="w"); row += 1
-
-        ttk.Label(frm, text="Node.exe:").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_node_path, width=46).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Procurar...", command=lambda: self._pick(self.var_node_path, True))\
+        ttk.Label(tab_wa, text="Node.exe:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_wa, textvariable=self.var_node_path, width=40).grid(row=row, column=1, sticky="we", padx=(5, 5))
+        ttk.Button(tab_wa, text="...", command=lambda: self._pick(self.var_node_path, True), width=3)\
             .grid(row=row, column=2); row += 1
 
-        ttk.Label(frm, text="Script wa_send.js:").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_script, width=46).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Procurar...", command=lambda: self._pick(self.var_script, True))\
+        ttk.Label(tab_wa, text="Script wa_send.js:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_wa, textvariable=self.var_script, width=40).grid(row=row, column=1, sticky="we", padx=(5, 5))
+        ttk.Button(tab_wa, text="...", command=lambda: self._pick(self.var_script, True), width=3)\
             .grid(row=row, column=2); row += 1
 
-        ttk.Label(frm, text="Meu número:").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_my_number, width=46)\
-            .grid(row=row, column=1, columnspan=2, sticky="we"); row += 1
+        ttk.Label(tab_wa, text="Meu número:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_wa, textvariable=self.var_my_number, width=40)\
+            .grid(row=row, column=1, columnspan=2, sticky="we", padx=(5, 0)); row += 1
 
-        ttk.Label(frm, text="Destinos (vírgula):").grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.var_to_targets, width=46)\
-            .grid(row=row, column=1, columnspan=2, sticky="we"); row += 1
+        ttk.Label(tab_wa, text="Destinos (vírgula):").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_wa, textvariable=self.var_to_targets, width=40)\
+            .grid(row=row, column=1, columnspan=2, sticky="we", padx=(5, 0)); row += 1
 
-        ttk.Button(frm, text="Testar WhatsApp", command=self.test_whatsapp_qr)\
-            .grid(row=row, column=1, sticky="w"); row += 1
+        ttk.Button(tab_wa, text="Testar WhatsApp", command=self.test_whatsapp_qr)\
+            .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, pady=8, sticky="we"); row += 1
+        # === ABA 4: LIMPEZA DE LOGS ===
+        tab_logs = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_logs, text="Logs")
+        
+        row = 0
+        ttk.Checkbutton(tab_logs, text="Ativar limpeza automática de logs", variable=self.var_cleanup_enabled)\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
 
-        up = ttk.LabelFrame(frm, text="Atualizações", padding=(6,6))
-        ttk.Separator(frm).grid(row=row, column=0, columnspan=3, pady=8, sticky="we"); row += 1
+        # Linha 1: Dias para manter
+        cleanup_frame1 = ttk.Frame(tab_logs)
+        cleanup_frame1.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
+        ttk.Label(cleanup_frame1, text="Manter logs por:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cleanup_frame1, textvariable=self.var_cleanup_days, width=6)\
+            .grid(row=0, column=1, padx=(5, 2), sticky="w")
+        ttk.Label(cleanup_frame1, text="dias").grid(row=0, column=2, sticky="w")
 
-        backups = ttk.LabelFrame(frm, text="Backup e migração (configurações + tarefas)", padding=(6, 6))
-        backups.grid(row=row, column=0, columnspan=3, sticky="we"); row += 1
+        # Linha 2: Horário
+        cleanup_frame2 = ttk.Frame(tab_logs)
+        cleanup_frame2.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
+        ttk.Label(cleanup_frame2, text="Executar às:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cleanup_frame2, textvariable=self.var_cleanup_time, width=8)\
+            .grid(row=0, column=1, padx=(5, 2), sticky="w")
 
-        ttk.Button(backups, text="Exportar…", command=self.export_all)\
+        # Linha 3: Dia da semana
+        cleanup_frame3 = ttk.Frame(tab_logs)
+        cleanup_frame3.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
+        ttk.Label(cleanup_frame3, text="Dia da semana:").grid(row=0, column=0, sticky="w")
+        day_combo = ttk.Combobox(cleanup_frame3, textvariable=self.var_cleanup_day, width=15, state="readonly")
+        day_combo["values"] = ("0 - Segunda", "1 - Terça", "2 - Quarta", "3 - Quinta", "4 - Sexta", "5 - Sábado", "6 - Domingo")
+        day_combo.grid(row=0, column=1, padx=(5, 0), sticky="w")
+
+        ttk.Button(tab_logs, text="Limpar logs agora", command=self.cleanup_logs_now)\
+            .grid(row=row, column=0, sticky="w", pady=(8, 0))
+
+        # === ABA 5: SISTEMA ===
+        tab_sistema = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_sistema, text="Sistema")
+        
+        row = 0
+        # Atualizações
+        up_frame = ttk.LabelFrame(tab_sistema, text="Atualizações", padding=(8, 8))
+        up_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 10)); row += 1
+        ttk.Label(up_frame, text=f"Versão instalada: v{self._current_version}").grid(row=0, column=0, sticky="w")
+        ttk.Button(up_frame, text="Verificar atualização", command=self._check_updates)\
+            .grid(row=0, column=1, padx=(10, 0), sticky="e")
+        up_frame.columnconfigure(0, weight=1)
+
+        # Backup e migração
+        backup_frame = ttk.LabelFrame(tab_sistema, text="Backup e migração", padding=(8, 8))
+        backup_frame.grid(row=row, column=0, columnspan=3, sticky="we"); row += 1
+        ttk.Button(backup_frame, text="Exportar configurações", command=self.export_all)\
             .grid(row=0, column=0, padx=(0, 8), pady=2, sticky="w")
-        ttk.Button(backups, text="Importar…", command=self.import_all)\
-            .grid(row=0, column=1, padx=(0, 8), pady=2, sticky="w")
+        ttk.Button(backup_frame, text="Importar configurações", command=self.import_all)\
+            .grid(row=0, column=1, pady=2, sticky="w")
 
-        up.grid(row=row, column=0, columnspan=3, sticky="we"); row += 1
-        ttk.Label(up, text=f"Versão instalada: v{self._current_version}").grid(row=0, column=0, sticky="w")
-        ttk.Button(up, text="Verificar se há atualização", command=self._check_updates)\
-            .grid(row=0, column=1, padx=8, sticky="e")
+        # Configurar expansão das colunas nas abas
+        for tab in [tab_geral, tab_email, tab_wa, tab_logs, tab_sistema]:
+            tab.columnconfigure(1, weight=1)
 
-        btns = ttk.Frame(frm); btns.grid(row=row, column=0, columnspan=3, pady=(10,0))
-        ttk.Button(btns, text="Salvar", command=self.on_save).grid(row=0, column=0, padx=6)
-        ttk.Button(btns, text="Cancelar", command=self.destroy).grid(row=0, column=1, padx=6)
+        # Botões principais
+        btns = ttk.Frame(main_frame)
+        btns.grid(row=1, column=0, pady=(10, 0))
+        ttk.Button(btns, text="Salvar", command=self.on_save).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(btns, text="Cancelar", command=self.destroy).grid(row=0, column=1)
+
+        # Configurar responsividade da janela principal
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
 
         self.grab_set(); self.wait_visibility()
 
@@ -1350,6 +1485,13 @@ class SettingsDialog(tk.Toplevel):
         self.var_script.set(wa.get("webjs_script", str(resource_path("wa", "wa_send.js"))))
         self.var_my_number.set(wa.get("my_number", ""))
         self.var_to_targets.set(",".join(wa.get("to_targets", [])))
+
+        # Limpeza de logs
+        cleanup = s.get("log_cleanup", {})
+        self.var_cleanup_enabled.set(bool(cleanup.get("enabled", True)))
+        self.var_cleanup_days.set(str(cleanup.get("keep_days", 7)))
+        self.var_cleanup_day.set(str(cleanup.get("schedule_day", 6)))
+        self.var_cleanup_time.set(cleanup.get("schedule_time", "02:00"))
         
 
     def _pick(self, var, file=True):
@@ -1394,12 +1536,49 @@ class SettingsDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Falha", f"Não foi possível abrir o teste do WhatsApp:\n{e}")
 
+    def cleanup_logs_now(self):
+        """Executa limpeza de logs imediatamente."""
+        try:
+            # Cria configuração temporária baseada nos valores atuais da tela
+            temp_settings = {
+                "log_cleanup": {
+                    "enabled": self.var_cleanup_enabled.get(),
+                    "keep_days": int(self.var_cleanup_days.get() or 7)
+                }
+            }
+            
+            # Conta logs antes da limpeza
+            log_count_before = len(list(LOG_DIR.glob("*.log"))) if LOG_DIR.exists() else 0
+            
+            # Executa limpeza
+            cleanup_logs(temp_settings)
+            
+            # Conta logs após a limpeza
+            log_count_after = len(list(LOG_DIR.glob("*.log"))) if LOG_DIR.exists() else 0
+            removed = log_count_before - log_count_after
+            
+            if removed > 0:
+                messagebox.showinfo("Limpeza de logs", f"Limpeza concluída!\n{removed} arquivo(s) de log removido(s).")
+            else:
+                messagebox.showinfo("Limpeza de logs", "Nenhum arquivo de log antigo encontrado para remoção.")
+                
+        except Exception as e:
+            messagebox.showerror("Erro", f"Erro ao executar limpeza de logs:\n{e}")
+
     # ===== Coleta / salvar =====
     def get_result_preview(self):
         try:
             port = int(self.var_port.get())
         except Exception:
             port = 587
+        try:
+            cleanup_days = int(self.var_cleanup_days.get())
+        except Exception:
+            cleanup_days = 7
+        try:
+            cleanup_day = int(self.var_cleanup_day.get().split(" ")[0])
+        except Exception:
+            cleanup_day = 6
         return {
             "pdi_home": self.var_pdi.get().strip(),
             "email": {
@@ -1418,6 +1597,12 @@ class SettingsDialog(tk.Toplevel):
                 "webjs_script": self.var_script.get().strip(),
                 "my_number": self.var_my_number.get().strip(),
                 "to_targets": [n.strip() for n in self.var_to_targets.get().split(",") if n.strip()],
+            },
+            "log_cleanup": {
+                "enabled": self.var_cleanup_enabled.get(),
+                "keep_days": cleanup_days,
+                "schedule_day": cleanup_day,
+                "schedule_time": self.var_cleanup_time.get().strip()
             },
         }
 
@@ -1488,28 +1673,63 @@ class App(tk.Tk):
 
 
     def _style_table(self):
-     dark = bool(self.var_dark.get())
-     even = "#f7f7fb" if not dark else "#1d1d1d"
-     odd  = "#ffffff" if not dark else "#151515"
-     sel_bg = "#e6f4ea" if not dark else "#244a2a"
+        """Aplica estilo moderno à tabela com cores do tema atual"""
+        dark = bool(self.var_dark.get())
+        
+        # Usa cores do tema se disponível, senão usa cores padrão
+        if hasattr(self, '_theme_colors'):
+            colors = self._theme_colors
+            even = colors['surface']
+            odd = colors['bg']
+            sel_bg = colors['accent'] + '40'  # Accent com transparência
+            text_color = colors['text']
+            heading_bg = colors['overlay']
+        else:
+            # Cores padrão melhoradas
+            if dark:
+                even = "#2a2a2a"
+                odd = "#1e1e1e"
+                sel_bg = "#404040"
+                text_color = "#ffffff"
+                heading_bg = "#3a3a3a"
+            else:
+                even = "#f8f9fa"
+                odd = "#ffffff"
+                sel_bg = "#e3f2fd"
+                text_color = "#212529"
+                heading_bg = "#e9ecef"
 
-     style = ttk.Style(self)
-     # headings um pouco mais espaçosos
-     style.configure("Treeview.Heading", padding=6)
+        style = ttk.Style(self)
+        
+        # Cabeçalhos modernos
+        style.configure("Treeview.Heading", 
+                       padding=(8, 6),
+                       font=("Segoe UI", 9, "bold"),
+                       relief="flat")
+        
+        # Configuração da tabela
+        style.configure("Treeview",
+                       rowheight=28,  # Linhas mais altas
+                       font=("Segoe UI", 9))
 
-     # cores alternadas
-     try:
-        self.tree.tag_configure("evenrow", background=even)
-        self.tree.tag_configure("oddrow", background=odd)
-     except Exception:
-        pass
+        # Cores alternadas modernas
+        try:
+            self.tree.tag_configure("evenrow", 
+                                  background=even,
+                                  foreground=text_color)
+            self.tree.tag_configure("oddrow", 
+                                  background=odd,
+                                  foreground=text_color)
+        except Exception:
+            pass
 
-     # seleção mais visível
-     try:
-        style.map("Treeview",
-                  background=[("selected", sel_bg)])
-     except Exception:
-        pass
+        # Seleção com destaque suave
+        try:
+            style.map("Treeview",
+                     background=[("selected", sel_bg)],
+                     foreground=[("selected", text_color)])
+        except Exception:
+            pass
 
 
      # ===== Conectividade / Fila de updates =====
@@ -1581,7 +1801,7 @@ class App(tk.Tk):
         self._lbl_update.config(
             text=f"Atualização disponível: v{info.get('version')} — clique em 'Atualizar agora' para aplicar."
         )
-        self._update_banner.pack(fill="x")
+        self._update_banner.grid(row=1, column=0, sticky="ew")
 
     def apply_update_from_banner(self):
         if not self._update_info:
@@ -1605,7 +1825,17 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1060x600")
+        
+        # Configuração responsiva da janela
+        self.geometry("1200x700")  # Tamanho inicial maior
+        self.minsize(800, 500)     # Tamanho mínimo
+        self.state('zoomed')       # Inicia maximizada no Windows
+        
+        # Configurar responsividade da janela principal
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(3, weight=1)  # O painel principal (row 3) se expande
+        # Rows: 0=header, 1=banner, 2=toolbar, 3=main_content, 4=status
+        
         self.attributes("-alpha", 0.0)  # fade-in
         ensure_dirs()
         self.data = load_data()
@@ -1624,15 +1854,16 @@ class App(tk.Tk):
         style.configure("TButton", padding=4)
         style.configure("TLabel", font=("Segoe UI", 9))
 
-        # Cabeçalho (logo + título + tema)
+        # Cabeçalho (logo + título + tema) - Row 0
         header = ttk.Frame(self, padding=(8, 6))
-        header.pack(fill="x")
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(1, weight=1)  # Espaço entre logo e botão tema
 
-        # Banner de atualização (inicialmente oculto)
+        # Banner de atualização (inicialmente oculto) - Row 1
         self._update_info = None
         self._update_banner = ttk.Frame(self, padding=(8, 6))
-        self._update_banner.pack(fill="x")
-        self._update_banner.pack_forget()
+        self._update_banner.grid(row=1, column=0, sticky="ew")
+        self._update_banner.grid_remove()  # Oculta inicialmente
 
         self._lbl_update = ttk.Label(self._update_banner, text="", font=("Segoe UI", 10, "bold"))
         self._lbl_update.pack(side="left")
@@ -1641,7 +1872,7 @@ class App(tk.Tk):
         btns_up.pack(side="right")
         ttk.Button(btns_up, text="Atualizar agora", command=self.apply_update_from_banner)\
        .pack(side="left", padx=4)
-        ttk.Button(btns_up, text="Mais tarde", command=lambda: self._update_banner.pack_forget())\
+        ttk.Button(btns_up, text="Mais tarde", command=lambda: self._update_banner.grid_remove())\
        .pack(side="left", padx=4)
 
 
@@ -1656,42 +1887,45 @@ class App(tk.Tk):
                 self.iconbitmap(default=str(ico))
             except Exception:
                 pass
-            # Mostra a mesma .ico no cabeçalho (renderizada via Pillow) — apenas visual
-            try:
-                if Image and ImageTk:
-                    _pil = Image.open(ico).resize((28, 28), Image.LANCZOS)
-                    _img = ImageTk.PhotoImage(_pil)
-                    ttk.Label(header, image=_img).pack(side="left")
-                    self._header_img = _img  # evita GC
-            except Exception:
-                pass
+        # Logo e título (lado esquerdo)
+        logo_frame = ttk.Frame(header)
+        logo_frame.grid(row=0, column=0, sticky="w")
+        
+        # Mostra a mesma .ico no cabeçalho (renderizada via Pillow) — apenas visual
+        try:
+            if Image and ImageTk:
+                _pil = Image.open(ico).resize((28, 28), Image.LANCZOS)
+                _img = ImageTk.PhotoImage(_pil)
+                ttk.Label(logo_frame, image=_img).pack(side="left")
+                self._header_img = _img  # evita GC
+        except Exception:
+            pass
+        
+        title_label = ttk.Label(logo_frame, text="🚀 Agendador-Bravo", font=("Segoe UI", 14, "bold"))
+        title_label.pack(side="left", padx=8)
 
-            # Mostra a mesma .ico no cabeçalho (renderizada via Pillow) — apenas visual
-            try:
-                if Image and ImageTk:
-                    _pil = Image.open(ico).resize((28, 28), Image.LANCZOS)
-                    _img = ImageTk.PhotoImage(_pil)
-                    ttk.Label(header, image=_img).pack(side="left")
-                    self._header_img = _img  # evita GC
-            except Exception:
-                pass
-
-        ttk.Label(header, text="Agendador-Bravo", font=("Segoe UI", 12, "bold")).pack(side="left", padx=8)
-
+        # Controles (lado direito)
+        controls_frame = ttk.Frame(header)
+        controls_frame.grid(row=0, column=2, sticky="e")
+        
         self.var_dark = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            header, text="Modo escuro",
+        theme_button = ttk.Checkbutton(
+            controls_frame, text="🌙 Modo escuro",
             variable=self.var_dark,
-            command=lambda: self._apply_theme(self.var_dark.get())
-        ).pack(side="right", padx=6)
+            command=lambda: self._toggle_theme()
+        )
+        theme_button.pack(side="right", padx=6)
 
-        # --------- Toolbar responsiva ----------
-        toolbar_outer = ttk.Frame(self); toolbar_outer.pack(fill="x")
+        # --------- Toolbar responsiva ---------- Row 2
+        toolbar_outer = ttk.Frame(self)
+        toolbar_outer.grid(row=2, column=0, sticky="ew", padx=6)
+        toolbar_outer.columnconfigure(0, weight=1)
+        
         self._toolbar_canvas = tk.Canvas(toolbar_outer, height=40, highlightthickness=0)
-        self._toolbar_canvas.pack(fill="x", expand=True, side="top")
+        self._toolbar_canvas.grid(row=0, column=0, sticky="ew")
         self._toolbar_scroll = ttk.Scrollbar(toolbar_outer, orient="horizontal",
                                              command=self._toolbar_canvas.xview)
-        self._toolbar_scroll.pack(fill="x", side="bottom")
+        self._toolbar_scroll.grid(row=1, column=0, sticky="ew")
         self._toolbar_canvas.configure(xscrollcommand=self._toolbar_scroll.set)
         self._toolbar_inner = ttk.Frame(self._toolbar_canvas)
         self._toolbar_canvas.create_window((0, 0), window=self._toolbar_inner, anchor="nw")
@@ -1706,41 +1940,73 @@ class App(tk.Tk):
                                              "break"))
         
         bar = self._toolbar_inner
-        ttk.Button(bar, text="➕ Nova", command=self.add_task).pack(side="left")
-        ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant).pack(side="left", padx=5)
-        ttk.Button(bar, text="✏️ Editar", command=self.edit_task).pack(side="left")
-        ttk.Button(bar, text="🗑️ Remover", command=self.remove_task).pack(side="left")
-        self.btn_run = ttk.Button(bar, text="▶ Executar agora", command=self.run_now)
-        self.btn_run.pack(side="left", padx=(10, 0))
-        ttk.Button(bar, text="🧪 Simular erro", command=self.simulate_error).pack(side="left", padx=5)
-        ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings).pack(side="left", padx=5)
-        ttk.Button(bar, text="📂 Logs (pasta)", command=lambda: os.startfile(LOG_DIR)).pack(side="left", padx=5)
-        ttk.Button(bar, text="📄 Último log", command=self.open_last_log).pack(side="left", padx=5)
-        ttk.Button(bar, text="💡 Dicas", command=self.show_tips).pack(side="left", padx=5)
-        ttk.Button(bar, text="💾 Salvar", command=self.save).pack(side="left", padx=5)
+        
+        # Botões principais com estilos modernos
+        ttk.Button(bar, text="➕ Nova", command=self.add_task, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="✏️ Editar", command=self.edit_task, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="🗑️ Remover", command=self.remove_task, style="Modern.TButton").pack(side="left", padx=2)
+        
+        # Separador visual
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        
+        # Botão de ativar/desativar
+        self.btn_toggle = ttk.Button(bar, text="⏸️ Desativar", command=self.toggle_task_status, style="Toggle.TButton")
+        self.btn_toggle.pack(side="left", padx=2)
+        
+        # Botão de execução (destaque)
+        self.btn_run = ttk.Button(bar, text="▶ Executar agora", command=self.run_now, style="Accent.TButton")
+        self.btn_run.pack(side="left", padx=(8, 2))
+        
+        # Separador visual
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        
+        # Botões secundários
+        ttk.Button(bar, text="🧪 Simular erro", command=self.simulate_error, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="💡 Dicas", command=self.show_tips, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="💾 Salvar", command=self.save, style="Modern.TButton").pack(side="left", padx=2)
 
 
-        # --------- Layout principal ----------
+        # --------- Layout principal ---------- Row 3 (principal, expansível)
         paned = ttk.Panedwindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=6, pady=6)
+        paned.grid(row=3, column=0, sticky="nsew", padx=6, pady=6)
 
         left = ttk.Frame(paned)
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
 
-        cols = ("Nome","Hora","Dias","Arquivo","NotificarFalha","Timeout")
+        cols = ("Status","Nome","Hora","Dias","Arquivo","NotificarFalha","Timeout")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
         self._style_table()
+        
+        # Configuração responsiva das colunas
+        col_configs = {
+            "Status": {"width": 80, "minwidth": 60, "stretch": False},
+            "Nome": {"width": 200, "minwidth": 150, "stretch": True},
+            "Hora": {"width": 80, "minwidth": 60, "stretch": False},
+            "Dias": {"width": 100, "minwidth": 80, "stretch": False},
+            "Arquivo": {"width": 300, "minwidth": 200, "stretch": True},
+            "NotificarFalha": {"width": 100, "minwidth": 80, "stretch": False},
+            "Timeout": {"width": 80, "minwidth": 60, "stretch": False}
+        }
+        
         for c in cols:
             self.tree.heading(c, text=c)
-            self.tree.column(c, stretch=True)
+            config = col_configs[c]
+            self.tree.column(c, 
+                           width=config["width"], 
+                           minwidth=config["minwidth"], 
+                           stretch=config["stretch"])
         vbar = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         hbar = ttk.Scrollbar(left, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vbar.grid(row=0, column=1, sticky="ns")
         hbar.grid(row=1, column=0, sticky="ew")
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self.draw_chart())
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Configure>", self._on_tree_resize)
 
         right = ttk.Frame(paned)
@@ -1756,20 +2022,34 @@ class App(tk.Tk):
         paned.add(left, weight=3)
         paned.add(right, weight=2)
 
-        # --------- Status bar ----------
-        status = ttk.Frame(self, relief="groove", padding=(6,3)); status.pack(fill="x")
-        self.status_label = ttk.Label(status, text="Pronto."); self.status_label.pack(side="left")
-        self.lbl_net = ttk.Label(status, text="Internet ●")
+        # --------- Status bar ---------- Row 4
+        status = ttk.Frame(self, relief="groove", padding=(6,3))
+        status.grid(row=4, column=0, sticky="ew")
+        status.columnconfigure(0, weight=1)  # Status label se expande
+        
+        self.status_label = ttk.Label(status, text="Pronto.")
+        self.status_label.grid(row=0, column=0, sticky="w")
+        
+        # Indicadores de status (lado direito)
+        indicators_frame = ttk.Frame(status)
+        indicators_frame.grid(row=0, column=1, sticky="e")
+        
+        self.pbar = ttk.Progressbar(indicators_frame, mode="indeterminate", length=160)
+        self.pbar.pack(side="right")
+        self.lbl_wa = ttk.Label(indicators_frame, text="WhatsApp ●")
+        self.lbl_wa.pack(side="right", padx=(0,12))
+        self.lbl_mail = ttk.Label(indicators_frame, text="E-mail ●")
+        self.lbl_mail.pack(side="right", padx=(0,12))
+        self.lbl_net = ttk.Label(indicators_frame, text="Internet ●")
         self.lbl_net.pack(side="right", padx=(0,12))
-        self.lbl_mail = ttk.Label(status, text="E-mail ●"); self.lbl_mail.pack(side="right", padx=(0,12))
-        self.lbl_wa   = ttk.Label(status, text="WhatsApp ●"); self.lbl_wa.pack(side="right", padx=(0,12))
-        self.pbar = ttk.Progressbar(status, mode="indeterminate", length=160); self.pbar.pack(side="right")
 
         # Dados / agendamento
+        self._ensure_task_enabled_field()  # Garante que tarefas existentes tenham o campo enabled
         self.refresh_table()
         self.reschedule_all()
         self.update_status_indicators()
         self.update_net_indicator()
+        self.update_toggle_button()  # Inicializa o botão toggle
         self._apply_theme(False)
         self._fade_in()
         self._pulse_status()
@@ -1778,43 +2058,181 @@ class App(tk.Tk):
         start_net_monitor(self)
         start_auto_update_thread(self)
 
-    # ===== Tema / animações =====
+    def _ensure_task_enabled_field(self):
+        """Garante que todas as tarefas existentes tenham o campo 'enabled'"""
+        for task in self.data.get("tasks", []):
+            if "enabled" not in task:
+                task["enabled"] = True  # Por padrão, tarefas existentes ficam ativas
+
+    # ===== Tema / animações modernas =====
     def _apply_theme(self, dark: bool):
-     try:
-        if sv_ttk:
-            sv_ttk.use_dark_theme() if dark else sv_ttk.use_light_theme()
-     except Exception:
-        pass
-
-     style = ttk.Style(self)
-     style.configure("TButton", padding=6)
-     style.configure("TLabel", padding=2)
-     style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"))
-     try:
-        self.btn_run.configure(style="Accent.TButton")
-     except Exception:
-        pass
-
-     self._style_table()  # reconfigura a Treeview
-
-     # Só repinta o gráfico se o canvas já existir
-     if hasattr(self, "canvas"):
-        self.draw_chart()
-
-
-    # >>> ADICIONE ESTAS DUAS LINHAS <<<
-     self._style_table()   # reconfigura cores das linhas (even/odd/seleção)
-     self.draw_chart()     # repinta o canvas com fundo/grades corretos
-
-    def _fade_in(self, target=1.0, step=0.08):
+        """Aplica tema moderno com cores e animações atualizadas"""
+        # Define paleta de cores moderna
+        if dark:
+            colors = {
+                'bg': '#1e1e2e',           # Fundo principal (Catppuccin Mocha)
+                'surface': '#313244',       # Superfícies (cards, frames)
+                'overlay': '#6c7086',       # Overlays e bordas
+                'text': '#cdd6f4',         # Texto principal
+                'subtext': '#a6adc8',      # Texto secundário
+                'accent': '#89b4fa',       # Azul accent
+                'success': '#a6e3a1',      # Verde sucesso
+                'warning': '#f9e2af',      # Amarelo aviso
+                'error': '#f38ba8',        # Rosa erro
+                'purple': '#cba6f7',       # Roxo
+                'teal': '#94e2d5',         # Teal
+            }
+        else:
+            colors = {
+                'bg': '#eff1f5',           # Fundo principal (Catppuccin Latte)
+                'surface': '#e6e9ef',       # Superfícies
+                'overlay': '#9ca0b0',       # Overlays
+                'text': '#4c4f69',         # Texto principal
+                'subtext': '#6c6f85',      # Texto secundário
+                'accent': '#1e66f5',       # Azul accent
+                'success': '#40a02b',      # Verde sucesso
+                'warning': '#df8e1d',      # Amarelo aviso
+                'error': '#d20f39',        # Vermelho erro
+                'purple': '#8839ef',       # Roxo
+                'teal': '#179299',         # Teal
+            }
+        
+        # Configura o tema base
         try:
-            a = float(self.attributes("-alpha") or 0.0)
+            if sv_ttk:
+                sv_ttk.use_dark_theme() if dark else sv_ttk.use_light_theme()
+        except Exception:
+            pass
+
+        # Aplica estilos personalizados
+        style = ttk.Style(self)
+        
+        # Botões modernos com gradiente sutil
+        style.configure("Modern.TButton", 
+                       padding=(12, 8),
+                       font=("Segoe UI", 9),
+                       borderwidth=0,
+                       focuscolor='none')
+        
+        # Botão de destaque (Executar)
+        style.configure("Accent.TButton",
+                       padding=(12, 8),
+                       font=("Segoe UI", 9, "bold"),
+                       borderwidth=0,
+                       focuscolor='none')
+        
+        # Botão de toggle (Ativar/Desativar)
+        style.configure("Toggle.TButton",
+                       padding=(10, 6),
+                       font=("Segoe UI", 9),
+                       borderwidth=0,
+                       focuscolor='none')
+        
+        # Labels com tipografia moderna
+        style.configure("Title.TLabel",
+                       font=("Segoe UI", 14, "bold"),
+                       padding=(0, 4))
+        
+        style.configure("Subtitle.TLabel",
+                       font=("Segoe UI", 10),
+                       padding=(0, 2))
+        
+        # Configura cores do canvas
+        self.configure(bg=colors['bg'])
+        
+        # Aplica estilos aos botões específicos
+        try:
+            self.btn_run.configure(style="Accent.TButton")
+            self.btn_toggle.configure(style="Toggle.TButton")
+        except Exception:
+            pass
+        
+        # Armazena cores para uso em outros componentes
+        self._theme_colors = colors
+        
+        # Atualiza componentes visuais
+        self._style_table()
+        self._update_status_colors()
+        
+        # Só repinta o gráfico se o canvas já existir
+        if hasattr(self, "canvas"):
+            self.draw_chart()
+    
+    def _toggle_theme(self):
+        """Alterna tema com animação suave"""
+        dark_mode = self.var_dark.get()
+        
+        # Atualiza texto do botão
+        try:
+            theme_text = "☀️ Modo claro" if dark_mode else "🌙 Modo escuro"
+            # Encontra o checkbutton e atualiza o texto
+            for widget in self.winfo_children():
+                if isinstance(widget, ttk.Frame):
+                    for child in widget.winfo_children():
+                        if isinstance(child, ttk.Frame):
+                            for grandchild in child.winfo_children():
+                                if isinstance(grandchild, ttk.Checkbutton):
+                                    grandchild.configure(text=theme_text)
+                                    break
+        except Exception:
+            pass
+        
+        # Aplica o tema com pequena animação
+        self._animate_theme_change(dark_mode)
+    
+    def _animate_theme_change(self, dark_mode):
+        """Animação suave na mudança de tema"""
+        # Fade out rápido
+        self.attributes("-alpha", 0.7)
+        self.after(50, lambda: self._complete_theme_change(dark_mode))
+    
+    def _complete_theme_change(self, dark_mode):
+        """Completa a mudança de tema"""
+        self._apply_theme(dark_mode)
+        # Fade in de volta
+        self.attributes("-alpha", 1.0)
+    
+    def _update_status_colors(self):
+        """Atualiza cores dos indicadores de status"""
+        if not hasattr(self, '_theme_colors'):
+            return
+            
+        colors = self._theme_colors
+        try:
+            # Atualiza cor de fundo da barra de status
+            status_frame = self.lbl_net.master.master  # Frame da barra de status
+            status_frame.configure(style="Status.TFrame")
+        except Exception:
+            pass
+
+    def _fade_in(self, target=1.0, step=0.05):
+        """Animação suave de fade-in com easing"""
+        try:
+            current_alpha = float(self.attributes("-alpha") or 0.0)
         except Exception:
             return
-        a = min(target, a + step)
-        self.attributes("-alpha", a)
-        if a < target:
-            self.after(30, self._fade_in, target, step)
+        
+        # Easing suave (ease-out)
+        progress = current_alpha / target
+        eased_step = step * (2 - progress)  # Acelera no início, desacelera no final
+        
+        new_alpha = min(target, current_alpha + eased_step)
+        self.attributes("-alpha", new_alpha)
+        
+        if new_alpha < target:
+            self.after(16, self._fade_in, target, step)  # ~60fps
+        else:
+            # Animação completa, adiciona um pequeno bounce
+            self._bounce_effect()
+    
+    def _bounce_effect(self):
+        """Pequeno efeito de bounce no final do fade-in"""
+        try:
+            # Pequeno bounce para 1.02 e volta para 1.0
+            self.attributes("-alpha", 1.02)
+            self.after(50, lambda: self.attributes("-alpha", 1.0))
+        except Exception:
+            pass
 
     def _channels_ok(self):
         s = self.data.get("settings", {})
@@ -1833,19 +2251,43 @@ class App(tk.Tk):
         return em_ok, wa_ok
 
     def _pulse_status(self):
+        """Animação suave dos indicadores de status"""
         em_ok, wa_ok = self._channels_ok()
-        g1, g2 = "#2ecc71", "#27ae60"
-        r = "#dc143c"
+        
+        # Usa cores do tema se disponível
+        if hasattr(self, '_theme_colors'):
+            colors = self._theme_colors
+            success_bright = colors['success']
+            success_dim = self._lighten_color(colors['success'], -0.3)
+            error_color = colors['error']
+            net_color = colors['teal']
+        else:
+            # Cores padrão melhoradas
+            success_bright = "#4ade80"
+            success_dim = "#22c55e"
+            error_color = "#ef4444"
+            net_color = "#06b6d4"
+        
+        # Animação de pulsação mais suave
         t = getattr(self, "_pulse_toggle", False)
         self._pulse_toggle = not t
-        self.lbl_mail.config(foreground=(g1 if t else g2) if em_ok else r)
-        self.lbl_wa.config(foreground=(g1 if t else g2) if wa_ok else r)
-        self.after(650, self._pulse_status)
+        
+        # Aplica cores com transição suave
+        mail_color = (success_bright if t else success_dim) if em_ok else error_color
+        wa_color = (success_bright if t else success_dim) if wa_ok else error_color
+        net_color_pulse = (net_color if t else self._lighten_color(net_color, -0.2)) if self.net_online else error_color
+        
+        self.lbl_mail.config(foreground=mail_color)
+        self.lbl_wa.config(foreground=wa_color)
+        self.lbl_net.config(foreground=net_color_pulse)
+        
+        # Frequência mais suave (800ms ao invés de 650ms)
+        self.after(800, self._pulse_status)
 
     # ===== utilidades UI =====
     def _on_tree_resize(self, event=None):
         w = max(300, self.tree.winfo_width())
-        ratios = {"Nome":0.18, "Hora":0.08, "Dias":0.22, "Arquivo":0.38, "NotificarFalha":0.08, "Timeout":0.06}
+        ratios = {"Status":0.08, "Nome":0.18, "Hora":0.08, "Dias":0.20, "Arquivo":0.32, "NotificarFalha":0.08, "Timeout":0.06}
         for col, r in ratios.items():
             self.tree.column(col, width=max(60, int(w * r)), stretch=True)
 
@@ -1891,6 +2333,10 @@ class App(tk.Tk):
 
         # recria jobs
         for t in self.data.get("tasks", []):
+            # Pula tarefas desativadas
+            if not t.get("enabled", True):
+                continue
+                
             stype = (t.get("schedule_type") or "cron").lower()
 
             # dias válidos
@@ -1970,21 +2416,67 @@ class App(tk.Tk):
                 job_ids.append(jid)
             self.jobs[t["name"]] = job_ids
 
+        # Agenda limpeza automática de logs (se habilitada)
+        self._schedule_log_cleanup()
+
         # garante scheduler rodando
         if not self.scheduler.running:
             self.scheduler.start()
 
+    def _schedule_log_cleanup(self):
+        """Agenda a limpeza automática de logs baseada nas configurações."""
+        cleanup_cfg = self.data.get("settings", {}).get("log_cleanup", {})
+        
+        if not cleanup_cfg.get("enabled", True):
+            return
+        
+        try:
+            # Extrai configurações
+            schedule_day = int(cleanup_cfg.get("schedule_day", 6))  # 0=segunda, 6=domingo
+            schedule_time = cleanup_cfg.get("schedule_time", "02:00")
+            hh, mm = map(int, schedule_time.split(":"))
+            
+            # Mapeia número do dia para string do APScheduler
+            day_names = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            day_name = day_names[schedule_day % 7]
+            
+            # Cria trigger para executar semanalmente
+            trig = CronTrigger(day_of_week=day_name, hour=hh, minute=mm)
+            
+            # Agenda job de limpeza
+            self.scheduler.add_job(
+                self._cleanup_logs_job,
+                trigger=trig,
+                id="__log_cleanup__",
+                name="Limpeza automática de logs"
+            )
+            
+        except Exception:
+            # Se houver erro no agendamento, não faz nada
+            pass
+
+    def _cleanup_logs_job(self):
+        """Job que executa a limpeza automática de logs."""
+        try:
+            cleanup_logs(self.data.get("settings", {}))
+        except Exception:
+            # Se houver erro na limpeza, não faz nada
+            pass
 
     def _job_wrapper(self, task):
         def progress(_):
             pass
+        try:
+            if self.winfo_exists():
+                self.after(0, lambda t=task: (self._set_task_running(t["name"], True), self._on_job_start(t)))
+        except Exception:
+            pass
         rc, dur, log_path = run_task(task, self.data["settings"], progress_cb=progress)
         append_history(self.data, task["name"], rc, dur)
         self._maybe_notify(task, rc, log_path)
-        # GUI pode já ter sido destruída (Ctrl+C / fechamento)
         try:
             if self.winfo_exists():
-                self.after(0, self.draw_chart)
+                self.after(0, lambda t=task, r=rc, d=dur, lp=log_path: (self._set_task_running(t["name"], False), self.draw_chart(), self._on_job_end(t, r, d, lp)))
         except Exception:
             pass
 
@@ -2000,6 +2492,73 @@ class App(tk.Tk):
                 send_whatsapp(self.data["settings"], subject, body)
             except Exception as e:
                 print("Erro WhatsApp:", e)
+
+    def _set_task_running(self, name, running: bool):
+        try:
+            vals = list(self.tree.item(name, "values"))
+            if not vals:
+                return
+            enabled = True
+            try:
+                enabled = next((t for t in self.data.get("tasks", []) if t.get("name") == name), {}).get("enabled", True)
+            except Exception:
+                pass
+            vals[0] = "⏳ Rodando" if running else ("✅ Ativo" if enabled else "⏸️ Inativo")
+            self.tree.item(name, values=tuple(vals))
+        except Exception:
+            pass
+
+    def _on_job_start(self, task):
+        try:
+            self.set_status_line(f"Iniciando '{task['name']}'…")
+            self._show_toast(f"Iniciando: {task['name']}", task.get('path', ''))
+        except Exception:
+            pass
+
+    def _on_job_end(self, task, rc, dur, log_path):
+        try:
+            status = "OK" if rc == 0 else f"Falha (RC={rc})"
+            self.set_status_line(f"Concluído '{task['name']}' — {status} em {dur:.1f}s")
+            self._show_toast(f"Concluído: {task['name']}", f"{status} • {dur:.1f}s", ok=(rc == 0))
+        except Exception:
+            pass
+
+    def _show_toast(self, title: str, subtitle: str = "", duration: int = 4000, ok: bool = True):
+        try:
+            win = tk.Toplevel(self)
+            win.overrideredirect(True)
+            try:
+                win.attributes("-topmost", True)
+            except Exception:
+                pass
+            colors = getattr(self, "_theme_colors", None)
+            bg = (colors.get('surface') if colors else "#333333") if isinstance(colors, dict) else "#333333"
+            fg = (colors.get('text') if colors else "#ffffff") if isinstance(colors, dict) else "#ffffff"
+            border = (colors.get('success') if ok else colors.get('error')) if isinstance(colors, dict) else ("#22c55e" if ok else "#ef4444")
+            frame = tk.Frame(win, bg=bg, highlightthickness=2, highlightbackground=border)
+            frame.pack(fill="both", expand=True)
+            lbl1 = tk.Label(frame, text=title, bg=bg, fg=fg, font=("Segoe UI", 10, "bold"))
+            lbl1.pack(anchor="w", padx=10, pady=(8, 0))
+            if subtitle:
+                lbl2 = tk.Label(frame, text=subtitle, bg=bg, fg=fg, font=("Segoe UI", 9))
+                lbl2.pack(anchor="w", padx=10, pady=(2, 10))
+            else:
+                tk.Label(frame, text="", bg=bg).pack(pady=(0, 6))
+            self.update_idletasks()
+            win.update_idletasks()
+            w = max(260, frame.winfo_reqwidth() + 4)
+            h = max(60, frame.winfo_reqheight() + 4)
+            try:
+                rx, ry = self.winfo_rootx(), self.winfo_rooty()
+                rw, rh = self.winfo_width(), self.winfo_height()
+                x = rx + max(0, rw - w - 24)
+                y = ry + max(0, rh - h - 60)
+            except Exception:
+                x = y = 40
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            win.after(int(duration), win.destroy)
+        except Exception:
+            pass
 
     # ===== helpers busy/status =====
     def _set_ui_busy(self, busy=True, msg=None):
@@ -2053,37 +2612,89 @@ class App(tk.Tk):
         for idx, t in enumerate(self.data.get("tasks", [])):
             hora, dias = self._hora_dias_text(t)
             tag = ("evenrow" if idx % 2 == 0 else "oddrow")
+            
+            # Status da tarefa (ativo/inativo)
+            status = "✅ Ativo" if t.get("enabled", True) else "⏸️ Inativo"
+            
             self.tree.insert(
                 "", "end", iid=t["name"], tags=(tag,), values=(
-                    t["name"], hora, dias, t["path"],
+                    status, t["name"], hora, dias, t["path"],
                     "Sim" if t.get("notify_fail", True) else "Não",
                     t.get("timeout", "0")
                 )
             )
         self.draw_chart()
 
+    def _on_tree_select(self, event=None):
+        """Chamado quando uma linha da tabela é selecionada"""
+        self.draw_chart()
+        self.update_toggle_button()
+
     def draw_chart(self):
+        """Desenha gráfico moderno com animações suaves"""
         self.canvas.delete("all")
         dark = bool(self.var_dark.get())
-        self.canvas.configure(bg=("#0f0f10" if dark else "#ffffff"))
-        grid = "#2a2a2a" if dark else "#e0e0e0"
+        
+        # Usa cores do tema se disponível
+        if hasattr(self, '_theme_colors'):
+            colors = self._theme_colors
+            bg_color = colors['bg']
+            grid_color = colors['overlay']
+            text_color = colors['text']
+            subtext_color = colors['subtext']
+            success_color = colors['success']
+            error_color = colors['error']
+            accent_color = colors['accent']
+        else:
+            # Cores padrão melhoradas
+            bg_color = "#1a1a1a" if dark else "#ffffff"
+            grid_color = "#404040" if dark else "#e0e0e0"
+            text_color = "#ffffff" if dark else "#000000"
+            subtext_color = "#b0b0b0" if dark else "#666666"
+            success_color = "#4ade80" if dark else "#22c55e"
+            error_color = "#f87171" if dark else "#ef4444"
+            accent_color = "#60a5fa" if dark else "#3b82f6"
+        
+        self.canvas.configure(bg=bg_color)
 
         sel = self.tree.selection()
         if not sel:
+            # Mensagem estilizada quando nenhuma tarefa está selecionada
+            w = int(self.canvas.winfo_width() or 400)
+            h = int(self.canvas.winfo_height() or 300)
+            
             self.canvas.create_text(
-                10, 10, anchor="nw",
-                fill=("#bfbfbf" if dark else "#000"),
-                text="Selecione uma tarefa para ver o histórico."
+                w//2, h//2 - 20, anchor="center",
+                fill=subtext_color,
+                font=("Segoe UI", 12),
+                text="📊 Histórico de Execuções"
+            )
+            self.canvas.create_text(
+                w//2, h//2 + 10, anchor="center",
+                fill=subtext_color,
+                font=("Segoe UI", 10),
+                text="Selecione uma tarefa para visualizar o histórico"
             )
             return
 
         name = sel[0]
         hist = self.data.get("history", {}).get(name, [])
         if not hist:
+            # Mensagem estilizada quando não há histórico
+            w = int(self.canvas.winfo_width() or 400)
+            h = int(self.canvas.winfo_height() or 300)
+            
             self.canvas.create_text(
-                10, 10, anchor="nw",
-                fill=("#bfbfbf" if dark else "#000"),
-                text="Ainda sem histórico para esta tarefa."
+                w//2, h//2 - 20, anchor="center",
+                fill=subtext_color,
+                font=("Segoe UI", 12),
+                text="📈 Sem dados ainda"
+            )
+            self.canvas.create_text(
+                w//2, h//2 + 10, anchor="center",
+                fill=subtext_color,
+                font=("Segoe UI", 10),
+                text="Execute a tarefa para ver o histórico aqui"
             )
             return
 
@@ -2094,57 +2705,132 @@ class App(tk.Tk):
         H1 = int(h * 0.62)
         chart_w = w - 2 * pad
 
-        # duração (barras)
+        # Gráfico de duração modernizado
         N = len(items)
         chart_h = H1 - pad
         max_dur = max(1.0, max(i["dur"] for i in items))
-        bar_w = max(2, int(chart_w / max(N, 1) * 0.7))
+        bar_w = max(3, int(chart_w / max(N, 1) * 0.8))  # Barras um pouco mais largas
+        
+        # Título do gráfico com estilo moderno
         self.canvas.create_text(
-            pad, 8, anchor="nw",
-            text=f"Duração (s) — últimas {N}",
-            fill=("#bfbfbf" if dark else "#000")
+            pad, 12, anchor="nw",
+            text=f"⏱️ Tempo de Execução — últimas {N} execuções",
+            fill=text_color,
+            font=("Segoe UI", 10, "bold")
         )
-        self.canvas.create_line(pad, H1 - 10, w - pad, H1 - 10, fill=grid)
+        
+        # Grid moderno com linhas mais sutis
+        self.canvas.create_line(pad, H1 - 10, w - pad, H1 - 10, fill=grid_color, width=2)
         for k in (0.25, 0.5, 0.75):
             y = (H1 - 10) - k * chart_h
-            self.canvas.create_line(pad, y, w - pad, y, fill=grid)
+            self.canvas.create_line(pad, y, w - pad, y, fill=grid_color, width=1, dash=(2, 4))
 
+        # Barras com bordas arredondadas (simuladas)
         for idx, it in enumerate(items):
             x_center = pad + (idx + 0.5) * (chart_w / N)
-            bh = (it["dur"] / max_dur) * (chart_h - 6)
+            bh = max(4, (it["dur"] / max_dur) * (chart_h - 6))  # Altura mínima
             y0 = (H1 - 10) - bh
-            color = "#3cb371" if it["rc"] == 0 else "#dc143c"
+            
+            # Cor baseada no resultado
+            color = success_color if it["rc"] == 0 else error_color
+            
+            # Barra principal
             self.canvas.create_rectangle(
                 x_center - bar_w / 2, y0,
                 x_center + bar_w / 2, H1 - 10,
-                fill=color, outline=""
+                fill=color, outline="", width=0
             )
+            
+            # Efeito de brilho no topo (simulando material design)
+            if bh > 8:
+                highlight_h = min(4, bh * 0.3)
+                highlight_color = self._lighten_color(color, 0.3)
+                self.canvas.create_rectangle(
+                    x_center - bar_w / 2, y0,
+                    x_center + bar_w / 2, y0 + highlight_h,
+                    fill=highlight_color, outline=""
+                )
 
-        # legenda
-        self.canvas.create_rectangle(w - pad - 120, 6, w - pad - 102, 24, fill="#3cb371", outline="")
-        self.canvas.create_text(w - pad - 96, 15, text="Ok", anchor="w", fill=("#bfbfbf" if dark else "#000"))
-        self.canvas.create_rectangle(w - pad - 60, 6, w - pad - 42, 24, fill="#dc143c", outline="")
-        self.canvas.create_text(w - pad - 36, 15, text="Falha", anchor="w", fill=("#bfbfbf" if dark else "#000"))
+        # Legenda moderna
+        legend_y = 30
+        # Sucesso
+        self.canvas.create_oval(w - pad - 120, legend_y, w - pad - 108, legend_y + 12, 
+                               fill=success_color, outline="")
+        self.canvas.create_text(w - pad - 102, legend_y + 6, text="✓ Sucesso", 
+                               anchor="w", fill=text_color, font=("Segoe UI", 9))
+        # Erro
+        self.canvas.create_oval(w - pad - 60, legend_y, w - pad - 48, legend_y + 12, 
+                               fill=error_color, outline="")
+        self.canvas.create_text(w - pad - 42, legend_y + 6, text="✗ Falha", 
+                               anchor="w", fill=text_color, font=("Segoe UI", 9))
 
-        # acumulado OK x Falha
+        # Gráfico de barras horizontal moderno (Sucesso vs Falha)
         ok = sum(1 for i in items if i["rc"] == 0)
         fail = N - ok
         total = max(1, N)
-        y_top = H1 + 10
+        y_top = H1 + 15
+        
         self.canvas.create_text(
             pad, y_top, anchor="nw",
-            text=f"Acertos x Falhas — últimas {N}",
-            fill=("#bfbfbf" if dark else "#000")
+            text=f"📊 Taxa de Sucesso — {ok}/{N} ({(ok/total)*100:.1f}%)",
+            fill=text_color,
+            font=("Segoe UI", 10, "bold")
         )
-        y_bar = y_top + 18
-        bar_h = max(18, h - y_bar - 14)
+        
+        y_bar = y_top + 25
+        bar_h = max(20, h - y_bar - 20)
         full_w = w - 2 * pad
         ok_w = int(full_w * (ok / total))
         fail_w = full_w - ok_w
-        self.canvas.create_rectangle(pad, y_bar, pad + ok_w, y_bar + bar_h, fill="#3cb371", outline="")
-        self.canvas.create_rectangle(pad + ok_w, y_bar, pad + ok_w + fail_w, y_bar + bar_h, fill="#dc143c", outline="")
-        self.canvas.create_text(pad + 6, y_bar + bar_h / 2, text=f"{ok} OK", anchor="w", fill="white")
-        self.canvas.create_text(pad + ok_w + fail_w - 6, y_bar + bar_h / 2, text=f"{fail} Falhas", anchor="e", fill="white")
+        
+        # Fundo da barra
+        self.canvas.create_rectangle(pad, y_bar, pad + full_w, y_bar + bar_h, 
+                                   fill=grid_color, outline="")
+        
+        # Barra de sucesso
+        if ok_w > 0:
+            self.canvas.create_rectangle(pad, y_bar, pad + ok_w, y_bar + bar_h, 
+                                       fill=success_color, outline="")
+        
+        # Barra de falha
+        if fail_w > 0:
+            self.canvas.create_rectangle(pad + ok_w, y_bar, pad + ok_w + fail_w, y_bar + bar_h, 
+                                       fill=error_color, outline="")
+        
+        # Texto sobre as barras
+        if ok > 0:
+            self.canvas.create_text(pad + ok_w//2, y_bar + bar_h//2, 
+                                  text=f"{ok} OK", anchor="center", 
+                                  fill="white", font=("Segoe UI", 9, "bold"))
+        if fail > 0:
+            self.canvas.create_text(pad + ok_w + fail_w//2, y_bar + bar_h//2, 
+                                  text=f"{fail} Falhas", anchor="center", 
+                                  fill="white", font=("Segoe UI", 9, "bold"))
+    
+    def _lighten_color(self, color, factor):
+        """Clareia ou escurece uma cor hexadecimal por um fator (-1.0 a 1.0)"""
+        try:
+            # Remove o # se presente
+            color = color.lstrip('#')
+            # Converte para RGB
+            r, g, b = tuple(int(color[i:i+2], 16) for i in (0, 2, 4))
+            
+            if factor >= 0:
+                # Clareia (mistura com branco)
+                r = min(255, int(r + (255 - r) * factor))
+                g = min(255, int(g + (255 - g) * factor))
+                b = min(255, int(b + (255 - b) * factor))
+            else:
+                # Escurece (mistura com preto)
+                factor = abs(factor)
+                r = max(0, int(r * (1 - factor)))
+                g = max(0, int(g * (1 - factor)))
+                b = max(0, int(b * (1 - factor)))
+            
+            # Converte de volta para hex
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except:
+            return color  # Retorna a cor original se houver erro
 
     # ===== ações =====
     def add_task(self):
@@ -2152,6 +2838,8 @@ class App(tk.Tk):
         if dlg.result:
             if any(t["name"] == dlg.result["name"] for t in self.data["tasks"]):
                 messagebox.showerror("Erro", "Já existe uma tarefa com esse nome."); return
+            # Garante que novas tarefas sejam criadas ativadas por padrão
+            dlg.result.setdefault("enabled", True)
             self.data["tasks"].append(dlg.result)
             self.save(silent=True); self.refresh_table(); self.reschedule_all()
 
@@ -2162,6 +2850,8 @@ class App(tk.Tk):
         if td.result:
             if any(t["name"] == td.result["name"] for t in self.data["tasks"]):
                 messagebox.showerror("Erro", "Já existe uma tarefa com esse nome."); return
+            # Garante que novas tarefas sejam criadas ativadas por padrão
+            td.result.setdefault("enabled", True)
             self.data["tasks"].append(td.result)
             self.save(silent=True); self.refresh_table(); self.reschedule_all()
 
@@ -2199,6 +2889,51 @@ class App(tk.Tk):
 
      self.save(silent=True)
      self.refresh_table()
+
+    def toggle_task_status(self):
+        """Ativa ou desativa a tarefa selecionada"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Aviso", "Selecione uma tarefa para ativar/desativar.")
+            return
+        
+        name = sel[0]
+        task = next((t for t in self.data["tasks"] if t["name"] == name), None)
+        if not task:
+            return
+        
+        # Alterna o status
+        current_status = task.get("enabled", True)
+        task["enabled"] = not current_status
+        
+        # Atualiza interface
+        action = "desativada" if current_status else "ativada"
+        self.set_status_line(f"Tarefa '{name}' {action}.")
+        
+        # Reagenda todas as tarefas (para aplicar mudança)
+        self.save(silent=True)
+        self.refresh_table()
+        self.reschedule_all()
+        self.update_toggle_button()
+
+    def update_toggle_button(self):
+        """Atualiza o texto do botão de ativar/desativar baseado na seleção"""
+        sel = self.tree.selection()
+        if not sel:
+            self.btn_toggle.config(text="⏸️ Desativar", state="disabled")
+            return
+        
+        name = sel[0]
+        task = next((t for t in self.data["tasks"] if t["name"] == name), None)
+        if not task:
+            self.btn_toggle.config(text="⏸️ Desativar", state="disabled")
+            return
+        
+        is_enabled = task.get("enabled", True)
+        if is_enabled:
+            self.btn_toggle.config(text="⏸️ Desativar", state="normal")
+        else:
+            self.btn_toggle.config(text="▶️ Ativar", state="normal")
 
     def open_last_log(self):
         sel = self.tree.selection()
