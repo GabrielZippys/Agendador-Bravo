@@ -1723,13 +1723,32 @@ class App(tk.Tk):
         except Exception:
             pass
 
-        # Seleção com destaque suave
+        # Seleção com destaque mais visível
         try:
+            # Cores mais contrastantes para melhor visibilidade
+            selected_bg = "#0078d7"  # Azul mais forte
+            selected_fg = "#ffffff"   # Texto branco
+            
             style.map("Treeview",
-                     background=[("selected", sel_bg)],
-                     foreground=[("selected", text_color)])
-        except Exception:
-            pass
+                     background=[("selected", selected_bg)],
+                     foreground=[("selected", selected_fg)],
+                     fieldbackground=[("selected", selected_bg)])
+            
+            # Ajusta a cor do foco para combinar
+            style.map("Treeview", 
+                     background=[("focus", selected_bg)],
+                     foreground=[("focus", selected_fg)])
+            
+            # Remove a borda de foco para um visual mais limpo
+            style.layout("Treeview.Item", 
+                        [('Treeitem.padding', 
+                          {'sticky': 'nswe', 
+                           'children': [('Treeitem.indicator', {'side': 'left', 'sticky': ''}),
+                                       ('Treeitem.image', {'side': 'left', 'sticky': ''}),
+                                       ('Treeitem.text', {'side': 'left', 'sticky': ''})],
+                          })])
+        except Exception as e:
+            print(f"Erro ao configurar estilo da tabela: {e}")
 
 
      # ===== Conectividade / Fila de updates =====
