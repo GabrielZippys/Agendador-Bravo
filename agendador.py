@@ -247,6 +247,7 @@ except Exception:
     sv_ttk = None
 
 import tkinter as tk
+import tkinter.font as tkfont
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -570,7 +571,7 @@ def _write_pid(task, pid: int):
     except Exception:
         pass
 
-def run_task(task, settings, progress_cb=None):
+def run_task(task, settings, progress_cb=None, process_callback=None):
     ensure_dirs()
     name = task["name"]
     log_file = LOG_DIR / f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -629,6 +630,8 @@ def run_task(task, settings, progress_cb=None):
 
             proc = subprocess.Popen(cmd, **popen_kwargs)
             _write_pid(task, proc.pid)
+            if process_callback:
+                process_callback(proc, task['name'])
             try:
                 log_fh.flush(); log_fh.close()
             except Exception:
@@ -691,14 +694,91 @@ def parse_times(text: str):
             out.append(norm)
     return out or ["06:00"]
 
+# ===== classes =====
+class ToolTip:
+    """
+    Cria uma dica de ferramenta para um widget.
+    """
+    def __init__(self, widget, text='widget info'):
+        self.waittime = 500     # milissegundos
+        self.wraplength = 300   # pixels
+        self.widget = widget
+        self.text = text
+        self.widget.bind("<Enter>", self.enter)
+        self.widget.bind("<Leave>", self.leave)
+        self.widget.bind("<ButtonPress>", self.leave)
+        self.id = None
+        self.tw = None
+
+    def enter(self, event=None):
+        self.schedule()
+        
+    def schedule(self):
+        self.unschedule()
+        self.id = self.widget.after(self.waittime, self.showtip)
+        
+    def unschedule(self):
+        id = self.id
+        self.id = None
+        if id:
+            self.widget.after_cancel(id)
+            
+    def leave(self, event=None):
+        self.unschedule()
+        self.hidetip()
+        
+    def showtip(self):
+        """Exibe a dica de ferramenta com o texto."""
+        x = y = 0
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        
+        # Cria a janela de dica
+        self.tw = tk.Toplevel(self.widget)
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry(f"+{x}+{y}")
+        
+        # Estilo da dica
+        label = ttk.Label(
+            self.tw, 
+            text=self.text, 
+            justify='left',
+            background="#ffffe0", 
+            relief='solid', 
+            borderwidth=1,
+            padding=5,
+            wraplength=self.wraplength
+        )
+        label.pack(ipadx=1)
+        
+        # Garante que a dica fique acima de outras janelas
+        self.tw.attributes('-topmost', True)
+        
+        # Remove o foco da janela de dica
+        self.tw.focus_set()
+        
+        # Posiciona a dica para não sair da tela
+        self.tw.update_idletasks()
+        width = self.tw.winfo_width()
+        height = self.tw.winfo_height()
+        screen_width = self.tw.winfo_screenwidth()
+        screen_height = self.tw.winfo_screenheight()
+        
+        if x + width > screen_width - 10:
+            x = screen_width - width - 10
+        if y + height > screen_height - 10:
+            y = screen_height - height - 10
+            
+        self.tw.wm_geometry(f"+{x}+{y}")
+
+    def hidetip(self):
+        """Esconde a dica de ferramenta."""
+        if self.tw:
+            self.tw.destroy()
+            self.tw = None
 
 class TaskDialog(tk.Toplevel):
-    """
-    Dialogo de tarefa com botão 'Horários...' que abre um editor de horários.
-    - No modo 'Horário fixo' (cron): é obrigatório ter >= 1 horário.
-    - No modo 'Intervalo': o botão de horários é desabilitado e
-      usam-se os campos 'A cada N minutes/hours'.
-    """
     def __init__(self, master, task=None):
         super().__init__(master)
         self.title("Tarefa")
@@ -1667,7 +1747,6 @@ class SettingsDialog(tk.Toplevel):
 
 # ======================================================================================
 #  Aplicação principal (GUI)
-# ======================================================================================
 
 class App(tk.Tk):
 
@@ -1681,7 +1760,7 @@ class App(tk.Tk):
             colors = self._theme_colors
             even = colors['surface']
             odd = colors['bg']
-            sel_bg = colors['accent'] + '40'  # Accent com transparência
+            sel_bg = colors['accent']  # Usa a cor de destaque sem transparência
             text_color = colors['text']
             heading_bg = colors['overlay']
         else:
@@ -1689,29 +1768,66 @@ class App(tk.Tk):
             if dark:
                 even = "#2a2a2a"
                 odd = "#1e1e1e"
-                sel_bg = "#404040"
+                sel_bg = "#0078d7"  # Azul mais forte para seleção
                 text_color = "#ffffff"
                 heading_bg = "#3a3a3a"
             else:
                 even = "#f8f9fa"
                 odd = "#ffffff"
-                sel_bg = "#e3f2fd"
+                sel_bg = "#b3d7ff"  # Azul claro para seleção
                 text_color = "#212529"
                 heading_bg = "#e9ecef"
 
         style = ttk.Style(self)
         
-        # Cabeçalhos modernos
+        # Configuração do estilo do cabeçalho
         style.configure("Treeview.Heading", 
-                       padding=(8, 6),
+                       background=heading_bg,
+                       foreground=text_color,
+                       relief="flat",
                        font=("Segoe UI", 9, "bold"),
-                       relief="flat")
+                       anchor="center")  # Centraliza o texto do cabeçalho
         
         # Configuração da tabela
         style.configure("Treeview",
-                       rowheight=28,  # Linhas mais altas
+                       rowheight=28,  # Altura maior para melhor legibilidade
+                       background=odd,
+                       foreground=text_color,
+                       fieldbackground=odd,
+                       borderwidth=0,
                        font=("Segoe UI", 9))
-
+        
+        # Configuração específica para a coluna Status
+        style.configure("Treeview",
+                       rowheight=32,  # Altura um pouco maior para melhor visualização
+                       font=("Segoe UI", 9),
+                       fieldbackground=odd,
+                       background=odd,
+                       foreground=text_color)
+        
+        # Estilo para o cabeçalho
+        style.configure("Treeview.Heading", 
+                      font=('Segoe UI', 9, 'bold'),
+                      anchor='center',
+                      background=heading_bg,
+                      foreground=text_color,
+                      relief='flat')
+        
+        # Estilo para as células
+        style.configure("Treeview.Cell", 
+                      anchor='center',
+                      padding=0)
+                      
+        # Estilo para a coluna Status
+        style.configure('Status.Treeview.Cell',
+                      anchor='center',
+                      font=('Segoe UI', 12, 'bold'))
+        
+        # Ajusta o alinhamento das colunas
+        style.layout("Treeview", [
+            ('Treeview.treearea', {'sticky': 'nswe'})
+        ])
+        
         # Cores alternadas modernas
         try:
             self.tree.tag_configure("evenrow", 
@@ -1720,36 +1836,47 @@ class App(tk.Tk):
             self.tree.tag_configure("oddrow", 
                                   background=odd,
                                   foreground=text_color)
-        except Exception:
-            pass
-
-        # Seleção com destaque mais visível
-        try:
-            # Cores mais contrastantes para melhor visibilidade
-            selected_bg = "#0078d7"  # Azul mais forte
-            selected_fg = "#ffffff"   # Texto branco
             
-            style.map("Treeview",
-                     background=[("selected", selected_bg)],
-                     foreground=[("selected", selected_fg)],
-                     fieldbackground=[("selected", selected_bg)])
+            # Cores para itens desabilitados
+            self.tree.tag_configure("disabled", 
+                                  foreground=text_color,
+                                  background=odd,
+                                  font=("Segoe UI", 9))
             
-            # Ajusta a cor do foco para combinar
-            style.map("Treeview", 
-                     background=[("focus", selected_bg)],
-                     foreground=[("focus", selected_fg)])
-            
-            # Remove a borda de foco para um visual mais limpo
-            style.layout("Treeview.Item", 
-                        [('Treeitem.padding', 
-                          {'sticky': 'nswe', 
-                           'children': [('Treeitem.indicator', {'side': 'left', 'sticky': ''}),
-                                       ('Treeitem.image', {'side': 'left', 'sticky': ''}),
-                                       ('Treeitem.text', {'side': 'left', 'sticky': ''})],
-                          })])
+            # Configuração para itens selecionados
+            self.tree.tag_configure('selected', 
+                                  background=sel_bg, 
+                                  foreground=text_color)
+                                  
         except Exception as e:
-            print(f"Erro ao configurar estilo da tabela: {e}")
+            print(f"Erro ao configurar estilos: {e}")
 
+        # Configuração do tema para seleção
+        style.map('Treeview',
+                 background=[('selected', sel_bg)],
+                 foreground=[('selected', text_color)],
+                 fieldbackground=[('!selected', odd if dark else even), ('selected', sel_bg)])
+        
+        # Ajusta o alinhamento das células
+        self.tree.column("#0", width=0, stretch=tk.NO)  # Coluna fantasma
+        self.tree.column("Status", anchor="center", width=50, stretch=tk.NO, minwidth=50)
+        self.tree.heading("Status", text="●", anchor="center")  # Usa um ponto como cabeçalho
+        
+        # Configura o estilo das células da coluna Status
+        self.tree.tag_configure('status_cell', anchor='center')
+        
+        # Configuração específica para a coluna Status
+        self.tree.column('Status', width=50, anchor='center', stretch=False)
+        self.tree.heading('Status', text='Status', anchor='center')
+        
+        # Aplica o estilo a todas as células da coluna Status
+        for item in self.tree.get_children():
+            self.tree.set(item, 'Status', self.tree.set(item, 'Status'))
+        
+        # Ajusta o alinhamento das outras colunas
+        for col in ["Nome", "Horário", "Tipo", "Dias", "Arquivo", "NotificarFalha", "Timeout"]:
+            self.tree.column(col, anchor="w")
+            self.tree.heading(col, text=col, anchor="w")
 
      # ===== Conectividade / Fila de updates =====
     def on_net_status_change(self, online: bool):
@@ -1865,6 +1992,10 @@ class App(tk.Tk):
         self.net_online = is_online()
         self._update_processing = False
         self.update_queue = self.data.setdefault("update_queue", [])  # persiste no JSON
+        
+        # Dicionário para armazenar processos em execução
+        self.running_processes = {}
+        self.running_lock = threading.Lock()  # Para evitar condições de corrida
 
 
         # Estilos
@@ -1974,8 +2105,20 @@ class App(tk.Tk):
         self.btn_toggle.pack(side="left", padx=2)
         
         # Botão de execução (destaque)
-        self.btn_run = ttk.Button(bar, text="▶ Executar agora", command=self.run_now, style="Accent.TButton")
+        self.btn_run = ttk.Button(bar, text="▶ Executar agora", 
+                                 command=self.run_now, 
+                                 style="Accent.TButton")
         self.btn_run.pack(side="left", padx=(8, 2))
+        
+        # Dica de ferramenta para o botão de execução
+        ToolTip(self.btn_run, "Executa a tarefa selecionada. Selecione múltiplas tarefas para executá-las simultaneamente.")
+        
+        # Botão de interrupção
+        self.btn_stop = ttk.Button(bar, text="⏹️ Interromper", 
+                                 command=self.stop_running_tasks,
+                                 style="Danger.TButton")
+        self.btn_stop.pack(side="left", padx=2)
+        self.btn_stop.config(state="disabled")  # Inicialmente desabilitado
         
         # Separador visual
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
@@ -1997,17 +2140,30 @@ class App(tk.Tk):
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
 
-        cols = ("Status","Nome","Hora","Dias","Arquivo","NotificarFalha","Timeout")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
+        # Definindo as colunas da tabela
+        cols = ("Status", "Nome", "Horário", "Tipo", "Dias", "Arquivo", "NotificarFalha", "Timeout")
+        self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="extended")
+        
+        # Configurando os cabeçalhos
+        self.tree.heading("Status", text="Status")
+        self.tree.heading("Nome", text="Nome")
+        self.tree.heading("Horário", text="Horário")
+        self.tree.heading("Tipo", text="Tipo")
+        self.tree.heading("Dias", text="Dias")
+        self.tree.heading("Arquivo", text="Arquivo")
+        self.tree.heading("NotificarFalha", text="Notificar Falha")
+        self.tree.heading("Timeout", text="Timeout")
+        
         self._style_table()
         
         # Configuração responsiva das colunas
         col_configs = {
             "Status": {"width": 80, "minwidth": 60, "stretch": False},
             "Nome": {"width": 200, "minwidth": 150, "stretch": True},
-            "Hora": {"width": 80, "minwidth": 60, "stretch": False},
+            "Horário": {"width": 150, "minwidth": 100, "stretch": False},
+            "Tipo": {"width": 100, "minwidth": 80, "stretch": False},
             "Dias": {"width": 100, "minwidth": 80, "stretch": False},
-            "Arquivo": {"width": 300, "minwidth": 200, "stretch": True},
+            "Arquivo": {"width": 200, "minwidth": 150, "stretch": True},
             "NotificarFalha": {"width": 100, "minwidth": 80, "stretch": False},
             "Timeout": {"width": 80, "minwidth": 60, "stretch": False}
         }
@@ -2147,6 +2303,13 @@ class App(tk.Tk):
                        borderwidth=0,
                        focuscolor='none')
         
+        # Botão de interrupção (Danger)
+        style.configure("Danger.TButton",
+                       padding=(10, 6),
+                       font=("Segoe UI", 9),
+                       borderwidth=0,
+                       focuscolor='none')
+        
         # Labels com tipografia moderna
         style.configure("Title.TLabel",
                        font=("Segoe UI", 14, "bold"),
@@ -2163,6 +2326,7 @@ class App(tk.Tk):
         try:
             self.btn_run.configure(style="Accent.TButton")
             self.btn_toggle.configure(style="Toggle.TButton")
+            self.btn_stop.configure(style="Danger.TButton")
         except Exception:
             pass
         
@@ -2306,7 +2470,16 @@ class App(tk.Tk):
     # ===== utilidades UI =====
     def _on_tree_resize(self, event=None):
         w = max(300, self.tree.winfo_width())
-        ratios = {"Status":0.08, "Nome":0.18, "Hora":0.08, "Dias":0.20, "Arquivo":0.32, "NotificarFalha":0.08, "Timeout":0.06}
+        ratios = {
+            "Status": 0.05,
+            "Nome": 0.15,
+            "Horário": 0.12,
+            "Tipo": 0.10,
+            "Dias": 0.15,
+            "Arquivo": 0.30,
+            "NotificarFalha": 0.08,
+            "Timeout": 0.05
+        }
         for col, r in ratios.items():
             self.tree.column(col, width=max(60, int(w * r)), stretch=True)
 
@@ -2326,7 +2499,60 @@ class App(tk.Tk):
         if not silent:
             messagebox.showinfo("Salvo", "Configurações salvas.")
 
+    def _register_process(self, process, task_name):
+        """Registra um processo em execução e atualiza o estado do botão de parada.
+        
+        Args:
+            process: Objeto subprocess.Popen do processo em execução
+            task_name: Nome da tarefa associada ao processo
+        """
+        with self.running_lock:
+            self.running_processes[task_name] = process
+            # Habilita o botão de parada se houver processos em execução
+            if self.running_processes and self.btn_stop['state'] == 'disabled':
+                self.btn_stop.config(state="normal")
+
+    def stop_running_tasks(self):
+        """Interrompe todas as tarefas em execução."""
+        if not messagebox.askyesno("Confirmar", "Deseja realmente interromper todas as tarefas em execução?"):
+            return
+            
+        with self.running_lock:
+            if not self.running_processes:
+                messagebox.showinfo("Informação", "Nenhuma tarefa em execução para interromper.")
+                return
+                
+            for name, process in list(self.running_processes.items()):
+                try:
+                    if process.poll() is None:  # Se ainda estiver rodando
+                        if os.name == 'nt':
+                            import ctypes
+                            ctypes.windll.kernel32.GenerateConsoleCtrlEvent(0, 0)
+                        else:
+                            process.terminate()
+                        process.wait(timeout=5)
+                except Exception as e:
+                    print(f"Erro ao interromper tarefa {name}: {e}")
+                    try:
+                        process.kill()
+                    except:
+                        pass
+            
+            self.running_processes.clear()
+            self.btn_stop.config(state="disabled")
+            self.set_status_line("Tarefas interrompidas pelo usuário.")
+            
+            # Atualiza a interface
+            self.refresh_table()
+    
     def on_close(self):
+        # Interrompe todas as tarefas em execução
+        with self.running_lock:
+            if self.running_processes:
+                if messagebox.askyesno("Tarefas em execução", 
+                                     "Existem tarefas em execução. Deseja interrompê-las?"):
+                    self.stop_running_tasks()
+        
         try:
             self.scheduler.shutdown(wait=False)
         except Exception:
@@ -2421,8 +2647,7 @@ class App(tk.Tk):
             try:
                 times = parse_times(",".join(times) if isinstance(times, list) else str(times))
             except Exception:
-                continue
-
+                times = [t.get("time", "06:00")]
             job_ids = []
             for idx, hhmm in enumerate(times):
                 try:
@@ -2490,7 +2715,9 @@ class App(tk.Tk):
                 self.after(0, lambda t=task: (self._set_task_running(t["name"], True), self._on_job_start(t)))
         except Exception:
             pass
-        rc, dur, log_path = run_task(task, self.data["settings"], progress_cb=progress)
+        rc, dur, log_path = run_task(task, self.data["settings"], 
+                                  progress_cb=progress,
+                                  process_callback=self._register_process)
         append_history(self.data, task["name"], rc, dur)
         self._maybe_notify(task, rc, log_path)
         try:
@@ -2625,29 +2852,150 @@ class App(tk.Tk):
 
     # ===== tabela & gráfico =====
     def refresh_table(self):
+        # Salva a seleção atual
+        current_selection = self.tree.selection()
+        
+        # Limpa a tabela
         for i in self.tree.get_children():
             self.tree.delete(i)
-
-        for idx, t in enumerate(self.data.get("tasks", [])):
-            hora, dias = self._hora_dias_text(t)
-            tag = ("evenrow" if idx % 2 == 0 else "oddrow")
+        
+        # Preenche com as tarefas
+        for i, task in enumerate(self.data.get("tasks", [])):
+            task_name = task["name"]
+            is_selected = task_name in current_selection
             
-            # Status da tarefa (ativo/inativo)
-            status = "✅ Ativo" if t.get("enabled", True) else "⏸️ Inativo"
+            # Define as tags do item
+            tags = ["evenrow" if i % 2 == 0 else "oddrow"]
+            if not task.get("enabled", True):
+                tags.append("disabled")
+            if is_selected:
+                tags.append("selected")
             
-            self.tree.insert(
-                "", "end", iid=t["name"], tags=(tag,), values=(
-                    status, t["name"], hora, dias, t["path"],
-                    "Sim" if t.get("notify_fail", True) else "Não",
-                    t.get("timeout", "0")
-                )
-            )
-        self.draw_chart()
+            # Ícones de play/pause para status
+            if task.get("enabled", True):
+                status_icon = "▶"  # Play para ativo
+                status_fg = "#10b981"  # Verde
+            else:
+                status_icon = "⏸"  # Pause para desativado
+                status_fg = "#ef4444"  # Vermelho
+            
+            # Obtém o tipo de agendamento
+            schedule_type = task.get("schedule_type", "cron")
+            
+            # Formata os horários de acordo com o tipo de agendamento
+            if schedule_type == "cron":
+                times = ", ".join(task.get("times", [task.get("time", "06:00")]))
+            elif schedule_type == "interval":
+                every_val = task.get("every_value", 30)
+                every_unit = task.get("every_unit", "minutes")
+                times = f"A cada {every_val} {every_unit}"
+            elif schedule_type == "start_repeat":
+                start = task.get("sr_start", "06:00")
+                every_val = task.get("sr_every_value", 30)
+                every_unit = task.get("sr_every_unit", "minutes")
+                times = f"{start} + {every_val}{every_unit[0]}"
+            else:
+                times = "Desconhecido"
+            
+            # Adiciona a tarefa à tabela
+            item_id = self.tree.insert("", "end", iid=task_name,
+                           values=(
+                               status_icon,  # Ícone centralizado
+                               task_name,
+                               times,
+                               schedule_type.capitalize(),
+                               self._format_days(task.get("days", [True]*7)),
+                               task.get("path", ""),
+                               "Sim" if task.get("notify_on_failure") else "Não",
+                               f"{task.get('timeout', '')}s" if task.get("timeout") else "Padrão"
+                           ),
+                           tags=('enabled' if task.get("enabled", True) else 'disabled',))
+            
+            # Aplica estilo ao ícone de status
+            self.tree.tag_configure('status_icon', foreground=status_fg, font=('Segoe UI', 14, 'bold'))
+            self.tree.set(item_id, 'Status', status_icon)
+            self.tree.set(item_id, 'Nome', task_name)  # Garante que o nome seja definido corretamente
+        
+        # Ajusta o tamanho das colunas
+        self._resize_columns()
+        
+        # Restaura a seleção
+        if current_selection:
+            try:
+                for item in current_selection:
+                    self.tree.selection_add(item)
+            except:
+                pass
 
-    def _on_tree_select(self, event=None):
-        """Chamado quando uma linha da tabela é selecionada"""
-        self.draw_chart()
+    def _format_days(self, days):
+        """Formata os dias da semana para exibição na tabela."""
+        if not isinstance(days, (list, tuple)) or len(days) != 7:
+            return ""
+        
+        dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+        ativos = []
+        
+        for i, ativo in enumerate(days[:7]):  # Garante que pegamos no máximo 7 dias
+            if ativo:
+                ativos.append(dias_semana[i])
+                
+        return ", ".join(ativos) if ativos else "Nunca"
+        
+    def _resize_columns(self):
+        """Ajusta automaticamente o tamanho das colunas da tabela."""
+        # Configuração de largura fixa para a coluna Status
+        self.tree.column("#0", width=0, stretch=tk.NO)
+        self.tree.column("Status", width=50, minwidth=50, stretch=tk.NO, anchor="center")
+        
+        # Configuração de largura para as outras colunas
+        col_widths = {
+            "Nome": 150,
+            "Horário": 120,
+            "Tipo": 100,
+            "Dias": 100,
+            "Arquivo": 200,
+            "NotificarFalha": 100,
+            "Timeout": 80
+        }
+        
+        # Ajusta o tamanho das colunas baseado no conteúdo
+        for col, width in col_widths.items():
+            self.tree.column(col, width=width, minwidth=width, stretch=tk.YES, anchor="w")
+        
+        # Ajusta o cabeçalho para manter o alinhamento
+        for col in self.tree["columns"]:
+            self.tree.heading(col, text=col, anchor="w")
+        
+        # Ajusta a coluna Status para centralizar o conteúdo
+        self.tree.heading("Status", text="Status", anchor="center")
+
+    def _on_tree_select(self, event):
+        # Atualiza o botão de ativar/desativar
         self.update_toggle_button()
+        
+        # Atualiza o gráfico com base na primeira seleção
+        sel = self.tree.selection()
+        if sel:
+            self.draw_chart()
+            
+        # Força a atualização do estilo dos itens selecionados
+        self._update_selection_styles()
+    
+    def _update_selection_styles(self):
+        """Atualiza os estilos dos itens selecionados"""
+        # Primeiro, remove a tag 'selected' de todos os itens
+        for item in self.tree.get_children():
+            tags = list(self.tree.item(item, 'tags'))
+            if 'selected' in tags:
+                tags.remove('selected')
+                self.tree.item(item, tags=tags)
+        
+        # Adiciona a tag 'selected' aos itens selecionados
+        for item in self.tree.selection():
+            tags = list(self.tree.item(item, 'tags'))
+            if 'selected' not in tags:
+                tags.append('selected')
+                self.tree.item(item, tags=tags)
 
     def draw_chart(self):
         """Desenha gráfico moderno com animações suaves"""
@@ -2963,29 +3311,161 @@ class App(tk.Tk):
             messagebox.showinfo("Logs", "Sem logs desta tarefa ainda."); return
         os.startfile(files[-1])
 
-    def run_now(self):
-        sel = self.tree.selection()
-        if not sel: return
-        name = sel[0]
-        task = next((t for t in self.data["tasks"] if t["name"]==name), None)
-        if not task: return
+    def run_now(self, task_name=None):
+        """Executa uma tarefa específica ou a selecionada."""
+        if task_name:
+            # Se um nome de tarefa for fornecido, executa essa tarefa
+            task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
+            if not task:
+                return
+            tasks = [task]
+        else:
+            # Caso contrário, usa a seleção atual
+            sel = self.tree.selection()
+            if not sel:
+                return
+            
+            # Se mais de uma tarefa estiver selecionada, usa o método de múltiplas execuções
+            if len(sel) > 1:
+                self.run_multiple_tasks(sel)
+                return
+                
+            # Se apenas uma tarefa estiver selecionada, executa normalmente
+            name = sel[0]
+            task = next((t for t in self.data["tasks"] if t["name"] == name), None)
+            if not task:
+                return
+            tasks = [task]
 
-        self._set_ui_busy(True, f"Executando '{task['name']}'...")
+        # Executa a tarefa única
+        for task in tasks:
+            self._set_ui_busy(True, f"Executando '{task['name']}'...")
 
-        def worker():
-            def progress(line):
-                self.after(0, lambda: self.set_status_line(f"[{task['name']}] {line}"))
-            rc, dur, log_path = run_task(task, self.data["settings"], progress_cb=progress)
-            append_history(self.data, task["name"], rc, dur)
-            self._maybe_notify(task, rc, log_path)
-            def finish():
-                self._set_ui_busy(False)
-                self.draw_chart()
-                msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
-                messagebox.showinfo("Execução", f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}")
-            self.after(0, finish)
+            def worker(task=task):
+                def progress(line):
+                    self.after(0, lambda: self.set_status_line(f"[{task['name']}] {line}"))
+                
+                rc, dur, log_path = run_task(task, self.data["settings"], 
+                                         progress_cb=progress,
+                                         process_callback=self._register_process)
+                append_history(self.data, task["name"], rc, dur)
+                self._maybe_notify(task, rc, log_path)
+                
+                def finish():
+                    self._set_ui_busy(False)
+                    self.draw_chart()
+                    msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
+                    # Mostra mensagem apenas para execuções únicas
+                    if len(tasks) == 1:
+                        messagebox.showinfo(
+                            "Execução", 
+                            f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}"
+                        )
+                
+                self.after(0, finish)
 
-        threading.Thread(target=worker, daemon=True).start()
+            threading.Thread(target=worker, daemon=True).start()
+    
+    def run_multiple_tasks(self, task_names):
+        """Executa múltiplas tarefas em paralelo."""
+        if not task_names:
+            return
+            
+        # Remove o limite de 3 tarefas, permitindo selecionar quantas quiser
+        tasks = []
+        
+        # Encontra as tarefas pelos nomes
+        for name in task_names:
+            task = next((t for t in self.data["tasks"] if t["name"] == name), None)
+            if task:
+                tasks.append(task)
+        
+        if not tasks:
+            messagebox.showwarning("Aviso", "Nenhuma tarefa válida selecionada.")
+            return
+        
+        # Confirmação antes de executar múltiplas tarefas
+        task_list = "\n- " + "\n- ".join(t["name"] for t in tasks)
+        if not messagebox.askyesno(
+            "Confirmar execução múltipla",
+            f"Deseja executar as seguintes tarefas simultaneamente?\n{task_list}"
+        ):
+            return
+        
+        # Executa cada tarefa em sua própria thread
+        self._set_ui_busy(True, f"Executando {len(tasks)} tarefas em paralelo...")
+        
+        # Contadores para acompanhar o progresso
+        completed = 0
+        total = len(tasks)
+        success_count = 0
+        fail_count = 0
+        
+        # Flag para controlar se já mostrou a mensagem de conclusão
+        completion_shown = False
+        
+        def show_completion_message():
+            """Mostra mensagem de resumo após a execução de múltiplas tarefas."""
+            nonlocal completion_shown
+            if completion_shown:
+                return
+                
+            completion_shown = True
+            
+            if success_count == total:
+                msg = f"✅ Todas as {total} tarefas foram concluídas com sucesso!"
+            elif fail_count == total:
+                msg = f"❌ Todas as {total} tarefas falharam!"
+            else:
+                msg = (
+                    f"📊 Resumo da execução de {total} tarefas:\n\n"
+                    f"✅ {success_count} tarefa(s) concluída(s) com sucesso\n"
+                    f"❌ {fail_count} tarefa(s) falharam"
+                )
+                
+            self.after(0, lambda: messagebox.showinfo(
+                "Execução Concluída",
+                msg
+            ))
+        
+        def task_completed(name, success):
+            nonlocal completed, success_count, fail_count
+            
+            # Atualiza contadores
+            if success:
+                success_count += 1
+            else:
+                fail_count += 1
+                
+            completed += 1
+            
+            # Atualiza barra de status
+            self.after(0, lambda: self.set_status_line(
+                f"Concluído: {completed}/{total} tarefas"
+            ))
+            
+            # Quando todas as tarefas terminarem
+            if completed >= total:
+                self.after(0, lambda: [
+                    self._set_ui_busy(False),
+                    self.draw_chart(),
+                    show_completion_message()
+                ])
+        
+        # Inicia cada tarefa em uma thread separada
+        for task in tasks:
+            def worker(task=task):
+                try:
+                    rc, dur, log_path = run_task(task, self.data["settings"],
+                                         process_callback=self._register_process)
+                    append_history(self.data, task["name"], rc, dur)
+                    self._maybe_notify(task, rc, log_path)
+                    task_completed(task["name"], rc == 0)
+                except Exception as e:
+                    print(f"Erro ao executar tarefa {task['name']}: {e}")
+                    task_completed(task["name"], False)
+            
+            threading.Thread(target=worker, daemon=True).start()
 
     def open_settings(self):
         dlg = SettingsDialog(
