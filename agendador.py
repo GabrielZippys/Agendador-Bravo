@@ -13,16 +13,32 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import urllib.request, hashlib, tempfile
 
 # --- CONECTIVIDADE / FILA DE ATUALIZAÇÕES ----------------------------------
-NET_CHECK_EVERY_SEC = int(os.getenv("AGENDADOR_NET_EVERY_SEC", "10"))
+NET_CHECK_EVERY_SEC = int(os.getenv("AGENDADOR_NET_EVERY_SEC", "30"))  # Reduzido para 30s (menos overhead)
 NET_FLAP_STABLE = int(os.getenv("AGENDADOR_NET_STABLE", "2"))
 UPDATE_QUEUE_MAX = 50
 
-def is_online(timeout=3) -> bool:
+# Cache para verificação de rede
+_net_cache = {"status": None, "timestamp": 0}
+_NET_CACHE_TTL = 10  # Cache de 10 segundos
+
+def is_online(timeout=2, use_cache=True) -> bool:
+    """Verifica conectividade com cache para reduzir overhead."""
+    if use_cache:
+        now = time.time()
+        if now - _net_cache["timestamp"] < _NET_CACHE_TTL:
+            if _net_cache["status"] is not None:
+                return _net_cache["status"]
+    
     try:
         urllib.request.urlopen("https://www.gstatic.com/generate_204", timeout=timeout)
-        return True
+        status = True
     except Exception:
-        return False
+        status = False
+    
+    # Atualiza cache
+    _net_cache["status"] = status
+    _net_cache["timestamp"] = time.time()
+    return status
 
 def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STABLE):
     def worker():
@@ -50,7 +66,7 @@ UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
 )
-UPDATE_CHECK_EVERY_MIN = int(os.getenv("AGENDADOR_UPDATE_EVERY_MIN", "240"))  # 4h
+UPDATE_CHECK_EVERY_MIN = int(os.getenv("AGENDADOR_UPDATE_EVERY_MIN", "480"))  # 8h (reduzido overhead)
 
 def _is_frozen():
     return getattr(sys, "frozen", False)
@@ -320,15 +336,30 @@ def format_days_bool(days_list):
     labels = ["seg","ter","qua","qui","sex","sab","dom"]
     return ",".join([labels[i] for i,v in enumerate(days_list) if v])
 
+# Cache de dados para evitar leituras repetidas
+_data_cache = {"data": None, "mtime": 0}
+
 def load_data():
-    """Carrega config.json; cria defaults se não existir/corrompido."""
+    """Carrega config.json com cache; cria defaults se não existir/corrompido."""
     ensure_dirs()
+    
+    # Verifica cache
     if DATA_FILE.exists():
         try:
-            return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            current_mtime = DATA_FILE.stat().st_mtime
+            if _data_cache["data"] and _data_cache["mtime"] == current_mtime:
+                return _data_cache["data"].copy()  # Retorna cópia para evitar mutações
+            
+            # Carrega e atualiza cache
+            data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            _data_cache["data"] = data
+            _data_cache["mtime"] = current_mtime
+            return data
         except Exception:
             pass
-    return {
+    
+    # Dados padrão
+    default_data = {
         "settings": {
             "pdi_home": r"C:\Pentaho\data-integration",
             "email": {
@@ -353,10 +384,16 @@ def load_data():
         "tasks": [],
         "history": {}
     }
+    _data_cache["data"] = default_data
+    return default_data
 
 def save_data(data):
+    """Salva dados e atualiza cache."""
     ensure_dirs()
     DATA_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Atualiza cache
+    _data_cache["data"] = data.copy()
+    _data_cache["mtime"] = DATA_FILE.stat().st_mtime
 
 def append_history(data, task_name, rc, dur):
     hist = data.setdefault("history", {}).setdefault(task_name, [])
@@ -371,56 +408,82 @@ def append_history(data, task_name, rc, dur):
 
 def cleanup_logs(settings):
     """Remove logs antigos baseado na configuração de limpeza."""
+    print(f"[CLEANUP] Iniciando limpeza de logs @ {now_str()}")
+    
     cleanup_cfg = settings.get("log_cleanup", {})
     if not cleanup_cfg.get("enabled", True):
+        print("[CLEANUP] Limpeza desabilitada nas configurações")
         return
     
     keep_days = int(cleanup_cfg.get("keep_days", 7))
     if keep_days <= 0:
+        print(f"[CLEANUP] keep_days inválido: {keep_days}")
         return
+    
+    print(f"[CLEANUP] Configuração: manter logs dos últimos {keep_days} dias")
     
     ensure_dirs()
     if not LOG_DIR.exists():
+        print(f"[CLEANUP] Diretório de logs não existe: {LOG_DIR}")
         return
+    
+    print(f"[CLEANUP] Diretório de logs: {LOG_DIR}")
     
     # Calcula data limite (logs mais antigos que isso serão removidos)
     from datetime import timedelta
     cutoff_date = datetime.now() - timedelta(days=keep_days)
+    print(f"[CLEANUP] Data de corte: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}")
     
     removed_count = 0
     total_size = 0
+    skipped_count = 0
     
     try:
         # Lista todos os arquivos .log na pasta de logs
-        for log_file in LOG_DIR.glob("*.log"):
+        log_files = list(LOG_DIR.glob("*.log"))
+        print(f"[CLEANUP] Encontrados {len(log_files)} arquivos .log")
+        
+        for log_file in log_files:
             try:
                 # Verifica a data de modificação do arquivo
                 file_mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+                file_age_days = (datetime.now() - file_mtime).days
+                
+                print(f"[CLEANUP] Arquivo: {log_file.name} | Idade: {file_age_days} dias | Data: {file_mtime.strftime('%Y-%m-%d')}")
                 
                 if file_mtime < cutoff_date:
                     file_size = log_file.stat().st_size
                     log_file.unlink()
                     removed_count += 1
                     total_size += file_size
-            except Exception:
-                # Se houver erro com um arquivo específico, continua com os outros
+                    print(f"[CLEANUP] ✓ Removido: {log_file.name} ({file_size} bytes)")
+                else:
+                    skipped_count += 1
+                    print(f"[CLEANUP] ○ Mantido: {log_file.name}")
+            except Exception as e:
+                print(f"[CLEANUP] ✗ Erro ao processar {log_file.name}: {e}")
                 continue
-    except Exception:
-        # Se houver erro geral, não faz nada
+    except Exception as e:
+        print(f"[CLEANUP] ✗ Erro geral ao listar logs: {e}")
         pass
     
-    # Log da limpeza (se removeu algum arquivo)
-    if removed_count > 0:
-        cleanup_log = LOG_DIR / f"cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        try:
-            size_mb = total_size / (1024 * 1024)
-            with open(cleanup_log, "w", encoding="utf-8") as f:
-                f.write(f"# Limpeza automática de logs @ {now_str()}\n")
-                f.write(f"Arquivos removidos: {removed_count}\n")
-                f.write(f"Espaço liberado: {size_mb:.2f} MB\n")
-                f.write(f"Critério: logs mais antigos que {keep_days} dias\n")
-        except Exception:
-            pass
+    print(f"[CLEANUP] Resumo: {removed_count} removidos, {skipped_count} mantidos")
+    
+    # Log da limpeza (sempre cria, mesmo se não removeu nada)
+    cleanup_log = LOG_DIR / f"cleanup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    try:
+        size_mb = total_size / (1024 * 1024)
+        with open(cleanup_log, "w", encoding="utf-8") as f:
+            f.write(f"# Limpeza automática de logs @ {now_str()}\n")
+            f.write(f"Arquivos analisados: {removed_count + skipped_count}\n")
+            f.write(f"Arquivos removidos: {removed_count}\n")
+            f.write(f"Arquivos mantidos: {skipped_count}\n")
+            f.write(f"Espaço liberado: {size_mb:.2f} MB\n")
+            f.write(f"Critério: logs mais antigos que {keep_days} dias\n")
+            f.write(f"Data de corte: {cutoff_date.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        print(f"[CLEANUP] Log de limpeza criado: {cleanup_log}")
+    except Exception as e:
+        print(f"[CLEANUP] Erro ao criar log de limpeza: {e}")
 
 # ======================================================================================
 #  Notificações
@@ -518,12 +581,29 @@ def build_command(task, pdi_home):
                 "-WindowStyle", "Hidden",
                 "-ExecutionPolicy", "Bypass", "-File", path] + arg_list
     if ext == ".py":
+        # Para scripts Python, usa flags que garantem encerramento limpo
         py = sys.executable
-        return [py, path] + arg_list
+        # -u: unbuffered output (para ver logs em tempo real)
+        # -B: não cria arquivos .pyc
+        return [py, "-u", "-B", path] + arg_list
     if ext == ".ktr":
-        return [str(Path(pdi_home)/"Pan.bat"), f"/file:{path}"] + arg_list
+        # Otimizações para Pan (Kettle Transformation)
+        pan_path = str(Path(pdi_home)/"Pan.bat")
+        optimization_flags = [
+            f"/file:{path}",
+            "/level:Basic",  # Nível de log básico (menos overhead)
+            "/norep",        # Não usa repositório (mais rápido)
+        ]
+        return [pan_path] + optimization_flags + arg_list
     if ext == ".kjb":
-        return [str(Path(pdi_home)/"Kitchen.bat"), f"/file:{path}"] + arg_list
+        # Otimizações para Kitchen (Kettle Job)
+        kitchen_path = str(Path(pdi_home)/"Kitchen.bat")
+        optimization_flags = [
+            f"/file:{path}",
+            "/level:Basic",  # Nível de log básico
+            "/norep",        # Não usa repositório
+        ]
+        return [kitchen_path] + optimization_flags + arg_list
     return [path] + arg_list
 
 def _pid_alive(pid: int) -> bool:
@@ -571,6 +651,52 @@ def _write_pid(task, pid: int):
     except Exception:
         pass
 
+def cleanup_orphaned_python_processes():
+    """Limpa processos Python órfãos que podem ter ficado em execução."""
+    if not psutil:
+        return
+    
+    try:
+        current_pid = os.getpid()
+        python_exe = os.path.basename(sys.executable).lower()
+        
+        print(f"[CLEANUP] Verificando processos Python órfãos...")
+        
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            try:
+                # Verifica se é um processo Python
+                if proc.info['name'] and python_exe in proc.info['name'].lower():
+                    # Não mata o processo atual
+                    if proc.info['pid'] == current_pid:
+                        continue
+                    
+                    # Verifica se é um processo antigo (mais de 1 hora)
+                    age_hours = (time.time() - proc.info['create_time']) / 3600
+                    
+                    # Se for muito antigo, pode ser órfão
+                    if age_hours > 1:
+                        cmdline = proc.info.get('cmdline', [])
+                        # Verifica se está executando um script (não é o agendador)
+                        if cmdline and len(cmdline) > 1 and cmdline[1].endswith('.py'):
+                            script_name = os.path.basename(cmdline[1])
+                            if 'agendador' not in script_name.lower():
+                                print(f"[CLEANUP] Processo órfão encontrado: PID {proc.info['pid']} - {script_name} (idade: {age_hours:.1f}h)")
+                                try:
+                                    proc.terminate()
+                                    proc.wait(timeout=3)
+                                    print(f"[CLEANUP] ✓ Processo {proc.info['pid']} encerrado")
+                                except Exception as e:
+                                    print(f"[CLEANUP] ✗ Erro ao encerrar processo {proc.info['pid']}: {e}")
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception as e:
+                print(f"[CLEANUP] Erro ao verificar processo: {e}")
+                continue
+                
+        print(f"[CLEANUP] Verificação de processos órfãos concluída")
+    except Exception as e:
+        print(f"[CLEANUP] Erro geral na limpeza de processos: {e}")
+
 def run_task(task, settings, progress_cb=None, process_callback=None):
     ensure_dirs()
     name = task["name"]
@@ -594,10 +720,16 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
         CREATE_NO_WINDOW        = 0x08000000
 
 
-    # força UTF-8 no filho Python
+    # Otimizações de ambiente
     env = os.environ.copy()
+    # Python
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")  # Não cria .pyc
+    # Pentaho/Java (otimizações de memória)
+    env.setdefault("PENTAHO_DI_JAVA_OPTIONS", "-Xms512m -Xmx2048m -XX:+UseG1GC")
+    # Desabilita verificações desnecessárias
+    env.setdefault("KETTLE_DISABLE_CONSOLE_LOGGING", "Y")
 
     # se for spawn e já tem processo vivo, só loga e sai
     if spawn and _already_running_by_pidfile(task):
@@ -652,6 +784,10 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
                 text=True, encoding="utf-8", errors="ignore", bufsize=1, env=env,
                 **({"startupinfo": si, "creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {})
             )
+            
+            # Registra o processo no callback, se fornecido
+            if process_callback and callable(process_callback):
+                process_callback(proc, task['name'])
 
             while True:
                 line = proc.stdout.readline()
@@ -661,16 +797,55 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
                     f.write(line)
                     if progress_cb:
                         progress_cb(line.strip()[:140])
+            
+            # Aguarda o processo terminar completamente
+            proc.wait()
+            
             if timeout and (time.time() - start) > timeout:
-                try: proc.kill()
-                except Exception: pass
+                try: 
+                    proc.kill()
+                    proc.wait(timeout=2)  # Aguarda até 2 segundos para o processo morrer
+                except Exception: 
+                    pass
                 rc = -9
                 f.write("\n### TIMEOUT atingido.\n")
             else:
                 rc = proc.returncode
+            
+            # Garante que o processo e seus filhos sejam encerrados (especialmente Python)
+            try:
+                if psutil and proc.pid:
+                    try:
+                        parent = psutil.Process(proc.pid)
+                        # Encerra processos filhos primeiro
+                        for child in parent.children(recursive=True):
+                            try:
+                                child.terminate()
+                            except Exception:
+                                pass
+                        # Aguarda um pouco
+                        psutil.wait_procs(parent.children(recursive=True), timeout=1)
+                        # Força o encerramento se ainda estiver vivo
+                        if parent.is_running():
+                            parent.terminate()
+                            parent.wait(timeout=1)
+                    except psutil.NoSuchProcess:
+                        pass  # Processo já morreu
+                    except Exception as e:
+                        f.write(f"\n### Aviso ao limpar processos: {e}\n")
+            except Exception:
+                pass
+                
         except Exception as e:
             rc = -1
             f.write("\n### ERRO ao iniciar/executar:\n" + "".join(traceback.format_exception(e)))
+            # Tenta matar o processo se ainda existir
+            try:
+                if 'proc' in locals() and proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+            except Exception:
+                pass
 
     return rc, time.time() - start, str(log_file)
 
@@ -1859,14 +2034,14 @@ class App(tk.Tk):
         
         # Ajusta o alinhamento das células
         self.tree.column("#0", width=0, stretch=tk.NO)  # Coluna fantasma
-        self.tree.column("Status", anchor="center", width=50, stretch=tk.NO, minwidth=50)
-        self.tree.heading("Status", text="●", anchor="center")  # Usa um ponto como cabeçalho
+        self.tree.column("Status", anchor="center", width=90, stretch=tk.NO, minwidth=90)
+        self.tree.heading("Status", text="Status", anchor="center")
         
         # Configura o estilo das células da coluna Status
         self.tree.tag_configure('status_cell', anchor='center')
         
         # Configuração específica para a coluna Status
-        self.tree.column('Status', width=50, anchor='center', stretch=False)
+        self.tree.column('Status', width=90, anchor='center', stretch=False)
         self.tree.heading('Status', text='Status', anchor='center')
         
         # Aplica o estilo a todas as células da coluna Status
@@ -1874,7 +2049,7 @@ class App(tk.Tk):
             self.tree.set(item, 'Status', self.tree.set(item, 'Status'))
         
         # Ajusta o alinhamento das outras colunas
-        for col in ["Nome", "Horário", "Tipo", "Dias", "Arquivo", "NotificarFalha", "Timeout"]:
+        for col in ["Nome", "Horário", "Tipo", "Dias", "Arquivo"]:
             self.tree.column(col, anchor="w")
             self.tree.heading(col, text=col, anchor="w")
 
@@ -1973,8 +2148,8 @@ class App(tk.Tk):
         self.title(APP_NAME)
         
         # Configuração responsiva da janela
-        self.geometry("1200x700")  # Tamanho inicial maior
-        self.minsize(800, 500)     # Tamanho mínimo
+        self.geometry("1400x800")  # Tamanho inicial maior e mais espaçoso
+        self.minsize(1000, 600)    # Tamanho mínimo aumentado
         self.state('zoomed')       # Inicia maximizada no Windows
         
         # Configurar responsividade da janela principal
@@ -1984,6 +2159,10 @@ class App(tk.Tk):
         
         self.attributes("-alpha", 0.0)  # fade-in
         ensure_dirs()
+        
+        # Limpa processos Python órfãos ao iniciar
+        cleanup_orphaned_python_processes()
+        
         self.data = load_data()
         # Deixa explícito (1 instância por job, coalesce)
         self.scheduler = BackgroundScheduler(job_defaults={"max_instances": 1, "coalesce": True})
@@ -1998,20 +2177,21 @@ class App(tk.Tk):
         self.running_lock = threading.Lock()  # Para evitar condições de corrida
 
 
-        # Estilos
+        # Estilos melhorados
         style = ttk.Style(self)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", padding=4)
-        style.configure("TLabel", font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"), padding=6)
+        style.configure("Treeview", font=("Segoe UI", 10), rowheight=28)
+        style.configure("TButton", padding=(8, 6), font=("Segoe UI", 10))
+        style.configure("TLabel", font=("Segoe UI", 10))
 
         # Cabeçalho (logo + título + tema) - Row 0
-        header = ttk.Frame(self, padding=(8, 6))
+        header = ttk.Frame(self, padding=(12, 8))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)  # Espaço entre logo e botão tema
 
         # Banner de atualização (inicialmente oculto) - Row 1
         self._update_info = None
-        self._update_banner = ttk.Frame(self, padding=(8, 6))
+        self._update_banner = ttk.Frame(self, padding=(12, 8))
         self._update_banner.grid(row=1, column=0, sticky="ew")
         self._update_banner.grid_remove()  # Oculta inicialmente
 
@@ -2067,11 +2247,11 @@ class App(tk.Tk):
         theme_button.pack(side="right", padx=6)
 
         # --------- Toolbar responsiva ---------- Row 2
-        toolbar_outer = ttk.Frame(self)
-        toolbar_outer.grid(row=2, column=0, sticky="ew", padx=6)
+        toolbar_outer = ttk.Frame(self, padding=(10, 6))
+        toolbar_outer.grid(row=2, column=0, sticky="ew")
         toolbar_outer.columnconfigure(0, weight=1)
         
-        self._toolbar_canvas = tk.Canvas(toolbar_outer, height=40, highlightthickness=0)
+        self._toolbar_canvas = tk.Canvas(toolbar_outer, height=50, highlightthickness=0)
         self._toolbar_canvas.grid(row=0, column=0, sticky="ew")
         self._toolbar_scroll = ttk.Scrollbar(toolbar_outer, orient="horizontal",
                                              command=self._toolbar_canvas.xview)
@@ -2091,24 +2271,24 @@ class App(tk.Tk):
         
         bar = self._toolbar_inner
         
-        # Botões principais com estilos modernos
-        ttk.Button(bar, text="➕ Nova", command=self.add_task, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="✏️ Editar", command=self.edit_task, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="🗑️ Remover", command=self.remove_task, style="Modern.TButton").pack(side="left", padx=2)
+        # Botões principais com estilos modernos e espaçamento melhorado
+        ttk.Button(bar, text="➕ Nova", command=self.add_task, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="✏️ Editar", command=self.edit_task, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="🗑️ Remover", command=self.remove_task, style="Modern.TButton").pack(side="left", padx=3)
         
         # Separador visual
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         
         # Botão de ativar/desativar
         self.btn_toggle = ttk.Button(bar, text="⏸️ Desativar", command=self.toggle_task_status, style="Toggle.TButton")
-        self.btn_toggle.pack(side="left", padx=2)
+        self.btn_toggle.pack(side="left", padx=3)
         
         # Botão de execução (destaque)
         self.btn_run = ttk.Button(bar, text="▶ Executar agora", 
                                  command=self.run_now, 
                                  style="Accent.TButton")
-        self.btn_run.pack(side="left", padx=(8, 2))
+        self.btn_run.pack(side="left", padx=(10, 3))
         
         # Dica de ferramenta para o botão de execução
         ToolTip(self.btn_run, "Executa a tarefa selecionada. Selecione múltiplas tarefas para executá-las simultaneamente.")
@@ -2117,31 +2297,29 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(bar, text="⏹️ Interromper", 
                                  command=self.stop_running_tasks,
                                  style="Danger.TButton")
-        self.btn_stop.pack(side="left", padx=2)
+        self.btn_stop.pack(side="left", padx=3)
         self.btn_stop.config(state="disabled")  # Inicialmente desabilitado
         
         # Separador visual
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
         
         # Botões secundários
-        ttk.Button(bar, text="🧪 Simular erro", command=self.simulate_error, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="💡 Dicas", command=self.show_tips, style="Modern.TButton").pack(side="left", padx=2)
-        ttk.Button(bar, text="💾 Salvar", command=self.save, style="Modern.TButton").pack(side="left", padx=2)
+        ttk.Button(bar, text="🧪 Simular erro", command=self.simulate_error, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton").pack(side="left", padx=3)
 
 
         # --------- Layout principal ---------- Row 3 (principal, expansível)
         paned = ttk.Panedwindow(self, orient="horizontal")
-        paned.grid(row=3, column=0, sticky="nsew", padx=6, pady=6)
+        paned.grid(row=3, column=0, sticky="nsew", padx=10, pady=8)
 
         left = ttk.Frame(paned)
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
 
         # Definindo as colunas da tabela
-        cols = ("Status", "Nome", "Horário", "Tipo", "Dias", "Arquivo", "NotificarFalha", "Timeout")
+        cols = ("Status", "Nome", "Horário", "Tipo", "Dias", "Arquivo")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="extended")
         
         # Configurando os cabeçalhos
@@ -2151,21 +2329,17 @@ class App(tk.Tk):
         self.tree.heading("Tipo", text="Tipo")
         self.tree.heading("Dias", text="Dias")
         self.tree.heading("Arquivo", text="Arquivo")
-        self.tree.heading("NotificarFalha", text="Notificar Falha")
-        self.tree.heading("Timeout", text="Timeout")
         
         self._style_table()
         
         # Configuração responsiva das colunas
         col_configs = {
-            "Status": {"width": 80, "minwidth": 60, "stretch": False},
-            "Nome": {"width": 200, "minwidth": 150, "stretch": True},
-            "Horário": {"width": 150, "minwidth": 100, "stretch": False},
-            "Tipo": {"width": 100, "minwidth": 80, "stretch": False},
-            "Dias": {"width": 100, "minwidth": 80, "stretch": False},
-            "Arquivo": {"width": 200, "minwidth": 150, "stretch": True},
-            "NotificarFalha": {"width": 100, "minwidth": 80, "stretch": False},
-            "Timeout": {"width": 80, "minwidth": 60, "stretch": False}
+            "Status": {"width": 100, "minwidth": 90, "stretch": False},
+            "Nome": {"width": 220, "minwidth": 180, "stretch": True},
+            "Horário": {"width": 160, "minwidth": 120, "stretch": False},
+            "Tipo": {"width": 110, "minwidth": 90, "stretch": False},
+            "Dias": {"width": 180, "minwidth": 150, "stretch": False},
+            "Arquivo": {"width": 350, "minwidth": 250, "stretch": True}
         }
         
         for c in cols:
@@ -2198,7 +2372,7 @@ class App(tk.Tk):
         paned.add(right, weight=2)
 
         # --------- Status bar ---------- Row 4
-        status = ttk.Frame(self, relief="groove", padding=(6,3))
+        status = ttk.Frame(self, relief="groove", padding=(10, 5))
         status.grid(row=4, column=0, sticky="ew")
         status.columnconfigure(0, weight=1)  # Status label se expande
         
@@ -2471,14 +2645,12 @@ class App(tk.Tk):
     def _on_tree_resize(self, event=None):
         w = max(300, self.tree.winfo_width())
         ratios = {
-            "Status": 0.05,
-            "Nome": 0.15,
-            "Horário": 0.12,
+            "Status": 0.08,
+            "Nome": 0.18,
+            "Horário": 0.14,
             "Tipo": 0.10,
-            "Dias": 0.15,
-            "Arquivo": 0.30,
-            "NotificarFalha": 0.08,
-            "Timeout": 0.05
+            "Dias": 0.16,
+            "Arquivo": 0.34
         }
         for col, r in ratios.items():
             self.tree.column(col, width=max(60, int(w * r)), stretch=True)
@@ -2500,59 +2672,298 @@ class App(tk.Tk):
             messagebox.showinfo("Salvo", "Configurações salvas.")
 
     def _register_process(self, process, task_name):
-        """Registra um processo em execução e atualiza o estado do botão de parada.
+        """Registra um processo em execução e atualiza a interface."""
+        def update_ui():
+            try:
+                with self.running_lock:
+                    # Garante que temos o PID do processo
+                    if not hasattr(process, 'pid') and hasattr(process, 'popen'):
+                        process.pid = process.popen.pid
+                    self.running_processes[task_name] = process
+                    # Habilita o botão de parada se houver processos em execução
+                    if self.running_processes and self.btn_stop['state'] == 'disabled':
+                        self.btn_stop.config(state="normal")
+                print(f"Processo registrado: {task_name} (PID: {process.pid})")
+            except Exception as e:
+                print(f"Erro ao registrar processo: {e}")
         
-        Args:
-            process: Objeto subprocess.Popen do processo em execução
-            task_name: Nome da tarefa associada ao processo
-        """
-        with self.running_lock:
-            self.running_processes[task_name] = process
-            # Habilita o botão de parada se houver processos em execução
-            if self.running_processes and self.btn_stop['state'] == 'disabled':
-                self.btn_stop.config(state="normal")
+        # Garante que a atualização da UI seja feita na thread principal
+        if self.winfo_exists():
+            self.after(0, update_ui)
 
+    def _update_ui_after_stop(self):
+        """Atualiza a interface após parar as tarefas."""
+        self.btn_stop.config(state="disabled")
+        self.set_status_line("Tarefas interrompidas pelo usuário.")
+        self.refresh_table()
+
+    def _stop_single_task(self, task_name):
+        """Para uma única tarefa em execução."""
+        try:
+            with self.running_lock:
+                process = self.running_processes.get(task_name)
+                if not process:
+                    return False
+                
+                print(f"Tentando interromper tarefa: {task_name}")
+                
+                # Para Windows
+                if os.name == 'nt':
+                    # Verifica se o processo já terminou
+                    if process.poll() is not None:
+                        print(f"Processo {task_name} (PID: {process.pid}) já foi finalizado")
+                        if task_name in self.running_processes:
+                            del self.running_processes[task_name]
+                        return True
+                    
+                    try:
+                        # Tenta encerrar o processo e seus filhos
+                        result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], 
+                                            timeout=5, 
+                                            check=False,  # Não levantar exceção em caso de erro
+                                            capture_output=True,
+                                            text=True,
+                                            creationflags=subprocess.CREATE_NO_WINDOW)
+                        
+                        # Verifica se o processo foi encerrado com sucesso ou se já estava finalizado
+                        error_output = result.stderr or ''
+                        if result.returncode == 0 or 'não está em execução' in error_output or 'not running' in error_output:
+                            print(f"Processo {task_name} (PID: {process.pid}) encerrado com sucesso")
+                            if task_name in self.running_processes:
+                                del self.running_processes[task_name]
+                            return True
+                        else:
+                            # Se o processo já foi finalizado
+                            if 'não encontrado' in error_output or 'not found' in error_output or 'no tasks' in error_output.lower():
+                                print(f"Processo {task_name} (PID: {process.pid}) já foi finalizado")
+                                if task_name in self.running_processes:
+                                    del self.running_processes[task_name]
+                                return True
+                            # Não exibe mensagens de erro no console
+                            return False
+                    except subprocess.TimeoutExpired:
+                        # Não exibe mensagem de timeout
+                        pass
+                    
+                    # Se ainda estiver rodando, tenta métodos alternativos silenciosamente
+                    if process.poll() is None:
+                        try:
+                            process.terminate()
+                            process.wait(timeout=2)
+                            if task_name in self.running_processes:
+                                del self.running_processes[task_name]
+                            return True
+                        except (subprocess.TimeoutExpired, Exception):
+                            try:
+                                process.kill()
+                                process.wait(timeout=1)
+                                if task_name in self.running_processes:
+                                    del self.running_processes[task_name]
+                                return True
+                            except Exception:
+                                pass
+                
+                # Para sistemas Unix/Linux
+                else:
+                    # Código para Unix/Linux...
+                    pass
+                
+                # Se chegou aqui, não conseguiu encerrar
+                return False
+                
+        except Exception as e:
+            print(f"Erro ao interromper tarefa {task_name}: {e}")
+            return False
+    
     def stop_running_tasks(self):
-        """Interrompe todas as tarefas em execução."""
-        if not messagebox.askyesno("Confirmar", "Deseja realmente interromper todas as tarefas em execução?"):
+        """Interrompe as tarefas em execução que estão selecionadas."""
+        print("Método stop_running_tasks chamado")
+        
+        # Verifica seleção
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Aviso", "Nenhuma tarefa selecionada.")
+            return False
+            
+        task_names = [self.tree.item(i, 'values')[1] for i in selected]
+        running_tasks = []
+        
+        with self.running_lock:
+            # Filtra apenas as tarefas selecionadas que estão em execução
+            running_tasks = [name for name in task_names if name in self.running_processes]
+            
+            if not running_tasks:
+                print("Nenhuma das tarefas selecionadas está em execução")
+                messagebox.showinfo("Informação", 
+                    "Nenhuma das tarefas selecionadas está em execução.")
+                return False
+            
+            # Pede confirmação ao usuário
+            task_list = "\n- " + "\n- ".join(running_tasks)
+            if not messagebox.askyesno("Confirmar", 
+                                     f"Deseja realmente interromper as seguintes tarefas?\n{task_list}"):
+                print("Usuário cancelou a interrupção")
+                return False
+            
+            # Mostra mensagem de status
+            self.set_status_line(f"Interrompendo {len(running_tasks)} tarefa(s)...")
+            print(f"Iniciando interrupção de {len(running_tasks)} tarefa(s)...")
+        
+        # Executa o stop em uma thread separada para não travar a interface
+        def stop_tasks():
+            stopped_count = 0
+            for task_name in running_tasks:
+                if self._stop_single_task(task_name):
+                    stopped_count += 1
+            
+            # Atualiza a interface após finalizar (na thread principal)
+            self.after(0, lambda: self._after_stop_tasks(running_tasks))
+            # Força a atualização do botão de parada e da interface
+            self.after(100, self._update_stop_button_state)
+            self.after(100, self.update)
+            print(f"{stopped_count} tarefa(s) interrompida(s) com sucesso")
+        
+        # Inicia a thread de parada em segundo plano
+        threading.Thread(target=stop_tasks, daemon=True).start()
+        return True
+    
+    def _after_stop_tasks(self, stopped_processes):
+        """Atualiza a interface após parar as tarefas."""
+        if not stopped_processes:
+            self.after(100, lambda: messagebox.showinfo("Informação", "Nenhuma tarefa foi interrompida."))
             return
             
+        success_count = 0
+        interrupted_tasks = []
+        
+        # Remove os processos parados da lista de processos em execução
         with self.running_lock:
-            if not self.running_processes:
-                messagebox.showinfo("Informação", "Nenhuma tarefa em execução para interromper.")
-                return
-                
-            for name, process in list(self.running_processes.items()):
-                try:
-                    if process.poll() is None:  # Se ainda estiver rodando
-                        if os.name == 'nt':
-                            import ctypes
-                            ctypes.windll.kernel32.GenerateConsoleCtrlEvent(0, 0)
-                        else:
-                            process.terminate()
-                        process.wait(timeout=5)
-                except Exception as e:
-                    print(f"Erro ao interromper tarefa {name}: {e}")
+            for name in stopped_processes:
+                process_terminated = False
+                if name in self.running_processes:
+                    # Tenta encerrar o processo silenciosamente
                     try:
-                        process.kill()
-                    except:
-                        pass
+                        process = self.running_processes[name]
+                        if process.poll() is None:  # Se ainda estiver rodando
+                            try:
+                                process.kill()  # Força o encerramento
+                                process.wait(timeout=1)  # Dá um tempo para o processo finalizar
+                                process_terminated = True
+                            except Exception:
+                                process_terminated = False
+                        else:
+                            process_terminated = True
+                    except Exception:
+                        process_terminated = False
+                    
+                    # Remove da lista de processos em execução
+                    try:
+                        del self.running_processes[name]
+                        if process_terminated:
+                            success_count += 1
+                            interrupted_tasks.append(name)
+                    except Exception:
+                        pass  # Ignora erros ao remover da lista
             
-            self.running_processes.clear()
-            self.btn_stop.config(state="disabled")
-            self.set_status_line("Tarefas interrompidas pelo usuário.")
-            
-            # Atualiza a interface
-            self.refresh_table()
+            # Atualiza o estado do botão de parada
+            if not self.running_processes:
+                self.btn_stop.config(state="disabled")
+        
+        # Marca as tarefas como interrompidas visualmente
+        for task_name in interrupted_tasks:
+            self._set_task_interrupted(task_name)
+        
+        # Atualiza a interface
+        status_message = f"{success_count} de {len(stopped_processes)} tarefa(s) interrompida(s) com sucesso."
+        self.set_status_line(status_message)
+        # NÃO chama refresh_table aqui para não sobrescrever o status "Interrompido"
+        
+        # Mostra mensagem de sucesso
+        if success_count > 0:
+            self.after(100, lambda: messagebox.showinfo("Sucesso", 
+                f"{success_count} tarefa(s) foram interrompida(s) com sucesso!"))
+        
+        # Atualiza o estado da UI
+        self._set_ui_busy(False)
+        self.draw_chart()
     
     def on_close(self):
-        # Interrompe todas as tarefas em execução
+        # Verifica se há tarefas em execução
         with self.running_lock:
-            if self.running_processes:
-                if messagebox.askyesno("Tarefas em execução", 
-                                     "Existem tarefas em execução. Deseja interrompê-las?"):
-                    self.stop_running_tasks()
+            has_running_tasks = bool(self.running_processes)
         
+        # Se houver tarefas em execução, pergunta ao usuário o que fazer
+        if has_running_tasks:
+            response = messagebox.askyesnocancel(
+                "Tarefas em Execução",
+                "Existem tarefas em execução.\n\n"
+                "• 'Sim' para interromper e sair\n"
+                "• 'Não' para sair sem interromper\n"
+                "• 'Cancelar' para continuar executando"
+            )
+            
+            if response is None:  # Cancelar
+                return
+                
+            if response:  # Sim - interromper e sair
+                # Cria uma janela de progresso
+                progress_win = tk.Toplevel(self)
+                progress_win.title("Aguarde...")
+                progress_win.geometry("300x100")
+                progress_win.resizable(False, False)
+                
+                # Centraliza a janela
+                window_width = 300
+                window_height = 100
+                screen_width = progress_win.winfo_screenwidth()
+                screen_height = progress_win.winfo_screenheight()
+                x = (screen_width // 2) - (window_width // 2)
+                y = (screen_height // 2) - (window_height // 2)
+                progress_win.geometry(f"{window_width}x{window_height}+{x}+{y}")
+                
+                # Adiciona um label e uma barra de progresso
+                tk.Label(progress_win, text="Interrompendo tarefas, aguarde...").pack(pady=10)
+                progress = ttk.Progressbar(progress_win, mode="indeterminate")
+                progress.pack(pady=10, padx=20, fill="x")
+                progress.start()
+                
+                # Força a atualização da interface
+                progress_win.update_idletasks()
+                
+                # Função para encerrar as tarefas e fechar o programa
+                def stop_and_quit():
+                    # Para todas as tarefas diretamente (sem confirmação)
+                    with self.running_lock:
+                        tasks_to_stop = list(self.running_processes.keys())
+                    
+                    # Interrompe cada tarefa
+                    for task_name in tasks_to_stop:
+                        self._stop_single_task(task_name)
+                    
+                    # Aguarda um pouco para as tarefas serem interrompidas
+                    time.sleep(1)
+                    
+                    # Fecha o agendador
+                    try:
+                        self.scheduler.shutdown(wait=False)
+                    except Exception:
+                        pass
+                    
+                    # Fecha a janela de progresso e a aplicação (na thread principal)
+                    self.after(0, lambda: progress_win.destroy())
+                    self.after(100, self.destroy)
+                
+                # Executa em uma thread separada para não travar a interface
+                threading.Thread(target=stop_and_quit, daemon=True).start()
+                
+                # Mantém a janela de progresso aberta
+                self.wait_window(progress_win)
+                return
+            
+            # Se o usuário escolheu "Não", apenas continua para fechar o programa
+            # sem interromper as tarefas em execução
+        
+        # Se não houver tarefas em execução ou se o usuário escolheu "Não"
         try:
             self.scheduler.shutdown(wait=False)
         except Exception:
@@ -2710,24 +3121,72 @@ class App(tk.Tk):
     def _job_wrapper(self, task):
         def progress(_):
             pass
+            
+        task_name = task["name"]
+        
+        def on_task_start():
+            if self.winfo_exists():
+                self._on_job_start(task)  # Já chama _set_task_running internamente
+        
+        def on_task_end(rc, dur, log_path):
+            def update_ui():
+                if not self.winfo_exists():
+                    return
+                
+                # Verifica se foi interrompido manualmente
+                was_interrupted = False
+                with self.running_lock:
+                    if task_name not in self.running_processes:
+                        was_interrupted = True
+                    else:
+                        # Remove o processo da lista de processos em execução
+                        del self.running_processes[task_name]
+                    
+                    # Atualiza o estado do botão de parada
+                    if not self.running_processes:
+                        self.btn_stop.config(state="disabled")
+                
+                # Atualiza a interface
+                # Só atualiza o status se NÃO foi interrompido (pois _set_task_interrupted já foi chamado)
+                if not was_interrupted:
+                    self._set_task_running(task_name, False)
+                
+                self.draw_chart()
+                self._on_job_end(task, rc, dur, log_path)
+            
+            if self.winfo_exists():
+                self.after(0, update_ui)
+        
+        # Inicia a tarefa
         try:
             if self.winfo_exists():
-                self.after(0, lambda t=task: (self._set_task_running(t["name"], True), self._on_job_start(t)))
-        except Exception:
-            pass
-        rc, dur, log_path = run_task(task, self.data["settings"], 
-                                  progress_cb=progress,
-                                  process_callback=self._register_process)
-        append_history(self.data, task["name"], rc, dur)
-        self._maybe_notify(task, rc, log_path)
+                self.after(0, on_task_start)
+        except Exception as e:
+            print(f"Erro ao iniciar tarefa {task_name}: {e}")
+        
+        # Executa a tarefa
         try:
-            if self.winfo_exists():
-                self.after(0, lambda t=task, r=rc, d=dur, lp=log_path: (self._set_task_running(t["name"], False), self.draw_chart(), self._on_job_end(t, r, d, lp)))
-        except Exception:
-            pass
+            rc, dur, log_path = run_task(task, self.data["settings"], 
+                                      progress_cb=progress,
+                                      process_callback=self._register_process)
+            append_history(self.data, task_name, rc, dur)
+            self._maybe_notify(task, rc, log_path)
+        except Exception as e:
+            print(f"Erro ao executar tarefa {task_name}: {e}")
+            rc, dur, log_path = 1, 0, None
+        
+        # Atualiza a interface após o término
+        on_task_end(rc, dur, log_path)
 
     def _maybe_notify(self, task, rc, log_path):
-        if rc != 0 and task.get("notify_fail", True):
+        # Verifica se a tarefa foi interrompida manualmente
+        was_stopped_manually = False
+        with self.running_lock:
+            if task['name'] not in self.running_processes:
+                was_stopped_manually = True
+                
+        # Não envia notificação se foi interrompida manualmente
+        if rc != 0 and task.get("notify_fail", True) and not was_stopped_manually:
             subject = f"[{task['name']}] FALHA (RC={rc})"
             body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}"
             try:
@@ -2739,6 +3198,36 @@ class App(tk.Tk):
             except Exception as e:
                 print("Erro WhatsApp:", e)
 
+    def _update_task_status_color(self, name):
+        """Atualiza a cor do status de uma tarefa baseado no seu estado atual"""
+        try:
+            # Verifica se a tarefa está rodando
+            with self.running_lock:
+                is_running = name in self.running_processes
+            
+            # Busca a tarefa
+            task = next((t for t in self.data.get("tasks", []) if t.get("name") == name), None)
+            if not task:
+                return
+            
+            enabled = task.get("enabled", True)
+            
+            # Define texto de status
+            if is_running:
+                status_text = "Rodando"
+            elif enabled:
+                status_text = "Ativo"
+            else:
+                status_text = "Parado"
+            
+            # Atualiza apenas a coluna Status
+            vals = list(self.tree.item(name, "values"))
+            if vals:
+                vals[0] = status_text
+                self.tree.item(name, values=tuple(vals))
+        except Exception:
+            pass
+    
     def _set_task_running(self, name, running: bool):
         try:
             vals = list(self.tree.item(name, "values"))
@@ -2749,23 +3238,79 @@ class App(tk.Tk):
                 enabled = next((t for t in self.data.get("tasks", []) if t.get("name") == name), {}).get("enabled", True)
             except Exception:
                 pass
-            vals[0] = "⏳ Rodando" if running else ("✅ Ativo" if enabled else "⏸️ Inativo")
+            
+            # Define texto de status
+            if running:
+                vals[0] = "Rodando"
+            elif enabled:
+                vals[0] = "Ativo"
+            else:
+                vals[0] = "Parado"
+            
+            # Atualiza os valores
             self.tree.item(name, values=tuple(vals))
         except Exception:
             pass
 
+    def _set_task_interrupted(self, name):
+        """Marca uma tarefa como interrompida"""
+        try:
+            print(f"Marcando tarefa '{name}' como interrompida")
+            vals = list(self.tree.item(name, "values"))
+            if not vals:
+                print(f"Erro: valores vazios para tarefa '{name}'")
+                return
+            
+            print(f"Status anterior: {vals[0]}")
+            vals[0] = "Interrompido"
+            print(f"Novo status: {vals[0]}")
+            
+            # Atualiza os valores
+            self.tree.item(name, values=tuple(vals))
+            print(f"Status atualizado na interface para '{name}'")
+            
+            # Após 3 segundos, volta para o estado normal (ativo/inativo)
+            def reset_status():
+                try:
+                    if self.winfo_exists():
+                        print(f"Resetando status de '{name}' após 3 segundos")
+                        self._set_task_running(name, False)
+                except Exception as e:
+                    print(f"Erro ao resetar status: {e}")
+            self.after(3000, reset_status)
+        except Exception as e:
+            print(f"Erro em _set_task_interrupted: {e}")
+    
     def _on_job_start(self, task):
         try:
-            self.set_status_line(f"Iniciando '{task['name']}'…")
-            self._show_toast(f"Iniciando: {task['name']}", task.get('path', ''))
+            task_name = task['name']
+            self.set_status_line(f"Iniciando '{task_name}'…")
+            self._show_toast(f"Iniciando: {task_name}", task.get('path', ''))
+            # Atualiza o status visual para "Rodando"
+            self._set_task_running(task_name, True)
         except Exception:
             pass
 
     def _on_job_end(self, task, rc, dur, log_path):
         try:
-            status = "OK" if rc == 0 else f"Falha (RC={rc})"
-            self.set_status_line(f"Concluído '{task['name']}' — {status} em {dur:.1f}s")
-            self._show_toast(f"Concluído: {task['name']}", f"{status} • {dur:.1f}s", ok=(rc == 0))
+            task_name = task['name']
+            was_stopped_manually = False
+            
+            # Verifica se a tarefa foi interrompida manualmente
+            with self.running_lock:
+                if task_name not in self.running_processes:
+                    was_stopped_manually = True
+            
+            # Se foi interrompida manualmente, marca como interrompida
+            if was_stopped_manually and rc != 0:
+                status = "Interrompido"
+                self._set_task_interrupted(task_name)
+                self.set_status_line(f"Tarefa '{task_name}' interrompida pelo usuário")
+                self._show_toast(f"Tarefa interrompida", f"{task_name} foi interrompida com sucesso", ok=True)
+            else:
+                status = "OK" if rc == 0 else f"Falha (RC={rc})"
+                self.set_status_line(f"Concluído '{task_name}' — {status} em {dur:.1f}s")
+                self._show_toast(f"Concluído: {task_name}", f"{status} • {dur:.1f}s", ok=(rc == 0))
         except Exception:
             pass
 
@@ -2810,19 +3355,76 @@ class App(tk.Tk):
     def _set_ui_busy(self, busy=True, msg=None):
         try:
             self.btn_run.config(state=("disabled" if busy else "normal"))
-        except Exception:
-            pass
+            # Atualiza o estado do botão Interromper
+            if busy:
+                self.btn_stop.config(state="normal")
+            else:
+                # Só desabilita se não houver tarefas em execução
+                with self.running_lock:
+                    if not self.running_processes:
+                        self.btn_stop.config(state="disabled")
+        except Exception as e:
+            print(f"Erro ao atualizar estado da UI: {e}")
+            
         if busy:
-            self.status_label.config(text=msg or "Executando...")
+            # Adapta cor ao tema
+            dark_mode = getattr(self, 'var_dark', None)
+            if dark_mode and dark_mode.get():
+                text_color = "#e5e7eb"  # Cinza claro para modo escuro
+            else:
+                text_color = "#1f2937"  # Cinza escuro para modo claro
+            self.status_label.config(text=msg or "Executando...", foreground=text_color)
             self.pbar.start(10)
         else:
             self.pbar.stop()
-            self.status_label.config(text="Pronto.")
+            # Adapta cor ao tema
+            dark_mode = getattr(self, 'var_dark', None)
+            if dark_mode and dark_mode.get():
+                text_color = "#e5e7eb"  # Cinza claro para modo escuro
+            else:
+                text_color = "#1f2937"  # Cinza escuro para modo claro
+            self.status_label.config(text="Pronto.", foreground=text_color)
         self.update_idletasks()
 
-    def set_status_line(self, text):
-        self.status_label.config(text=text[:160])
-        self.update_idletasks()
+    def set_status_line(self, text, color=None):
+        """Atualiza a barra de status de forma segura (thread-safe).
+        
+        Args:
+            text: Texto a ser exibido
+            color: Cor do texto (None para usar cor baseada no tema)
+        """
+        def update():
+            try:
+                if self.winfo_exists():
+                    # Usa cor baseada no tema se não especificada
+                    if color is None:
+                        # Verifica se está no modo escuro
+                        dark_mode = getattr(self, 'var_dark', None)
+                        if dark_mode and dark_mode.get():
+                            text_color = "#e5e7eb"  # Cinza claro para modo escuro
+                        else:
+                            text_color = "#1f2937"  # Cinza escuro para modo claro
+                    else:
+                        text_color = color
+                    
+                    self.status_label.config(text=text[:160], foreground=text_color)
+                    self.update_idletasks()
+            except Exception as e:
+                print(f"Erro ao atualizar barra de status: {e}")
+        
+        # Se estamos na thread principal, atualiza diretamente
+        # Caso contrário, agenda para a thread principal
+        try:
+            if threading.current_thread() is threading.main_thread():
+                update()
+            else:
+                self.after(0, update)
+        except Exception:
+            # Fallback: sempre tenta agendar
+            try:
+                self.after(0, update)
+            except Exception as e:
+                print(f"Erro ao agendar atualização de status: {e}")
 
     def _hora_dias_text(self, t):
      st = (t.get("schedule_type") or "cron").lower()
@@ -2851,9 +3453,16 @@ class App(tk.Tk):
 
 
     # ===== tabela & gráfico =====
-    def refresh_table(self):
+    def refresh_table(self, full_refresh=True):
+        """Atualiza a tabela. full_refresh=False apenas atualiza status."""
         # Salva a seleção atual
         current_selection = self.tree.selection()
+        
+        # Se não for refresh completo, apenas atualiza status
+        if not full_refresh:
+            for task in self.data.get("tasks", []):
+                self._update_task_status_color(task["name"])
+            return
         
         # Limpa a tabela
         for i in self.tree.get_children():
@@ -2871,13 +3480,16 @@ class App(tk.Tk):
             if is_selected:
                 tags.append("selected")
             
-            # Ícones de play/pause para status
-            if task.get("enabled", True):
-                status_icon = "▶"  # Play para ativo
-                status_fg = "#10b981"  # Verde
+            # Texto de status - verifica se está rodando
+            with self.running_lock:
+                is_running = task_name in self.running_processes
+            
+            if is_running:
+                status_text = "Rodando"
+            elif task.get("enabled", True):
+                status_text = "Ativo"
             else:
-                status_icon = "⏸"  # Pause para desativado
-                status_fg = "#ef4444"  # Vermelho
+                status_text = "Parado"
             
             # Obtém o tipo de agendamento
             schedule_type = task.get("schedule_type", "cron")
@@ -2900,21 +3512,18 @@ class App(tk.Tk):
             # Adiciona a tarefa à tabela
             item_id = self.tree.insert("", "end", iid=task_name,
                            values=(
-                               status_icon,  # Ícone centralizado
+                               status_text,  # Texto de status
                                task_name,
                                times,
                                schedule_type.capitalize(),
                                self._format_days(task.get("days", [True]*7)),
-                               task.get("path", ""),
-                               "Sim" if task.get("notify_on_failure") else "Não",
-                               f"{task.get('timeout', '')}s" if task.get("timeout") else "Padrão"
+                               task.get("path", "")
                            ),
-                           tags=('enabled' if task.get("enabled", True) else 'disabled',))
-            
-            # Aplica estilo ao ícone de status
-            self.tree.tag_configure('status_icon', foreground=status_fg, font=('Segoe UI', 14, 'bold'))
-            self.tree.set(item_id, 'Status', status_icon)
-            self.tree.set(item_id, 'Nome', task_name)  # Garante que o nome seja definido corretamente
+                           tags=tags)
+        
+        # Aplica as cores de status após inserir todos os itens
+        for task in self.data.get("tasks", []):
+            self._update_task_status_color(task["name"])
         
         # Ajusta o tamanho das colunas
         self._resize_columns()
@@ -2945,17 +3554,15 @@ class App(tk.Tk):
         """Ajusta automaticamente o tamanho das colunas da tabela."""
         # Configuração de largura fixa para a coluna Status
         self.tree.column("#0", width=0, stretch=tk.NO)
-        self.tree.column("Status", width=50, minwidth=50, stretch=tk.NO, anchor="center")
+        self.tree.column("Status", width=90, minwidth=90, stretch=tk.NO, anchor="center")
         
         # Configuração de largura para as outras colunas
         col_widths = {
-            "Nome": 150,
-            "Horário": 120,
+            "Nome": 180,
+            "Horário": 130,
             "Tipo": 100,
-            "Dias": 100,
-            "Arquivo": 200,
-            "NotificarFalha": 100,
-            "Timeout": 80
+            "Dias": 150,
+            "Arquivo": 300
         }
         
         # Ajusta o tamanho das colunas baseado no conteúdo
@@ -2997,8 +3604,25 @@ class App(tk.Tk):
                 tags.append('selected')
                 self.tree.item(item, tags=tags)
 
-    def draw_chart(self):
-        """Desenha gráfico moderno com animações suaves"""
+    def draw_chart(self, force=False):
+        """Desenha gráfico moderno com animações suaves e debounce."""
+        # Debounce: evita múltiplos redesenhos em sequência
+        if not force and hasattr(self, '_chart_redraw_scheduled'):
+            return
+        
+        def _do_draw():
+            try:
+                if hasattr(self, '_chart_redraw_scheduled'):
+                    delattr(self, '_chart_redraw_scheduled')
+                self._draw_chart_impl()
+            except Exception:
+                pass
+        
+        self._chart_redraw_scheduled = True
+        self.after(100, _do_draw)  # Aguarda 100ms antes de redesenhar
+    
+    def _draw_chart_impl(self):
+        """Implementação real do desenho do gráfico."""
         self.canvas.delete("all")
         dark = bool(self.var_dark.get())
         
@@ -3312,160 +3936,247 @@ class App(tk.Tk):
         os.startfile(files[-1])
 
     def run_now(self, task_name=None):
-        """Executa uma tarefa específica ou a selecionada."""
-        if task_name:
-            # Se um nome de tarefa for fornecido, executa essa tarefa
-            task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
-            if not task:
-                return
-            tasks = [task]
-        else:
-            # Caso contrário, usa a seleção atual
-            sel = self.tree.selection()
-            if not sel:
-                return
-            
-            # Se mais de uma tarefa estiver selecionada, usa o método de múltiplas execuções
-            if len(sel) > 1:
-                self.run_multiple_tasks(sel)
-                return
+        """Executa uma tarefa imediatamente."""
+        try:
+            if task_name is None:
+                # Se nenhum nome for fornecido, verifica a seleção na árvore
+                selected = self.tree.selection()
+                if not selected:
+                    messagebox.showwarning("Aviso", "Nenhuma tarefa selecionada.")
+                    return
                 
-            # Se apenas uma tarefa estiver selecionada, executa normalmente
-            name = sel[0]
-            task = next((t for t in self.data["tasks"] if t["name"] == name), None)
-            if not task:
-                return
-            tasks = [task]
-
-        # Executa a tarefa única
-        for task in tasks:
-            self._set_ui_busy(True, f"Executando '{task['name']}'...")
-
-            def worker(task=task):
-                def progress(line):
-                    self.after(0, lambda: self.set_status_line(f"[{task['name']}] {line}"))
+                # Obtém os nomes das tarefas selecionadas
+                task_names = [self.tree.item(i, 'values')[1] for i in selected]
                 
-                rc, dur, log_path = run_task(task, self.data["settings"], 
-                                         progress_cb=progress,
-                                         process_callback=self._register_process)
-                append_history(self.data, task["name"], rc, dur)
-                self._maybe_notify(task, rc, log_path)
+                # Executa as tarefas selecionadas
+                if len(task_names) > 1:
+                    print(f"Executando tarefas selecionadas: {', '.join(task_names)}")
+                    self.run_multiple_tasks(task_names)
+                else:
+                    # Executa uma única tarefa diretamente
+                    print(f"Executando tarefa: {task_names[0]}")
+                    self._run_single_task(task_names[0])
+            else:
+                # Executa uma única tarefa pelo nome
+                print(f"Executando tarefa: {task_name}")
+                self._run_single_task(task_name)
                 
-                def finish():
-                    self._set_ui_busy(False)
-                    self.draw_chart()
-                    msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
-                    # Mostra mensagem apenas para execuções únicas
-                    if len(tasks) == 1:
-                        messagebox.showinfo(
-                            "Execução", 
-                            f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}"
-                        )
-                
-                self.after(0, finish)
-
-            threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            print(f"Erro ao executar tarefa: {e}")
+            self.after(0, lambda: messagebox.showerror("Erro", f"Falha ao executar a tarefa: {e}"))
     
+    def _update_stop_button_state(self):
+        """Atualiza o estado do botão Interromper com base nas tarefas em execução."""
+        try:
+            with self.running_lock:
+                # O botão deve estar habilitado se houver tarefas em execução
+                # independente de quais tarefas estão selecionadas
+                has_running = bool(self.running_processes)
+                
+                # Atualiza o estado do botão
+                self.btn_stop.config(state="normal" if has_running else "disabled")
+                
+        except Exception as e:
+            print(f"Erro ao atualizar estado do botão de parada: {e}")
+            self.btn_stop.config(state="disabled")
+
     def run_multiple_tasks(self, task_names):
         """Executa múltiplas tarefas em paralelo."""
-        if not task_names:
-            return
+        try:
+            if not task_names:
+                return
+
+            # Filtra apenas tarefas que existem
+            valid_tasks = [name for name in task_names 
+                          if name in {t["name"] for t in self.data["tasks"]}]
             
-        # Remove o limite de 3 tarefas, permitindo selecionar quantas quiser
-        tasks = []
-        
-        # Encontra as tarefas pelos nomes
-        for name in task_names:
-            task = next((t for t in self.data["tasks"] if t["name"] == name), None)
-            if task:
-                tasks.append(task)
-        
-        if not tasks:
-            messagebox.showwarning("Aviso", "Nenhuma tarefa válida selecionada.")
+            if not valid_tasks:
+                self.after(0, lambda: messagebox.showinfo("Aviso", "Nenhuma tarefa válida para executar."))
+                return
+            
+            # Atualiza a interface para mostrar que as tarefas estão sendo executadas
+            self._set_ui_busy(True, f"Executando {len(valid_tasks)} tarefa(s)...")
+            
+            # Habilita o botão de parada
+            self.after(0, lambda: self.btn_stop.config(state="normal"))
+            
+            # Cria uma thread para cada tarefa
+            threads = []
+            for task_name in valid_tasks:
+                thread = threading.Thread(
+                    target=self._run_single_task,
+                    args=(task_name,),
+                    daemon=True
+                )
+                threads.append(thread)
+                thread.start()
+            
+            # Inicia uma thread para monitorar o término das tarefas
+            monitor_thread = threading.Thread(
+                target=self._monitor_tasks_completion,
+                args=(threads, valid_tasks),
+                daemon=True
+            )
+            monitor_thread.start()
+            
+        except Exception as e:
+            print(f"Erro ao executar tarefas: {e}")
+            self.after(0, lambda: messagebox.showerror("Erro", f"Falha ao executar as tarefas: {e}"))
+            self._set_ui_busy(False, "Erro ao executar tarefas")
+
+    def _run_single_task(self, task_name):
+        task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
+        if not task:
             return
         
-        # Confirmação antes de executar múltiplas tarefas
-        task_list = "\n- " + "\n- ".join(t["name"] for t in tasks)
-        if not messagebox.askyesno(
-            "Confirmar execução múltipla",
-            f"Deseja executar as seguintes tarefas simultaneamente?\n{task_list}"
-        ):
-            return
+        self._set_ui_busy(True, f"Executando '{task['name']}'...")
         
-        # Executa cada tarefa em sua própria thread
-        self._set_ui_busy(True, f"Executando {len(tasks)} tarefas em paralelo...")
+        # Atualiza o status visual para "Rodando"
+        self.after(0, lambda: self._set_task_running(task_name, True))
         
-        # Contadores para acompanhar o progresso
+        def worker(task=task):
+            def progress(line):
+                self.after(0, lambda: self.set_status_line(f"[{task['name']}] {line}"))
+            
+            rc, dur, log_path = run_task(task, self.data["settings"], 
+                                     progress_cb=progress,
+                                     process_callback=self._register_process)
+            append_history(self.data, task["name"], rc, dur)
+            self._maybe_notify(task, rc, log_path)
+            
+            def finish():
+                # Atualiza o status visual para "Ativo"
+                self._set_task_running(task_name, False)
+                self._set_ui_busy(False)
+                self.draw_chart()
+                msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
+                messagebox.showinfo(
+                    "Execução", 
+                    f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}"
+                )
+            
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_task_status(self, task_name, success):
+        """Atualiza o status de uma tarefa na interface.
+        
+        Args:
+            task_name: Nome da tarefa
+            success: Booleano indicando se a tarefa foi bem-sucedida
+        """
+        # Remove a tarefa dos processos em execução
+        with self.running_lock:
+            if task_name in self.running_processes:
+                del self.running_processes[task_name]
+        
+        # Atualiza o status na árvore de tarefas
+        for item in self.tree.get_children():
+            if self.tree.item(item, 'values')[1] == task_name:  # Índice 1 é a coluna 'Nome'
+                # Atualiza o status (índice 0 é a coluna 'Status')
+                values = list(self.tree.item(item, 'values'))
+                values[0] = '✅' if success else '❌'
+                self.tree.item(item, values=values)
+                break
+        
+        # Atualiza o estado do botão de parada
+        self.after(0, self._update_stop_button_state)
+                
+    def _update_ui_after_completion(self, success_count, failed_count):
+        """Atualiza a interface após a conclusão de todas as tarefas.
+        
+        Args:
+            success_count: Número de tarefas concluídas com sucesso
+            failed_count: Número de tarefas que falharam
+        """
+        self._set_ui_busy(False)
+        self.refresh_table()
+        
+        # Atualiza o botão de parada
+        self.after(0, self._update_stop_button_state)
+        
+        # Prepara a mensagem de status
+        total = success_count + failed_count
+        if total > 0:
+            if success_count > 0 and failed_count > 0:
+                msg = f"{success_count} tarefa(s) concluída(s) com sucesso.\n{failed_count} tarefa(s) falharam."
+                messagebox.showinfo("Execução concluída", msg)
+            elif success_count > 0:
+                msg = f"Todas as {success_count} tarefa(s) foram concluídas com sucesso!"
+                messagebox.showinfo("Sucesso", msg)
+            else:
+                msg = f"Todas as {failed_count} tarefa(s) falharam."
+                messagebox.showerror("Falha", msg)
+            
+            # Atualiza a barra de status
+            status_msg = f"✅ {success_count} concluídas | ❌ {failed_count} falhas | Total: {total}"
+            self.set_status_line(status_msg)
+        else:
+            # Caso não haja tarefas para processar
+            self.set_status_line("Nenhuma tarefa para executar.")
+            
+        # Garante que o botão de parada esteja desativado
+        with self.running_lock:
+            if not self.running_processes:
+                self.after(0, lambda: self.btn_stop.config(state="disabled"))
+
+    def _monitor_tasks_completion(self, threads, task_names):
+        total = len(task_names)
         completed = 0
-        total = len(tasks)
         success_count = 0
-        fail_count = 0
-        
-        # Flag para controlar se já mostrou a mensagem de conclusão
+        failed_count = 0
         completion_shown = False
         
-        def show_completion_message():
-            """Mostra mensagem de resumo após a execução de múltiplas tarefas."""
-            nonlocal completion_shown
-            if completion_shown:
-                return
-                
-            completion_shown = True
-            
-            if success_count == total:
-                msg = f"✅ Todas as {total} tarefas foram concluídas com sucesso!"
-            elif fail_count == total:
-                msg = f"❌ Todas as {total} tarefas falharam!"
-            else:
-                msg = (
-                    f"📊 Resumo da execução de {total} tarefas:\n\n"
-                    f"✅ {success_count} tarefa(s) concluída(s) com sucesso\n"
-                    f"❌ {fail_count} tarefa(s) falharam"
-                )
-                
-            self.after(0, lambda: messagebox.showinfo(
-                "Execução Concluída",
-                msg
-            ))
-        
+        # Função para atualizar o estado da tarefa de forma thread-safe
         def task_completed(name, success):
-            nonlocal completed, success_count, fail_count
-            
-            # Atualiza contadores
-            if success:
-                success_count += 1
-            else:
-                fail_count += 1
+            nonlocal completed, success_count, failed_count, completion_shown
+            with threading.Lock():
+                completed += 1
+                if success:
+                    success_count += 1
+                else:
+                    failed_count += 1
                 
-            completed += 1
-            
-            # Atualiza barra de status
-            self.after(0, lambda: self.set_status_line(
-                f"Concluído: {completed}/{total} tarefas"
-            ))
-            
-            # Quando todas as tarefas terminarem
-            if completed >= total:
-                self.after(0, lambda: [
-                    self._set_ui_busy(False),
-                    self.draw_chart(),
-                    show_completion_message()
-                ])
+                # Atualiza a UI na thread principal
+                self.after(0, lambda: self._update_task_status(name, success))
+                
+                # Atualiza a barra de progresso e status
+                progress = int((completed / total) * 100)
+                status = f"Concluído: {completed}/{total} | Sucesso: {success_count} | Falhas: {failed_count}"
+                self.after(0, lambda: self.set_status_line(status))
+                
+                # Atualiza a barra de progresso se existir
+                if hasattr(self, 'progress') and self.progress.winfo_exists():
+                    self.after(0, lambda: self.progress.config(value=progress))
+                
+                # Se todas as tarefas foram concluídas
+                if completed >= total and not completion_shown:
+                    completion_shown = True
+                    self.after(0, self._update_ui_after_completion, success_count, failed_count)
         
         # Inicia cada tarefa em uma thread separada
-        for task in tasks:
-            def worker(task=task):
-                try:
-                    rc, dur, log_path = run_task(task, self.data["settings"],
-                                         process_callback=self._register_process)
-                    append_history(self.data, task["name"], rc, dur)
-                    self._maybe_notify(task, rc, log_path)
-                    task_completed(task["name"], rc == 0)
-                except Exception as e:
-                    print(f"Erro ao executar tarefa {task['name']}: {e}")
-                    task_completed(task["name"], False)
+        for task_name in task_names:
+            task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
+            if task:
+                def worker(task=task):
+                    try:
+                        rc, dur, log_path = run_task(task, self.data["settings"],
+                                             process_callback=self._register_process)
+                        append_history(self.data, task["name"], rc, dur)
+                        self._maybe_notify(task, rc, log_path)
+                        task_completed(task["name"], rc == 0)
+                    except Exception as e:
+                        print(f"Erro ao executar tarefa {task['name']}: {e}")
+                        task_completed(task["name"], False)
+                
+                threading.Thread(target=worker, daemon=True).start()
+            else:
+                print(f"Tarefa não encontrada: {task_name}")
+                task_completed(task_name, False)
             
-            threading.Thread(target=worker, daemon=True).start()
+            # Garante que o botão Interromper esteja ativado
+            self.after(100, self._update_stop_button_state)
 
     def open_settings(self):
         dlg = SettingsDialog(
