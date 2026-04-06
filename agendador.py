@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.09.25.1.1"   # << aumente em cada build
+APP_VERSION = "2025.10.11.1"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -177,6 +177,51 @@ def _apply_update_and_restart(new_exe: Path):
 
     subprocess.Popen(["cmd", "/c", str(updater)], creationflags=flags, startupinfo=si)
     os._exit(0)
+
+
+# --- AUTOSTART com Windows (HKCU\...\Run) ----------------------------------
+AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_REG_NAME = "AgendadorBravo"
+
+def is_autostart_enabled() -> bool:
+    """Verifica se o app está configurado para iniciar com o Windows."""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ) as k:
+            val, _ = winreg.QueryValueEx(k, AUTOSTART_REG_NAME)
+            return bool(val)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+def set_autostart(enable: bool) -> tuple[bool, str]:
+    """Cria/remove a entrada de autostart no registro do Windows."""
+    if os.name != "nt":
+        return (False, "Somente Windows.")
+    try:
+        import winreg
+        if enable:
+            exe = _exe_path()
+            # Evita configurar autostart em modo dev (script .py)
+            if not _is_frozen():
+                return (False, "Modo dev: autostart não configurado.")
+            cmd = f'"{exe}"'
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, AUTOSTART_REG_NAME, 0, winreg.REG_SZ, cmd)
+            return (True, "Autostart habilitado.")
+        else:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, AUTOSTART_REG_NAME)
+            except FileNotFoundError:
+                pass
+            return (True, "Autostart desabilitado.")
+    except Exception as e:
+        return (False, f"Falha: {e}")
+# --- /AUTOSTART --------------------------------------------------------------
 
 
 def fetch_update_info() -> tuple[bool, dict | str]:
@@ -1599,7 +1644,7 @@ class SettingsDialog(tk.Toplevel):
         # === ABA 5: SISTEMA ===
         tab_sistema = ttk.Frame(notebook, padding=10)
         notebook.add(tab_sistema, text="Sistema")
-        
+
         row = 0
         # Atualizações
         up_frame = ttk.LabelFrame(tab_sistema, text="Atualizações", padding=(8, 8))
@@ -1608,6 +1653,18 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(up_frame, text="Verificar atualização", command=self._check_updates)\
             .grid(row=0, column=1, padx=(10, 0), sticky="e")
         up_frame.columnconfigure(0, weight=1)
+
+        # Inicializar com o Windows
+        self.var_autostart = tk.BooleanVar(value=is_autostart_enabled())
+        startup_frame = ttk.LabelFrame(tab_sistema, text="Inicialização", padding=(8, 8))
+        startup_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 10)); row += 1
+        ttk.Checkbutton(
+            startup_frame,
+            text="Iniciar com o Windows",
+            variable=self.var_autostart,
+            command=self._toggle_autostart,
+        ).grid(row=0, column=0, sticky="w")
+        startup_frame.columnconfigure(0, weight=1)
 
         # Backup e migração
         backup_frame = ttk.LabelFrame(tab_sistema, text="Backup e migração", padding=(8, 8))
@@ -1639,6 +1696,15 @@ class SettingsDialog(tk.Toplevel):
             self._on_check_updates()
         else:
             messagebox.showinfo("Atualizações", "Função de verificação não disponível.")
+
+    def _toggle_autostart(self):
+        """Habilita/desabilita a inicialização automática com o Windows."""
+        enable = bool(self.var_autostart.get())
+        ok, msg = set_autostart(enable)
+        if not ok:
+            messagebox.showwarning("Inicialização", msg, parent=self)
+            # Reverte o checkbox se falhou
+            self.var_autostart.set(is_autostart_enabled())
 
     def pick_pdi(self):
         d = filedialog.askdirectory(title="Selecione a pasta do Pentaho (data-integration)")
@@ -2157,12 +2223,10 @@ class App(tk.Tk):
         self.rowconfigure(3, weight=1)  # O painel principal (row 3) se expande
         # Rows: 0=header, 1=banner, 2=toolbar, 3=main_content, 4=status
         
-        self.attributes("-alpha", 0.0)  # fade-in
+        # Mostra a janela imediatamente (sem fade-in que atrasa visibilidade)
+        self.attributes("-alpha", 1.0)
         ensure_dirs()
-        
-        # Limpa processos Python órfãos ao iniciar
-        cleanup_orphaned_python_processes()
-        
+
         self.data = load_data()
         # Deixa explícito (1 instância por job, coalesce)
         self.scheduler = BackgroundScheduler(job_defaults={"max_instances": 1, "coalesce": True})
@@ -2395,17 +2459,73 @@ class App(tk.Tk):
         # Dados / agendamento
         self._ensure_task_enabled_field()  # Garante que tarefas existentes tenham o campo enabled
         self.refresh_table()
-        self.reschedule_all()
         self.update_status_indicators()
         self.update_net_indicator()
         self.update_toggle_button()  # Inicializa o botão toggle
         self._apply_theme(False)
-        self._fade_in()
         self._pulse_status()
+        self._monitor_stop_button()  # Inicia monitoramento do botão Interromper
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        
-        start_net_monitor(self)
-        start_auto_update_thread(self)
+
+        # Trabalho pesado adiado para DEPOIS da UI aparecer (startup mais leve/rápido)
+        self.after(50, self._deferred_startup)
+
+    def _deferred_startup(self):
+        """Trabalho pesado executado após a janela aparecer, para abertura mais rápida."""
+        # Agenda tarefas (cria scheduler + jobs)
+        try:
+            self.reschedule_all()
+        except Exception as e:
+            print(f"[startup] reschedule_all falhou: {e}")
+
+        # Limpeza de processos órfãos em background (psutil é lento)
+        def _cleanup_bg():
+            try:
+                cleanup_orphaned_python_processes()
+            except Exception:
+                pass
+        threading.Thread(target=_cleanup_bg, daemon=True).start()
+
+        # Monitor de rede e checagem de atualizações
+        try:
+            start_net_monitor(self)
+            start_auto_update_thread(self)
+        except Exception as e:
+            print(f"[startup] monitores falharam: {e}")
+
+        # Prompt de autostart (somente na 1ª vez, e só em modo compilado)
+        self.after(400, self._maybe_prompt_autostart)
+
+    def _maybe_prompt_autostart(self):
+        """Se ainda não perguntamos e o app não está no autostart, pergunta ao usuário."""
+        try:
+            if not _is_frozen():
+                return
+            settings = self.data.setdefault("settings", {})
+            if settings.get("autostart_prompted"):
+                return
+            if is_autostart_enabled():
+                # Já está configurado; apenas marca como perguntado
+                settings["autostart_prompted"] = True
+                save_data(self.data)
+                return
+
+            ans = messagebox.askyesno(
+                "Iniciar com o Windows",
+                "O Agendador-Bravo ainda não está configurado para iniciar automaticamente com o Windows.\n\n"
+                "Deseja que ele seja aberto junto com o Windows?",
+                parent=self,
+            )
+            if ans:
+                ok, msg = set_autostart(True)
+                if ok:
+                    self.set_status_line("Autostart habilitado.")
+                else:
+                    messagebox.showwarning("Autostart", f"Não foi possível habilitar:\n{msg}", parent=self)
+            settings["autostart_prompted"] = True
+            save_data(self.data)
+        except Exception as e:
+            print(f"[autostart] prompt falhou: {e}")
 
     def _ensure_task_enabled_field(self):
         """Garante que todas as tarefas existentes tenham o campo 'enabled'"""
@@ -2640,6 +2760,16 @@ class App(tk.Tk):
         
         # Frequência mais suave (800ms ao invés de 650ms)
         self.after(800, self._pulse_status)
+    
+    def _monitor_stop_button(self):
+        """Monitora periodicamente o estado do botão Interromper para garantir consistência."""
+        try:
+            self._update_stop_button_state()
+        except Exception as e:
+            print(f"Erro no monitoramento do botão Interromper: {e}")
+        finally:
+            # Verifica a cada 2 segundos
+            self.after(2000, self._monitor_stop_button)
 
     # ===== utilidades UI =====
     def _on_tree_resize(self, event=None):
@@ -2691,6 +2821,20 @@ class App(tk.Tk):
         if self.winfo_exists():
             self.after(0, update_ui)
 
+    def _log_interruption(self, task_name):
+        """Registra a interrupção de uma tarefa no arquivo de log."""
+        try:
+            ensure_dirs()
+            log_file = LOG_DIR / f"{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_INTERROMPIDO.log"
+            with open(log_file, "w", encoding="utf-8", errors="ignore") as f:
+                f.write(f"# {task_name} @ {now_str()}\n")
+                f.write("### TAREFA INTERROMPIDA PELO USUÁRIO ###\n")
+                f.write(f"Data/Hora: {now_str()}\n")
+                f.write("Status: Interrompida manualmente\n")
+            print(f"Log de interrupção criado: {log_file}")
+        except Exception as e:
+            print(f"Erro ao criar log de interrupção: {e}")
+
     def _update_ui_after_stop(self):
         """Atualiza a interface após parar as tarefas."""
         self.btn_stop.config(state="disabled")
@@ -2700,76 +2844,96 @@ class App(tk.Tk):
     def _stop_single_task(self, task_name):
         """Para uma única tarefa em execução."""
         try:
+            # Obtém o processo SEM manter o lock por muito tempo
+            process = None
             with self.running_lock:
                 process = self.running_processes.get(task_name)
                 if not process:
                     return False
-                
-                print(f"Tentando interromper tarefa: {task_name}")
-                
-                # Para Windows
-                if os.name == 'nt':
-                    # Verifica se o processo já terminou
-                    if process.poll() is not None:
-                        print(f"Processo {task_name} (PID: {process.pid}) já foi finalizado")
+            
+            print(f"Tentando interromper tarefa: {task_name}")
+            
+            # Para Windows
+            if os.name == 'nt':
+                # Verifica se o processo já terminou
+                if process.poll() is not None:
+                    print(f"Processo {task_name} (PID: {process.pid}) já foi finalizado")
+                    with self.running_lock:
                         if task_name in self.running_processes:
                             del self.running_processes[task_name]
-                        return True
-                    
-                    try:
-                        # Tenta encerrar o processo e seus filhos
-                        result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], 
-                                            timeout=5, 
-                                            check=False,  # Não levantar exceção em caso de erro
-                                            capture_output=True,
-                                            text=True,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                        
-                        # Verifica se o processo foi encerrado com sucesso ou se já estava finalizado
-                        error_output = result.stderr or ''
-                        if result.returncode == 0 or 'não está em execução' in error_output or 'not running' in error_output:
-                            print(f"Processo {task_name} (PID: {process.pid}) encerrado com sucesso")
-                            if task_name in self.running_processes:
-                                del self.running_processes[task_name]
-                            return True
-                        else:
-                            # Se o processo já foi finalizado
-                            if 'não encontrado' in error_output or 'not found' in error_output or 'no tasks' in error_output.lower():
-                                print(f"Processo {task_name} (PID: {process.pid}) já foi finalizado")
-                                if task_name in self.running_processes:
-                                    del self.running_processes[task_name]
-                                return True
-                            # Não exibe mensagens de erro no console
-                            return False
-                    except subprocess.TimeoutExpired:
-                        # Não exibe mensagem de timeout
-                        pass
-                    
-                    # Se ainda estiver rodando, tenta métodos alternativos silenciosamente
-                    if process.poll() is None:
-                        try:
-                            process.terminate()
-                            process.wait(timeout=2)
-                            if task_name in self.running_processes:
-                                del self.running_processes[task_name]
-                            return True
-                        except (subprocess.TimeoutExpired, Exception):
-                            try:
-                                process.kill()
-                                process.wait(timeout=1)
-                                if task_name in self.running_processes:
-                                    del self.running_processes[task_name]
-                                return True
-                            except Exception:
-                                pass
+                    return True
                 
-                # Para sistemas Unix/Linux
-                else:
-                    # Código para Unix/Linux...
+                try:
+                    # Tenta encerrar o processo e seus filhos
+                    result = subprocess.run(["taskkill", "/F", "/T", "/PID", str(process.pid)], 
+                                        timeout=5, 
+                                        check=False,  # Não levantar exceção em caso de erro
+                                        capture_output=True,
+                                        text=True,
+                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                    
+                    # Verifica se o processo foi encerrado com sucesso ou se já estava finalizado
+                    error_output = result.stderr or ''
+                    if result.returncode == 0 or 'não está em execução' in error_output or 'not running' in error_output:
+                        print(f"Processo {task_name} (PID: {process.pid}) encerrado com sucesso")
+                        with self.running_lock:
+                            if task_name in self.running_processes:
+                                del self.running_processes[task_name]
+                        # Registra a interrupção no histórico com código especial -999
+                        append_history(self.data, task_name, rc=-999, dur=0.0)
+                        # Registra no log
+                        self._log_interruption(task_name)
+                        return True
+                    else:
+                        # Se o processo já foi finalizado
+                        if 'não encontrado' in error_output or 'not found' in error_output or 'no tasks' in error_output.lower():
+                            print(f"Processo {task_name} (PID: {process.pid}) já foi finalizado")
+                            with self.running_lock:
+                                if task_name in self.running_processes:
+                                    del self.running_processes[task_name]
+                            # Registra a interrupção no histórico
+                            append_history(self.data, task_name, rc=-999, dur=0.0)
+                            self._log_interruption(task_name)
+                            return True
+                        # Não exibe mensagens de erro no console
+                        return False
+                except subprocess.TimeoutExpired:
+                    # Não exibe mensagem de timeout
                     pass
                 
-                # Se chegou aqui, não conseguiu encerrar
-                return False
+                # Se ainda estiver rodando, tenta métodos alternativos silenciosamente
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=2)
+                        with self.running_lock:
+                            if task_name in self.running_processes:
+                                del self.running_processes[task_name]
+                        # Registra a interrupção
+                        append_history(self.data, task_name, rc=-999, dur=0.0)
+                        self._log_interruption(task_name)
+                        return True
+                    except (subprocess.TimeoutExpired, Exception):
+                        try:
+                            process.kill()
+                            process.wait(timeout=1)
+                            with self.running_lock:
+                                if task_name in self.running_processes:
+                                    del self.running_processes[task_name]
+                            # Registra a interrupção
+                            append_history(self.data, task_name, rc=-999, dur=0.0)
+                            self._log_interruption(task_name)
+                            return True
+                        except Exception:
+                            pass
+            
+            # Para sistemas Unix/Linux
+            else:
+                # Código para Unix/Linux...
+                pass
+            
+            # Se chegou aqui, não conseguiu encerrar
+            return False
                 
         except Exception as e:
             print(f"Erro ao interromper tarefa {task_name}: {e}")
@@ -2788,26 +2952,27 @@ class App(tk.Tk):
         task_names = [self.tree.item(i, 'values')[1] for i in selected]
         running_tasks = []
         
+        # Filtra apenas as tarefas selecionadas que estão em execução
+        # IMPORTANTE: Faz isso FORA do messagebox para evitar deadlock
         with self.running_lock:
-            # Filtra apenas as tarefas selecionadas que estão em execução
             running_tasks = [name for name in task_names if name in self.running_processes]
-            
-            if not running_tasks:
-                print("Nenhuma das tarefas selecionadas está em execução")
-                messagebox.showinfo("Informação", 
-                    "Nenhuma das tarefas selecionadas está em execução.")
-                return False
-            
-            # Pede confirmação ao usuário
-            task_list = "\n- " + "\n- ".join(running_tasks)
-            if not messagebox.askyesno("Confirmar", 
-                                     f"Deseja realmente interromper as seguintes tarefas?\n{task_list}"):
-                print("Usuário cancelou a interrupção")
-                return False
-            
-            # Mostra mensagem de status
-            self.set_status_line(f"Interrompendo {len(running_tasks)} tarefa(s)...")
-            print(f"Iniciando interrupção de {len(running_tasks)} tarefa(s)...")
+        
+        if not running_tasks:
+            print("Nenhuma das tarefas selecionadas está em execução")
+            messagebox.showinfo("Informação", 
+                "Nenhuma das tarefas selecionadas está em execução.")
+            return False
+        
+        # Pede confirmação ao usuário (FORA do lock para evitar deadlock)
+        task_list = "\n- " + "\n- ".join(running_tasks)
+        if not messagebox.askyesno("Confirmar", 
+                                 f"Deseja realmente interromper as seguintes tarefas?\n{task_list}"):
+            print("Usuário cancelou a interrupção")
+            return False
+        
+        # Mostra mensagem de status
+        self.set_status_line(f"Interrompendo {len(running_tasks)} tarefa(s)...")
+        print(f"Iniciando interrupção de {len(running_tasks)} tarefa(s)...")
         
         # Executa o stop em uma thread separada para não travar a interface
         def stop_tasks():
@@ -2833,39 +2998,11 @@ class App(tk.Tk):
             self.after(100, lambda: messagebox.showinfo("Informação", "Nenhuma tarefa foi interrompida."))
             return
             
-        success_count = 0
-        interrupted_tasks = []
+        success_count = len(stopped_processes)  # Assume que todas foram interrompidas
+        interrupted_tasks = stopped_processes.copy()
         
-        # Remove os processos parados da lista de processos em execução
+        # Atualiza o estado do botão de parada (já não há processos rodando)
         with self.running_lock:
-            for name in stopped_processes:
-                process_terminated = False
-                if name in self.running_processes:
-                    # Tenta encerrar o processo silenciosamente
-                    try:
-                        process = self.running_processes[name]
-                        if process.poll() is None:  # Se ainda estiver rodando
-                            try:
-                                process.kill()  # Força o encerramento
-                                process.wait(timeout=1)  # Dá um tempo para o processo finalizar
-                                process_terminated = True
-                            except Exception:
-                                process_terminated = False
-                        else:
-                            process_terminated = True
-                    except Exception:
-                        process_terminated = False
-                    
-                    # Remove da lista de processos em execução
-                    try:
-                        del self.running_processes[name]
-                        if process_terminated:
-                            success_count += 1
-                            interrupted_tasks.append(name)
-                    except Exception:
-                        pass  # Ignora erros ao remover da lista
-            
-            # Atualiza o estado do botão de parada
             if not self.running_processes:
                 self.btn_stop.config(state="disabled")
         
@@ -2874,7 +3011,7 @@ class App(tk.Tk):
             self._set_task_interrupted(task_name)
         
         # Atualiza a interface
-        status_message = f"{success_count} de {len(stopped_processes)} tarefa(s) interrompida(s) com sucesso."
+        status_message = f"{success_count} tarefa(s) interrompida(s) com sucesso."
         self.set_status_line(status_message)
         # NÃO chama refresh_table aqui para não sobrescrever o status "Interrompido"
         
@@ -3355,14 +3492,12 @@ class App(tk.Tk):
     def _set_ui_busy(self, busy=True, msg=None):
         try:
             self.btn_run.config(state=("disabled" if busy else "normal"))
-            # Atualiza o estado do botão Interromper
-            if busy:
-                self.btn_stop.config(state="normal")
-            else:
-                # Só desabilita se não houver tarefas em execução
-                with self.running_lock:
-                    if not self.running_processes:
-                        self.btn_stop.config(state="disabled")
+            # Atualiza o estado do botão Interromper - SEMPRE verifica se há tarefas rodando
+            with self.running_lock:
+                has_running = bool(self.running_processes)
+                # Botão habilitado se busy OU se há tarefas rodando
+                should_enable = busy or has_running
+                self.btn_stop.config(state="normal" if should_enable else "disabled")
         except Exception as e:
             print(f"Erro ao atualizar estado da UI: {e}")
             
@@ -3723,7 +3858,13 @@ class App(tk.Tk):
             y0 = (H1 - 10) - bh
             
             # Cor baseada no resultado
-            color = success_color if it["rc"] == 0 else error_color
+            # -999 = interrompido (amarelo), 0 = sucesso (verde), outros = erro (vermelho)
+            if it["rc"] == -999:
+                color = "#fbbf24" if dark else "#f59e0b"  # Amarelo para interrompido
+            elif it["rc"] == 0:
+                color = success_color
+            else:
+                color = error_color
             
             # Barra principal
             self.canvas.create_rectangle(
@@ -3742,37 +3883,26 @@ class App(tk.Tk):
                     fill=highlight_color, outline=""
                 )
 
-        # Legenda moderna
-        legend_y = 30
-        # Sucesso
-        self.canvas.create_oval(w - pad - 120, legend_y, w - pad - 108, legend_y + 12, 
-                               fill=success_color, outline="")
-        self.canvas.create_text(w - pad - 102, legend_y + 6, text="✓ Sucesso", 
-                               anchor="w", fill=text_color, font=("Segoe UI", 9))
-        # Erro
-        self.canvas.create_oval(w - pad - 60, legend_y, w - pad - 48, legend_y + 12, 
-                               fill=error_color, outline="")
-        self.canvas.create_text(w - pad - 42, legend_y + 6, text="✗ Falha", 
-                               anchor="w", fill=text_color, font=("Segoe UI", 9))
-
-        # Gráfico de barras horizontal moderno (Sucesso vs Falha)
+        # Gráfico de barras horizontal moderno (Sucesso vs Interrompido vs Falha)
         ok = sum(1 for i in items if i["rc"] == 0)
-        fail = N - ok
+        interrupted = sum(1 for i in items if i["rc"] == -999)
+        fail = N - ok - interrupted
         total = max(1, N)
         y_top = H1 + 15
         
         self.canvas.create_text(
             pad, y_top, anchor="nw",
-            text=f"📊 Taxa de Sucesso — {ok}/{N} ({(ok/total)*100:.1f}%)",
+            text=f"📊 Resultados — {ok} OK | {interrupted} Interrompidas | {fail} Falhas",
             fill=text_color,
             font=("Segoe UI", 10, "bold")
         )
         
         y_bar = y_top + 25
-        bar_h = max(20, h - y_bar - 20)
+        bar_h = max(20, h - y_bar - 40)  # Deixa 40px para a legenda (antes era 20)
         full_w = w - 2 * pad
         ok_w = int(full_w * (ok / total))
-        fail_w = full_w - ok_w
+        interrupted_w = int(full_w * (interrupted / total))
+        fail_w = full_w - ok_w - interrupted_w
         
         # Fundo da barra
         self.canvas.create_rectangle(pad, y_bar, pad + full_w, y_bar + bar_h, 
@@ -3783,20 +3913,56 @@ class App(tk.Tk):
             self.canvas.create_rectangle(pad, y_bar, pad + ok_w, y_bar + bar_h, 
                                        fill=success_color, outline="")
         
+        # Barra de interrompidas
+        if interrupted_w > 0:
+            interrupted_color = "#fbbf24" if dark else "#f59e0b"
+            self.canvas.create_rectangle(pad + ok_w, y_bar, pad + ok_w + interrupted_w, y_bar + bar_h, 
+                                       fill=interrupted_color, outline="")
+        
         # Barra de falha
         if fail_w > 0:
-            self.canvas.create_rectangle(pad + ok_w, y_bar, pad + ok_w + fail_w, y_bar + bar_h, 
+            self.canvas.create_rectangle(pad + ok_w + interrupted_w, y_bar, 
+                                       pad + ok_w + interrupted_w + fail_w, y_bar + bar_h, 
                                        fill=error_color, outline="")
         
         # Texto sobre as barras
-        if ok > 0:
+        if ok > 0 and ok_w > 30:
             self.canvas.create_text(pad + ok_w//2, y_bar + bar_h//2, 
                                   text=f"{ok} OK", anchor="center", 
                                   fill="white", font=("Segoe UI", 9, "bold"))
-        if fail > 0:
-            self.canvas.create_text(pad + ok_w + fail_w//2, y_bar + bar_h//2, 
+        if interrupted > 0 and interrupted_w > 30:
+            self.canvas.create_text(pad + ok_w + interrupted_w//2, y_bar + bar_h//2, 
+                                  text=f"{interrupted} Int.", anchor="center", 
+                                  fill="white", font=("Segoe UI", 9, "bold"))
+        if fail > 0 and fail_w > 30:
+            self.canvas.create_text(pad + ok_w + interrupted_w + fail_w//2, y_bar + bar_h//2, 
                                   text=f"{fail} Falhas", anchor="center", 
                                   fill="white", font=("Segoe UI", 9, "bold"))
+        
+        # Legenda compacta abaixo do gráfico de barras
+        legend_y = y_bar + bar_h + 10
+        interrupted_color = "#fbbf24" if dark else "#f59e0b"
+        legend_x_start = pad
+        
+        # Sucesso
+        self.canvas.create_oval(legend_x_start, legend_y, legend_x_start + 10, legend_y + 10, 
+                               fill=success_color, outline="")
+        self.canvas.create_text(legend_x_start + 14, legend_y + 5, text="✓ Sucesso", 
+                               anchor="w", fill=text_color, font=("Segoe UI", 8))
+        
+        # Interrompido
+        legend_x_start += 80
+        self.canvas.create_oval(legend_x_start, legend_y, legend_x_start + 10, legend_y + 10, 
+                               fill=interrupted_color, outline="")
+        self.canvas.create_text(legend_x_start + 14, legend_y + 5, text="⏸ Interrompido", 
+                               anchor="w", fill=text_color, font=("Segoe UI", 8))
+        
+        # Erro
+        legend_x_start += 100
+        self.canvas.create_oval(legend_x_start, legend_y, legend_x_start + 10, legend_y + 10, 
+                               fill=error_color, outline="")
+        self.canvas.create_text(legend_x_start + 14, legend_y + 5, text="✗ Falha", 
+                               anchor="w", fill=text_color, font=("Segoe UI", 8))
     
     def _lighten_color(self, color, factor):
         """Clareia ou escurece uma cor hexadecimal por um fator (-1.0 a 1.0)"""
@@ -3973,12 +4139,24 @@ class App(tk.Tk):
                 # independente de quais tarefas estão selecionadas
                 has_running = bool(self.running_processes)
                 
-                # Atualiza o estado do botão
-                self.btn_stop.config(state="normal" if has_running else "disabled")
+                # Atualiza o estado do botão - SEMPRE habilitado se há tarefas rodando
+                new_state = "normal" if has_running else "disabled"
+                current_state = str(self.btn_stop['state'])
+                
+                # Só atualiza se o estado mudou
+                if current_state != new_state:
+                    self.btn_stop.config(state=new_state)
+                    print(f"Botão Interromper: {current_state} -> {new_state} (tarefas rodando: {len(self.running_processes)})")
                 
         except Exception as e:
             print(f"Erro ao atualizar estado do botão de parada: {e}")
-            self.btn_stop.config(state="disabled")
+            # Em caso de erro, tenta habilitar se houver processos
+            try:
+                with self.running_lock:
+                    if self.running_processes:
+                        self.btn_stop.config(state="normal")
+            except Exception:
+                pass
 
     def run_multiple_tasks(self, task_names):
         """Executa múltiplas tarefas em paralelo."""
