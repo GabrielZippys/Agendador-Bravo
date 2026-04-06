@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.2"   # << aumente em cada build
+APP_VERSION = "2025.10.11.3"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -2848,9 +2848,19 @@ class App(tk.Tk):
 
         # Mostra a janela principal após a splash sair
         if self._splash:
-            try: self._splash.set_status("Pronto.")
-            except Exception: pass
-            self.after(900, self._show_main_after_splash)
+            # Sequência de mensagens animadas na splash (~2.9s total)
+            def _step(msg, delay, next_step=None):
+                def _do():
+                    try: self._splash.set_status(msg)
+                    except Exception: pass
+                    if next_step:
+                        self.after(delay, next_step)
+                return _do
+            after_ready   = _step("Pronto.", 700, self._show_main_after_splash)
+            after_jobs    = _step("Agendando tarefas…", 800, after_ready)
+            after_load    = _step("Verificando integrações…", 700, after_jobs)
+            # Começa a sequência
+            self.after(700, after_load)
         else:
             self._show_main_after_splash()
 
