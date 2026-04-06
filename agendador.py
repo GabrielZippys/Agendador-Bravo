@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.1"   # << aumente em cada build
+APP_VERSION = "2025.10.11.2"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -139,44 +139,136 @@ def expand_start_repeat(start_hhmm: str, every_value: int, every_unit: str, repe
     return out
 
 
-def _write_update_cmd(pid: int, src_new: Path, dst_exe: Path) -> Path:
+def _write_update_scripts(pid: int, src_new: Path, dst_exe: Path, sha256_hex: str = "") -> Path:
+    """
+    Cria um .cmd + wrapper .vbs para:
+      1) matar AgendadorBravo.exe por nome (mata bootloader PyInstaller e child)
+      2) limpar pastas _MEI antigas em %TEMP%
+      3) copiar o exe novo por cima
+      4) validar SHA256 pós-copy; se divergir, restaura backup
+      5) iniciar o novo exe
+      6) auto-deletar temporários
+
+    Retorna o caminho do .vbs (rodar com wscript = 100% invisível, sem janela preta).
+    """
+    exe_name = dst_exe.name
+    backup = dst_exe.with_suffix(".exe.bak")
+    log = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.log"
+
+    # Gera .cmd — usa encoding do Windows (cp850/mbcs) pra evitar bugs com acentos
+    sha_line = ""
+    if sha256_hex:
+        # certutil -hashfile saída contém cabeçalho/rodapé; filtramos com findstr
+        sha_line = f'''
+rem --- validar SHA256 pos-copy ---
+for /f "skip=1 tokens=*" %%H in ('certutil -hashfile "%DST%" SHA256 ^| findstr /v "hash CertUtil"') do (
+  set "GOT=%%H"
+  goto :gotsha
+)
+:gotsha
+set "GOT=%GOT: =%"
+if /i not "%GOT%"=="{sha256_hex.lower()}" (
+  echo [%date% %time%] SHA mismatch: esperado {sha256_hex.lower()} obtido %GOT% >> "%LOG%"
+  if exist "%BAK%" copy /y "%BAK%" "%DST%" >nul 2>&1
+  goto :launch
+)
+'''
+
     cmd = f"""@echo off
 setlocal enabledelayedexpansion
 set "SRC={src_new}"
 set "DST={dst_exe}"
-set "PID={pid}"
-set "MAXWAIT=120"
-set /a COUNT=0
+set "BAK={backup}"
+set "EXE_NAME={exe_name}"
+set "LOG={log}"
+echo [%date% %time%] updater start pid={pid} >> "%LOG%"
 
-:wait
->nul 2>&1 timeout /t 1
->nul 2>&1 tasklist /FI "PID eq %PID%" | find "%PID%"
-if %ERRORLEVEL%==0 (
-  set /a COUNT+=1
-  if !COUNT! lss %MAXWAIT% goto wait
-  >nul 2>&1 taskkill /PID %PID% /T /F
+rem --- mata todas as instancias do app (bootloader + child) ---
+taskkill /IM "%EXE_NAME%" /F >nul 2>&1
+ping -n 2 127.0.0.1 >nul
+
+rem --- limpa pastas _MEI antigas no TEMP ---
+for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" >nul 2>&1
+
+rem --- backup do exe atual ---
+if exist "%DST%" copy /y "%DST%" "%BAK%" >nul 2>&1
+
+rem --- tenta copiar o novo exe (com retry se arquivo estiver travado) ---
+set /a TRY=0
+:copyloop
+copy /y "%SRC%" "%DST%" >nul 2>&1
+if not errorlevel 1 goto copied
+set /a TRY+=1
+if %TRY% lss 10 (
+  ping -n 2 127.0.0.1 >nul
+  goto copyloop
 )
+echo [%date% %time%] copy failed apos %TRY% tentativas >> "%LOG%"
+if exist "%BAK%" copy /y "%BAK%" "%DST%" >nul 2>&1
+goto :launch
 
->nul 2>&1 copy /y "%SRC%" "%DST%"
-start "" /b "%DST%"
->nul 2>&1 del "%SRC%"
->nul 2>&1 del "%~f0"
+:copied
+echo [%date% %time%] copy ok >> "%LOG%"
+{sha_line}
+
+:launch
+rem --- limpa _MEI novamente (caso o kill tenha deixado sobras) ---
+for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" >nul 2>&1
+
+rem --- inicia o novo exe ---
+start "" "%DST%"
+echo [%date% %time%] launched >> "%LOG%"
+
+rem --- cleanup ---
+del "%SRC%" >nul 2>&1
+del "%BAK%" >nul 2>&1
+(goto) 2>nul & del "%~f0"
 """
-    p = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.cmd"
-    p.write_text(cmd, encoding="utf-8")
-    return p
+    cmd_path = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.cmd"
+    # Usa mbcs pra o cmd interpretar corretamente em pt-BR
+    try:
+        cmd_path.write_text(cmd, encoding="mbcs")
+    except Exception:
+        cmd_path.write_text(cmd, encoding="utf-8")
+
+    # Wrapper VBS pra rodar INVISIVEL (sem janela preta)
+    vbs = (
+        'Set sh = CreateObject("WScript.Shell")\r\n'
+        f'sh.Run "cmd /c """"{cmd_path}""""", 0, False\r\n'
+    )
+    vbs_path = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.vbs"
+    try:
+        vbs_path.write_text(vbs, encoding="mbcs")
+    except Exception:
+        vbs_path.write_text(vbs, encoding="utf-8")
+    return vbs_path
 
 
-def _apply_update_and_restart(new_exe: Path):
-    flags = 0x08000000 | 0x00000008 | 0x00000200  # CREATE_NO_WINDOW | DETACHED | NEW_PROCESS_GROUP
+def _apply_update_and_restart(new_exe: Path, sha256_hex: str = ""):
+    """Dispara o updater invisível e encerra o processo atual."""
+    vbs = _write_update_scripts(os.getpid(), new_exe, _exe_path(), sha256_hex)
 
-    updater = _write_update_cmd(os.getpid(), new_exe, _exe_path())
-    si = subprocess.STARTUPINFO()
-    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = 0  # SW_HIDE
+    # Executa via wscript.exe (roda VBS sem janela)
+    try:
+        CREATE_NO_WINDOW = 0x08000000
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
+        subprocess.Popen(
+            ["wscript.exe", str(vbs)],
+            creationflags=CREATE_NO_WINDOW,
+            startupinfo=si,
+            close_fds=True,
+        )
+    except Exception as e:
+        print(f"[update] falha ao disparar updater: {e}")
 
-    subprocess.Popen(["cmd", "/c", str(updater)], creationflags=flags, startupinfo=si)
-    os._exit(0)
+    # Encerra de forma dura pra liberar o handle do .exe
+    try:
+        import ctypes
+        ctypes.windll.kernel32.ExitProcess(0)
+    except Exception:
+        os._exit(0)
 
 
 # --- AUTOSTART com Windows (HKCU\...\Run) ----------------------------------
@@ -258,13 +350,14 @@ def apply_update_now(info: dict) -> tuple[bool, str]:
     try:
         tmp_new = Path(tempfile.gettempdir()) / f"{APP_BASENAME}.new.exe"
         _download(info["exe_url"], tmp_new)
-        if info.get("sha256"):
+        sha_expected = (info.get("sha256") or "").lower()
+        if sha_expected:
             got = _sha256(tmp_new).lower()
-            if got != info["sha256"]:
+            if got != sha_expected:
                 tmp_new.unlink(missing_ok=True)
-                return (False, f"SHA256 divergente (esperado {info['sha256']}, obtido {got}).")
+                return (False, f"SHA256 divergente (esperado {sha_expected}, obtido {got}).")
         # agenda troca e reinicia
-        _apply_update_and_restart(tmp_new)
+        _apply_update_and_restart(tmp_new, sha_expected)
         return (True, f"Atualizando para {info.get('version')}...")
     except Exception as e:
         return (False, f"Falha ao aplicar: {e}")
@@ -1987,6 +2080,274 @@ class SettingsDialog(tk.Toplevel):
         self.destroy()
 
 # ======================================================================================
+#  Splash screen (tela de abertura animada)
+# ======================================================================================
+import math, random as _rnd
+
+class SplashScreen(tk.Toplevel):
+    """
+    Tela de abertura animada — logo + 'AGENDADOR BRAVO' + partículas de dados
+    + barra de progresso. Sai em ~1.5s (ou quando set_done() for chamado).
+    """
+    W, H = 520, 320
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.overrideredirect(True)     # sem borda/titulo
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+
+        # centraliza
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - self.W) // 2
+        y = (sh - self.H) // 2
+        self.geometry(f"{self.W}x{self.H}+{x}+{y}")
+
+        # Paleta
+        self.bg_top    = "#0b1221"
+        self.bg_bottom = "#141b2e"
+        self.accent    = "#3b82f6"
+        self.accent2   = "#06b6d4"
+        self.text_main = "#f1f5f9"
+        self.text_dim  = "#94a3b8"
+
+        self.canvas = tk.Canvas(
+            self, width=self.W, height=self.H,
+            bg=self.bg_top, highlightthickness=0, bd=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        # Fundo em gradiente
+        self._draw_gradient()
+
+        # Grade de pontos (estética de dados)
+        self._draw_dot_grid()
+
+        # Partículas animadas (nós de dados)
+        self._particles = []
+        for _ in range(32):
+            px = _rnd.randint(0, self.W)
+            py = _rnd.randint(0, self.H)
+            r  = _rnd.choice([1, 1, 2, 2, 3])
+            spd = _rnd.uniform(0.15, 0.55)
+            ang = _rnd.uniform(0, math.tau)
+            col = _rnd.choice(["#1e3a8a", "#1e40af", "#0e7490", "#0891b2"])
+            pid = self.canvas.create_oval(px-r, py-r, px+r, py+r, fill=col, outline="")
+            self._particles.append({
+                "id": pid, "x": px, "y": py, "r": r,
+                "dx": math.cos(ang) * spd, "dy": math.sin(ang) * spd,
+                "color": col,
+            })
+        # Linhas dinâmicas entre partículas próximas
+        self._links = []
+
+        # Moldura sutil
+        self.canvas.create_rectangle(
+            1, 1, self.W-1, self.H-1,
+            outline="#1e293b", width=1,
+        )
+        # Barra de destaque no topo
+        self.canvas.create_rectangle(
+            0, 0, self.W, 3, fill=self.accent, outline="",
+        )
+
+        # Logo
+        self._logo_img = None
+        ico = find_logo_ico()
+        if ico and Image and ImageTk:
+            try:
+                pil = Image.open(ico).convert("RGBA").resize((84, 84), Image.LANCZOS)
+                self._logo_img = ImageTk.PhotoImage(pil)
+                self.canvas.create_image(self.W // 2, 95, image=self._logo_img)
+            except Exception:
+                pass
+
+        # Título
+        self.canvas.create_text(
+            self.W // 2, 168,
+            text="AGENDADOR BRAVO",
+            font=("Segoe UI", 22, "bold"),
+            fill=self.text_main,
+        )
+        self.canvas.create_text(
+            self.W // 2, 198,
+            text="Automação de Dados  •  Pentaho / PDI",
+            font=("Segoe UI", 10),
+            fill=self.text_dim,
+        )
+
+        # Barra de progresso
+        bx, by, bw, bh = 80, 240, self.W - 160, 4
+        self._bar_bg = self.canvas.create_rectangle(
+            bx, by, bx + bw, by + bh,
+            fill="#1e293b", outline="",
+        )
+        self._bar = self.canvas.create_rectangle(
+            bx, by, bx, by + bh,
+            fill=self.accent, outline="",
+        )
+        self._bar_box = (bx, by, bw, bh)
+
+        # Status
+        self._status_id = self.canvas.create_text(
+            self.W // 2, 268,
+            text="Inicializando…",
+            font=("Segoe UI", 9),
+            fill=self.text_dim,
+        )
+
+        # Rodapé versão
+        self.canvas.create_text(
+            self.W // 2, 298,
+            text=f"v{APP_VERSION}",
+            font=("Segoe UI", 8),
+            fill="#475569",
+        )
+
+        self._progress_value = 0.0
+        self._done = False
+        self._alive = True
+        self._fade_alpha = 0.0
+
+        self._fade_in()
+        self._animate()
+
+    def _draw_gradient(self):
+        # Gradiente vertical do bg_top para bg_bottom
+        r1, g1, b1 = int(self.bg_top[1:3], 16), int(self.bg_top[3:5], 16), int(self.bg_top[5:7], 16)
+        r2, g2, b2 = int(self.bg_bottom[1:3], 16), int(self.bg_bottom[3:5], 16), int(self.bg_bottom[5:7], 16)
+        steps = 60
+        band = self.H / steps
+        for i in range(steps):
+            t = i / (steps - 1)
+            r = int(r1 + (r2 - r1) * t)
+            g = int(g1 + (g2 - g1) * t)
+            b = int(b1 + (b2 - b1) * t)
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            self.canvas.create_rectangle(
+                0, int(i * band), self.W, int((i + 1) * band) + 1,
+                fill=color, outline="",
+            )
+
+    def _draw_dot_grid(self):
+        step = 24
+        for gy in range(0, self.H, step):
+            for gx in range(0, self.W, step):
+                self.canvas.create_oval(
+                    gx, gy, gx + 1, gy + 1,
+                    fill="#1e293b", outline="",
+                )
+
+    def _fade_in(self):
+        if not self._alive:
+            return
+        try:
+            self._fade_alpha = min(1.0, self._fade_alpha + 0.08)
+            self.attributes("-alpha", self._fade_alpha)
+            if self._fade_alpha < 1.0:
+                self.after(16, self._fade_in)
+        except Exception:
+            pass
+
+    def _animate(self):
+        if not self._alive or not self.winfo_exists():
+            return
+
+        # Atualiza partículas
+        for p in self._particles:
+            p["x"] += p["dx"]
+            p["y"] += p["dy"]
+            if p["x"] <= 2 or p["x"] >= self.W - 2:
+                p["dx"] *= -1
+            if p["y"] <= 2 or p["y"] >= self.H - 2:
+                p["dy"] *= -1
+            r = p["r"]
+            try:
+                self.canvas.coords(
+                    p["id"],
+                    p["x"] - r, p["y"] - r,
+                    p["x"] + r, p["y"] + r,
+                )
+            except Exception:
+                pass
+
+        # Redesenha as linhas entre partículas próximas
+        try:
+            for lid in self._links:
+                self.canvas.delete(lid)
+            self._links.clear()
+            pts = self._particles
+            n = len(pts)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    dx = pts[i]["x"] - pts[j]["x"]
+                    dy = pts[i]["y"] - pts[j]["y"]
+                    d2 = dx * dx + dy * dy
+                    if d2 < 80 * 80:
+                        lid = self.canvas.create_line(
+                            pts[i]["x"], pts[i]["y"],
+                            pts[j]["x"], pts[j]["y"],
+                            fill="#1e3a8a", width=1,
+                        )
+                        self._links.append(lid)
+                        self.canvas.tag_lower(lid)
+        except Exception:
+            pass
+
+        # Progresso
+        target = 1.0 if self._done else 0.92
+        if self._progress_value < target:
+            self._progress_value = min(target, self._progress_value + 0.02)
+        bx, by, bw, bh = self._bar_box
+        pw = int(bw * self._progress_value)
+        try:
+            self.canvas.coords(self._bar, bx, by, bx + pw, by + bh)
+        except Exception:
+            pass
+
+        self.after(30, self._animate)
+
+    def set_status(self, text: str):
+        try:
+            if self.winfo_exists():
+                self.canvas.itemconfig(self._status_id, text=text)
+        except Exception:
+            pass
+
+    def set_done(self):
+        self._done = True
+
+    def finish(self, on_done=None):
+        """Fecha a splash com fade-out."""
+        def fade_out(alpha=1.0):
+            if not self._alive:
+                return
+            alpha -= 0.12
+            try:
+                if alpha <= 0:
+                    self._alive = False
+                    self.destroy()
+                    if on_done:
+                        on_done()
+                    return
+                self.attributes("-alpha", alpha)
+                self.after(16, lambda: fade_out(alpha))
+            except Exception:
+                self._alive = False
+                try:
+                    self.destroy()
+                except Exception:
+                    pass
+                if on_done:
+                    on_done()
+        fade_out()
+
+
+# ======================================================================================
 #  Aplicação principal (GUI)
 
 class App(tk.Tk):
@@ -2212,18 +2573,30 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        
+
+        # Esconde a janela principal enquanto a splash aparece
+        self.withdraw()
+
+        # Splash animada
+        try:
+            self._splash = SplashScreen(self)
+            self._splash.update_idletasks()
+            self._splash.set_status("Carregando configurações…")
+            self._splash.update()
+        except Exception as e:
+            print(f"[splash] falhou: {e}")
+            self._splash = None
+
         # Configuração responsiva da janela
         self.geometry("1400x800")  # Tamanho inicial maior e mais espaçoso
         self.minsize(1000, 600)    # Tamanho mínimo aumentado
         self.state('zoomed')       # Inicia maximizada no Windows
-        
+
         # Configurar responsividade da janela principal
         self.columnconfigure(0, weight=1)
         self.rowconfigure(3, weight=1)  # O painel principal (row 3) se expande
         # Rows: 0=header, 1=banner, 2=toolbar, 3=main_content, 4=status
-        
-        # Mostra a janela imediatamente (sem fade-in que atrasa visibilidade)
+
         self.attributes("-alpha", 1.0)
         ensure_dirs()
 
@@ -2458,17 +2831,49 @@ class App(tk.Tk):
 
         # Dados / agendamento
         self._ensure_task_enabled_field()  # Garante que tarefas existentes tenham o campo enabled
+        if self._splash:
+            try: self._splash.set_status("Aplicando tema…")
+            except Exception: pass
+        self._apply_theme(False)
+        if self._splash:
+            try: self._splash.set_status("Preparando tabela…")
+            except Exception: pass
         self.refresh_table()
         self.update_status_indicators()
         self.update_net_indicator()
         self.update_toggle_button()  # Inicializa o botão toggle
-        self._apply_theme(False)
         self._pulse_status()
         self._monitor_stop_button()  # Inicia monitoramento do botão Interromper
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Trabalho pesado adiado para DEPOIS da UI aparecer (startup mais leve/rápido)
-        self.after(50, self._deferred_startup)
+        # Mostra a janela principal após a splash sair
+        if self._splash:
+            try: self._splash.set_status("Pronto.")
+            except Exception: pass
+            self.after(900, self._show_main_after_splash)
+        else:
+            self._show_main_after_splash()
+
+    def _show_main_after_splash(self):
+        """Fecha a splash com fade-out e apresenta a janela principal."""
+        def _reveal():
+            try:
+                self.deiconify()
+                self.lift()
+                self.focus_force()
+            except Exception:
+                pass
+            # Trabalho pesado adiado para DEPOIS da UI aparecer
+            self.after(50, self._deferred_startup)
+
+        if self._splash:
+            try:
+                self._splash.set_done()
+                self._splash.finish(on_done=_reveal)
+                return
+            except Exception:
+                pass
+        _reveal()
 
     def _deferred_startup(self):
         """Trabalho pesado executado após a janela aparecer, para abertura mais rápida."""
@@ -2575,43 +2980,78 @@ class App(tk.Tk):
 
         # Aplica estilos personalizados
         style = ttk.Style(self)
-        
-        # Botões modernos com gradiente sutil
-        style.configure("Modern.TButton", 
-                       padding=(12, 8),
-                       font=("Segoe UI", 9),
-                       borderwidth=0,
-                       focuscolor='none')
-        
+
+        # Paleta derivada
+        btn_bg   = colors['surface']
+        btn_fg   = colors['text']
+        btn_hv   = colors['overlay']
+        acc_bg   = colors['accent']
+        acc_fg   = '#ffffff' if dark else '#ffffff'
+        acc_hv   = self._lighten_color(colors['accent'], -0.12)
+        acc_ac   = self._lighten_color(colors['accent'], -0.22)
+        danger_bg = colors['error']
+        danger_hv = self._lighten_color(colors['error'], -0.15)
+
+        # Botões modernos
+        style.configure("Modern.TButton",
+                        padding=(12, 8),
+                        font=("Segoe UI", 9),
+                        borderwidth=0,
+                        relief="flat",
+                        focuscolor='none',
+                        background=btn_bg,
+                        foreground=btn_fg)
+        style.map("Modern.TButton",
+                  background=[('active', btn_hv), ('pressed', btn_hv)],
+                  foreground=[('disabled', colors['subtext'])])
+
         # Botão de destaque (Executar)
         style.configure("Accent.TButton",
-                       padding=(12, 8),
-                       font=("Segoe UI", 9, "bold"),
-                       borderwidth=0,
-                       focuscolor='none')
-        
-        # Botão de toggle (Ativar/Desativar)
+                        padding=(14, 9),
+                        font=("Segoe UI", 10, "bold"),
+                        borderwidth=0,
+                        relief="flat",
+                        focuscolor='none',
+                        background=acc_bg,
+                        foreground=acc_fg)
+        style.map("Accent.TButton",
+                  background=[('active', acc_hv), ('pressed', acc_ac)],
+                  foreground=[('disabled', '#cbd5e1')])
+
+        # Botão de toggle
         style.configure("Toggle.TButton",
-                       padding=(10, 6),
-                       font=("Segoe UI", 9),
-                       borderwidth=0,
-                       focuscolor='none')
-        
+                        padding=(10, 6),
+                        font=("Segoe UI", 9),
+                        borderwidth=0,
+                        relief="flat",
+                        focuscolor='none',
+                        background=btn_bg,
+                        foreground=btn_fg)
+        style.map("Toggle.TButton",
+                  background=[('active', btn_hv), ('pressed', btn_hv)])
+
         # Botão de interrupção (Danger)
         style.configure("Danger.TButton",
-                       padding=(10, 6),
-                       font=("Segoe UI", 9),
-                       borderwidth=0,
-                       focuscolor='none')
-        
+                        padding=(10, 6),
+                        font=("Segoe UI", 9, "bold"),
+                        borderwidth=0,
+                        relief="flat",
+                        focuscolor='none',
+                        background=danger_bg,
+                        foreground='#ffffff')
+        style.map("Danger.TButton",
+                  background=[('active', danger_hv), ('pressed', danger_hv)],
+                  foreground=[('disabled', '#e2e8f0')])
+
         # Labels com tipografia moderna
         style.configure("Title.TLabel",
-                       font=("Segoe UI", 14, "bold"),
-                       padding=(0, 4))
-        
+                        font=("Segoe UI", 14, "bold"),
+                        padding=(0, 4),
+                        foreground=colors['text'])
         style.configure("Subtitle.TLabel",
-                       font=("Segoe UI", 10),
-                       padding=(0, 2))
+                        font=("Segoe UI", 10),
+                        padding=(0, 2),
+                        foreground=colors['subtext'])
         
         # Configura cores do canvas
         self.configure(bg=colors['bg'])
