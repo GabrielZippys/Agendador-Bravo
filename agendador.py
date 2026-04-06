@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.4"   # << aumente em cada build
+APP_VERSION = "2025.10.11.5"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -214,12 +214,11 @@ Function IsAppRunning()
     On Error Goto 0
 End Function
 
-Sub CleanMEI()
+Sub CleanMEIIn(dirPath)
     On Error Resume Next
-    Dim tempDir, base, f
-    tempDir = sh.ExpandEnvironmentStrings("%TEMP%")
-    If fso.FolderExists(tempDir) Then
-        Set base = fso.GetFolder(tempDir)
+    Dim base, f
+    If fso.FolderExists(dirPath) Then
+        Set base = fso.GetFolder(dirPath)
         For Each f In base.SubFolders
             If LCase(Left(f.Name, 4)) = "_mei" Then
                 fso.DeleteFolder f.Path, True
@@ -227,6 +226,13 @@ Sub CleanMEI()
         Next
     End If
     On Error Goto 0
+End Sub
+
+Sub CleanMEI()
+    ' Limpa em todos os locais onde o PyInstaller pode extrair
+    CleanMEIIn sh.ExpandEnvironmentStrings("%TEMP%")
+    CleanMEIIn sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\\AgendadorBravo\\rt")
+    CleanMEIIn sh.ExpandEnvironmentStrings("%TEMP%\\2")
 End Sub
 
 Function CopyWithRetry(src, dst, tries)

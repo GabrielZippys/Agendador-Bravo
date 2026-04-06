@@ -65,6 +65,10 @@ def create_executable():
         "--hidden-import=sv_ttk",
         "--hidden-import=apscheduler",
         "--hidden-import=requests",
+        # Runtime tmpdir ESTÁVEL: evita o %TEMP%\2\ em contextos Administrator
+        # e o race de antivírus quarentinando python313.dll na extração.
+        # O bootloader expande variáveis de ambiente neste path.
+        "--runtime-tmpdir=%LOCALAPPDATA%\\AgendadorBravo\\rt",
         "--clean",                      # Limpa cache anterior
         str(main_script)
     ]
