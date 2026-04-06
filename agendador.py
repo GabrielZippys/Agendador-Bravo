@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.3"   # << aumente em cada build
+APP_VERSION = "2025.10.11.4"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -141,101 +141,195 @@ def expand_start_repeat(start_hhmm: str, every_value: int, every_unit: str, repe
 
 def _write_update_scripts(pid: int, src_new: Path, dst_exe: Path, sha256_hex: str = "") -> Path:
     """
-    Cria um .cmd + wrapper .vbs para:
-      1) matar AgendadorBravo.exe por nome (mata bootloader PyInstaller e child)
-      2) limpar pastas _MEI antigas em %TEMP%
-      3) copiar o exe novo por cima
-      4) validar SHA256 pós-copy; se divergir, restaura backup
-      5) iniciar o novo exe
-      6) auto-deletar temporários
+    Cria um script VBS puro que:
+      1) mata AgendadorBravo.exe (bootloader PyInstaller + child)
+      2) limpa pastas %TEMP%\\_MEI*
+      3) faz backup e copia o novo exe
+      4) mostra uma MsgBox 'Atualização concluída com sucesso'
+      5) ao OK, limpa _MEI novamente e inicia o exe
+      6) se o processo morrer rápido (erro python313.dll etc.), retenta até 3x
+         limpando _MEI e esperando mais a cada tentativa
+      7) em último caso, restaura backup e mostra mensagem amigável
 
-    Retorna o caminho do .vbs (rodar com wscript = 100% invisível, sem janela preta).
+    Rodado via wscript.exe => 100% invisível (sem janela preta).
     """
     exe_name = dst_exe.name
     backup = dst_exe.with_suffix(".exe.bak")
     log = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.log"
 
-    # Gera .cmd — usa encoding do Windows (cp850/mbcs) pra evitar bugs com acentos
-    sha_line = ""
-    if sha256_hex:
-        # certutil -hashfile saída contém cabeçalho/rodapé; filtramos com findstr
-        sha_line = f'''
-rem --- validar SHA256 pos-copy ---
-for /f "skip=1 tokens=*" %%H in ('certutil -hashfile "%DST%" SHA256 ^| findstr /v "hash CertUtil"') do (
-  set "GOT=%%H"
-  goto :gotsha
-)
-:gotsha
-set "GOT=%GOT: =%"
-if /i not "%GOT%"=="{sha256_hex.lower()}" (
-  echo [%date% %time%] SHA mismatch: esperado {sha256_hex.lower()} obtido %GOT% >> "%LOG%"
-  if exist "%BAK%" copy /y "%BAK%" "%DST%" >nul 2>&1
-  goto :launch
-)
+    # Escapa aspas para VBS
+    def q(s: str) -> str:
+        return str(s).replace('"', '""')
+
+    SRC = q(src_new)
+    DST = q(dst_exe)
+    BAK = q(backup)
+    LOG = q(log)
+    EXE = q(exe_name)
+
+    vbs = f'''Option Explicit
+
+Dim sh, fso, wmi
+Set sh  = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+On Error Resume Next
+Set wmi = GetObject("winmgmts:\\\\.\\root\\cimv2")
+On Error Goto 0
+
+Const SRC_PATH = "{SRC}"
+Const DST_PATH = "{DST}"
+Const BAK_PATH = "{BAK}"
+Const LOG_PATH = "{LOG}"
+Const EXE_NAME = "{EXE}"
+Const APP_TITLE = "Agendador-Bravo"
+
+Sub LogLine(msg)
+    On Error Resume Next
+    Dim ts, f
+    ts = Now
+    Set f = fso.OpenTextFile(LOG_PATH, 8, True)
+    f.WriteLine "[" & ts & "] " & msg
+    f.Close
+    On Error Goto 0
+End Sub
+
+Sub KillApp()
+    On Error Resume Next
+    sh.Run "taskkill /IM """ & EXE_NAME & """ /F", 0, True
+    On Error Goto 0
+End Sub
+
+Function IsAppRunning()
+    IsAppRunning = False
+    If IsEmpty(wmi) Or IsNull(wmi) Then Exit Function
+    On Error Resume Next
+    Dim procs, p
+    Set procs = wmi.ExecQuery("Select * from Win32_Process Where Name='" & EXE_NAME & "'")
+    If Err.Number = 0 Then
+        For Each p In procs
+            IsAppRunning = True
+            Exit Function
+        Next
+    End If
+    On Error Goto 0
+End Function
+
+Sub CleanMEI()
+    On Error Resume Next
+    Dim tempDir, base, f
+    tempDir = sh.ExpandEnvironmentStrings("%TEMP%")
+    If fso.FolderExists(tempDir) Then
+        Set base = fso.GetFolder(tempDir)
+        For Each f In base.SubFolders
+            If LCase(Left(f.Name, 4)) = "_mei" Then
+                fso.DeleteFolder f.Path, True
+            End If
+        Next
+    End If
+    On Error Goto 0
+End Sub
+
+Function CopyWithRetry(src, dst, tries)
+    Dim i
+    For i = 1 To tries
+        On Error Resume Next
+        fso.CopyFile src, dst, True
+        If Err.Number = 0 Then
+            CopyWithRetry = True
+            On Error Goto 0
+            Exit Function
+        End If
+        On Error Goto 0
+        WScript.Sleep 800
+    Next
+    CopyWithRetry = False
+End Function
+
+LogLine "updater start pid={pid}"
+
+' 1) Mata app antigo
+KillApp
+WScript.Sleep 1500
+KillApp
+WScript.Sleep 800
+
+' 2) Limpa _MEI antigos
+CleanMEI
+
+' 3) Backup
+If fso.FileExists(DST_PATH) Then
+    On Error Resume Next
+    fso.CopyFile DST_PATH, BAK_PATH, True
+    On Error Goto 0
+End If
+
+' 4) Copia novo exe com retry
+If Not CopyWithRetry(SRC_PATH, DST_PATH, 12) Then
+    LogLine "copy failed"
+    ' Restaura backup
+    On Error Resume Next
+    If fso.FileExists(BAK_PATH) Then fso.CopyFile BAK_PATH, DST_PATH, True
+    On Error Goto 0
+    MsgBox "Não foi possível concluir a atualização." & vbCrLf & _
+           "A versão anterior foi mantida.", 48, APP_TITLE
+    ' Cleanup
+    On Error Resume Next
+    fso.DeleteFile SRC_PATH, True
+    fso.DeleteFile BAK_PATH, True
+    fso.DeleteFile WScript.ScriptFullName, True
+    On Error Goto 0
+    WScript.Quit 1
+End If
+LogLine "copy ok"
+
+' 5) Pequena pausa pro antivirus terminar o scan do arquivo novo
+WScript.Sleep 2000
+
+' 6) Dialogo amigavel de sucesso
+MsgBox "Atualização concluída com sucesso!" & vbCrLf & vbCrLf & _
+       "Clique em OK para abrir o Agendador-Bravo.", 64, APP_TITLE
+
+' 7) Tenta abrir com retries (resolve erros transitorios de python313.dll / AV)
+Dim attempt, launched, waitMs
+launched = False
+For attempt = 1 To 4
+    CleanMEI
+    LogLine "launch attempt " & attempt
+    On Error Resume Next
+    sh.Run """" & DST_PATH & """", 1, False
+    On Error Goto 0
+
+    ' Espera progressivamente: 3s, 4s, 6s, 8s
+    waitMs = 2000 + attempt * 1500
+    WScript.Sleep waitMs
+
+    If IsAppRunning() Then
+        launched = True
+        LogLine "launch ok"
+        Exit For
+    End If
+    LogLine "launch attempt " & attempt & " failed"
+
+    ' Mata qualquer resto e espera mais um pouco antes do retry
+    KillApp
+    WScript.Sleep 1200
+Next
+
+If Not launched Then
+    LogLine "all launches failed"
+    MsgBox "A atualização foi aplicada, mas o aplicativo não iniciou automaticamente." & vbCrLf & vbCrLf & _
+           "Isso normalmente acontece quando o antivírus está analisando arquivos novos." & vbCrLf & _
+           "Aguarde alguns segundos e abra o Agendador-Bravo pelo atalho do menu iniciar.", 48, APP_TITLE
+End If
+
+' 8) Cleanup final
+On Error Resume Next
+fso.DeleteFile SRC_PATH, True
+fso.DeleteFile BAK_PATH, True
+fso.DeleteFile WScript.ScriptFullName, True
+On Error Goto 0
 '''
 
-    cmd = f"""@echo off
-setlocal enabledelayedexpansion
-set "SRC={src_new}"
-set "DST={dst_exe}"
-set "BAK={backup}"
-set "EXE_NAME={exe_name}"
-set "LOG={log}"
-echo [%date% %time%] updater start pid={pid} >> "%LOG%"
-
-rem --- mata todas as instancias do app (bootloader + child) ---
-taskkill /IM "%EXE_NAME%" /F >nul 2>&1
-ping -n 2 127.0.0.1 >nul
-
-rem --- limpa pastas _MEI antigas no TEMP ---
-for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" >nul 2>&1
-
-rem --- backup do exe atual ---
-if exist "%DST%" copy /y "%DST%" "%BAK%" >nul 2>&1
-
-rem --- tenta copiar o novo exe (com retry se arquivo estiver travado) ---
-set /a TRY=0
-:copyloop
-copy /y "%SRC%" "%DST%" >nul 2>&1
-if not errorlevel 1 goto copied
-set /a TRY+=1
-if %TRY% lss 10 (
-  ping -n 2 127.0.0.1 >nul
-  goto copyloop
-)
-echo [%date% %time%] copy failed apos %TRY% tentativas >> "%LOG%"
-if exist "%BAK%" copy /y "%BAK%" "%DST%" >nul 2>&1
-goto :launch
-
-:copied
-echo [%date% %time%] copy ok >> "%LOG%"
-{sha_line}
-
-:launch
-rem --- limpa _MEI novamente (caso o kill tenha deixado sobras) ---
-for /d %%D in ("%TEMP%\\_MEI*") do rmdir /s /q "%%D" >nul 2>&1
-
-rem --- inicia o novo exe ---
-start "" "%DST%"
-echo [%date% %time%] launched >> "%LOG%"
-
-rem --- cleanup ---
-del "%SRC%" >nul 2>&1
-del "%BAK%" >nul 2>&1
-(goto) 2>nul & del "%~f0"
-"""
-    cmd_path = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.cmd"
-    # Usa mbcs pra o cmd interpretar corretamente em pt-BR
-    try:
-        cmd_path.write_text(cmd, encoding="mbcs")
-    except Exception:
-        cmd_path.write_text(cmd, encoding="utf-8")
-
-    # Wrapper VBS pra rodar INVISIVEL (sem janela preta)
-    vbs = (
-        'Set sh = CreateObject("WScript.Shell")\r\n'
-        f'sh.Run "cmd /c """"{cmd_path}""""", 0, False\r\n'
-    )
     vbs_path = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.vbs"
     try:
         vbs_path.write_text(vbs, encoding="mbcs")
