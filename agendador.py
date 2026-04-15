@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.5"   # << aumente em cada build
+APP_VERSION = "2025.10.11.6"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -505,6 +505,8 @@ import tkinter.font as tkfont
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.executors.pool import ThreadPoolExecutor as APSThreadPoolExecutor
+from apscheduler.events import EVENT_JOB_MISSED, EVENT_JOB_ERROR, EVENT_JOB_MAX_INSTANCES
 
 
 # Logos/ícones (opcional)
@@ -2702,7 +2704,26 @@ class App(tk.Tk):
 
         self.data = load_data()
         # Deixa explícito (1 instância por job, coalesce)
-        self.scheduler = BackgroundScheduler(job_defaults={"max_instances": 1, "coalesce": True})
+        # Scheduler dimensionado pra 80+ jobs simultaneos:
+        # - ThreadPool de 64 workers (default sao 10 -> causava misfire com muitos jobs)
+        # - misfire_grace_time de 600s (default 1s) -> tolera picos de CPU/IO
+        # - coalesce True mantem, mas com grace time largo os jobs nao sao mais descartados
+        self.scheduler = BackgroundScheduler(
+            executors={"default": APSThreadPoolExecutor(max_workers=64)},
+            job_defaults={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": 600,  # 10 min de tolerancia
+            },
+        )
+        # Listener para registrar jobs pulados/falhos no log
+        try:
+            self.scheduler.add_listener(
+                self._on_scheduler_event,
+                EVENT_JOB_MISSED | EVENT_JOB_ERROR | EVENT_JOB_MAX_INSTANCES,
+            )
+        except Exception as _e:
+            print(f"[scheduler] listener falhou: {_e}")
         self.jobs = {}
         # Estado de rede / fila de updates
         self.net_online = is_online()
@@ -3804,6 +3825,24 @@ class App(tk.Tk):
         except Exception:
             # Se houver erro na limpeza, não faz nada
             pass
+
+    def _on_scheduler_event(self, event):
+        """Registra jobs pulados/com erro num log dedicado para diagnostico."""
+        try:
+            sched_log = LOG_DIR / "_scheduler.log"
+            kind = "UNKNOWN"
+            if event.code == EVENT_JOB_MISSED:
+                kind = "MISSED"        # job nao rodou dentro do misfire_grace_time
+            elif event.code == EVENT_JOB_ERROR:
+                kind = "ERROR"         # excecao durante a execucao
+            elif event.code == EVENT_JOB_MAX_INSTANCES:
+                kind = "MAX_INSTANCES" # job anterior ainda rodando, nova execucao descartada
+            line = f"[{now_str()}] {kind} job_id={event.job_id} scheduled_run_time={getattr(event, 'scheduled_run_time', '-')}\n"
+            with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(line)
+            print(f"[SCHEDULER] {kind}: {event.job_id}")
+        except Exception as e:
+            print(f"[SCHEDULER] Falha ao logar evento: {e}")
 
     def _job_wrapper(self, task):
         def progress(_):
