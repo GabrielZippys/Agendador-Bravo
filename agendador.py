@@ -61,7 +61,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.6"   # << aumente em cada build
+APP_VERSION = "2025.10.11.7"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -142,14 +142,15 @@ def expand_start_repeat(start_hhmm: str, every_value: int, every_unit: str, repe
 def _write_update_scripts(pid: int, src_new: Path, dst_exe: Path, sha256_hex: str = "") -> Path:
     """
     Cria um script VBS puro que:
-      1) mata AgendadorBravo.exe (bootloader PyInstaller + child)
-      2) limpa pastas %TEMP%\\_MEI*
-      3) faz backup e copia o novo exe
-      4) mostra uma MsgBox 'Atualização concluída com sucesso'
-      5) ao OK, limpa _MEI novamente e inicia o exe
-      6) se o processo morrer rápido (erro python313.dll etc.), retenta até 3x
-         limpando _MEI e esperando mais a cada tentativa
-      7) em último caso, restaura backup e mostra mensagem amigável
+      1) mata AgendadorBravo.exe
+      2) limpa _MEI* antigos
+      3) backup + copia novo exe (12 tentativas)
+      4) PRÉ-AQUECIMENTO AV: roda o novo exe com --pre-extract (janela oculta)
+         por ~12 s, depois mata com /F → _MEI fica no disco → AV cacheia hashes
+      5) MsgBox "Atualização concluída com sucesso"
+      6) Inicia o exe de verdade (AV já confia nos hashes → sem erro de DLL)
+      7) Até 3 retentativas se o processo morrer inesperadamente
+      8) Restaura backup se tudo falhar
 
     Rodado via wscript.exe => 100% invisível (sem janela preta).
     """
@@ -253,32 +254,30 @@ End Function
 
 LogLine "updater start pid={pid}"
 
-' 1) Mata app antigo
+' ── 1) Mata app antigo ────────────────────────────────────────────────────
 KillApp
 WScript.Sleep 1500
 KillApp
 WScript.Sleep 800
 
-' 2) Limpa _MEI antigos
+' ── 2) Limpa _MEI antigos ────────────────────────────────────────────────
 CleanMEI
 
-' 3) Backup
+' ── 3) Backup ────────────────────────────────────────────────────────────
 If fso.FileExists(DST_PATH) Then
     On Error Resume Next
     fso.CopyFile DST_PATH, BAK_PATH, True
     On Error Goto 0
 End If
 
-' 4) Copia novo exe com retry
+' ── 4) Copia novo exe com retry ──────────────────────────────────────────
 If Not CopyWithRetry(SRC_PATH, DST_PATH, 12) Then
     LogLine "copy failed"
-    ' Restaura backup
     On Error Resume Next
     If fso.FileExists(BAK_PATH) Then fso.CopyFile BAK_PATH, DST_PATH, True
     On Error Goto 0
     MsgBox "Não foi possível concluir a atualização." & vbCrLf & _
            "A versão anterior foi mantida.", 48, APP_TITLE
-    ' Cleanup
     On Error Resume Next
     fso.DeleteFile SRC_PATH, True
     fso.DeleteFile BAK_PATH, True
@@ -288,47 +287,62 @@ If Not CopyWithRetry(SRC_PATH, DST_PATH, 12) Then
 End If
 LogLine "copy ok"
 
-' 5) Pequena pausa pro antivirus terminar o scan do arquivo novo
-WScript.Sleep 2000
+' ── 5) PRÉ-AQUECIMENTO DO ANTIVÍRUS ──────────────────────────────────────
+' Executa o novo exe em modo oculto com --pre-extract.
+' O bootloader PyInstaller extrai TODOS os DLLs (inclusive python313.dll)
+' para a pasta _MEI antes de o Python iniciar; o script Python dorme 8 s
+' e depois sai.  O taskkill /F mata o processo SEM deixar o bootloader
+' apagar a pasta _MEI → os arquivos ficam no disco enquanto o AV os escaneia
+' e adiciona os hashes ao seu cache de confiança.
+' Na segunda execução (a real) o AV já reconhece os hashes → sem erro de DLL.
+LogLine "pre-extracting for AV warm-up..."
+On Error Resume Next
+sh.Run """" & DST_PATH & """ --pre-extract", 0, False
+On Error Goto 0
 
-' 6) Dialogo amigavel de sucesso
+' Aguarda extração completa + tempo de scan do AV (Windows Defender ~5-8 s)
+WScript.Sleep 12000
+
+' Mata o processo de pre-extract forçadamente (preserva _MEI no disco)
+sh.Run "taskkill /IM """ & EXE_NAME & """ /F", 0, True
+WScript.Sleep 1000
+LogLine "pre-extract done"
+
+' ── 6) Diálogo de sucesso ────────────────────────────────────────────────
 MsgBox "Atualização concluída com sucesso!" & vbCrLf & vbCrLf & _
        "Clique em OK para abrir o Agendador-Bravo.", 64, APP_TITLE
 
-' 7) Tenta abrir com retries (resolve erros transitorios de python313.dll / AV)
+' ── 7) Inicia o exe de verdade ───────────────────────────────────────────
+' AV já confia nos hashes extraídos → sem janela de erro de DLL.
 Dim attempt, launched, waitMs
 launched = False
-For attempt = 1 To 4
-    CleanMEI
+For attempt = 1 To 3
     LogLine "launch attempt " & attempt
     On Error Resume Next
     sh.Run """" & DST_PATH & """", 1, False
     On Error Goto 0
 
-    ' Espera progressivamente: 3s, 4s, 6s, 8s
-    waitMs = 2000 + attempt * 1500
+    waitMs = 3000 + attempt * 2000   ' 5 s, 7 s, 9 s
     WScript.Sleep waitMs
 
     If IsAppRunning() Then
         launched = True
-        LogLine "launch ok"
+        LogLine "launch ok (attempt " & attempt & ")"
         Exit For
     End If
-    LogLine "launch attempt " & attempt & " failed"
-
-    ' Mata qualquer resto e espera mais um pouco antes do retry
+    LogLine "launch attempt " & attempt & " failed — cleaning MEI and retrying"
     KillApp
-    WScript.Sleep 1200
+    CleanMEI
+    WScript.Sleep 1500
 Next
 
 If Not launched Then
     LogLine "all launches failed"
-    MsgBox "A atualização foi aplicada, mas o aplicativo não iniciou automaticamente." & vbCrLf & vbCrLf & _
-           "Isso normalmente acontece quando o antivírus está analisando arquivos novos." & vbCrLf & _
-           "Aguarde alguns segundos e abra o Agendador-Bravo pelo atalho do menu iniciar.", 48, APP_TITLE
+    MsgBox "A atualização foi instalada, mas o aplicativo não iniciou automaticamente." & vbCrLf & vbCrLf & _
+           "Abra o Agendador-Bravo pelo atalho no Menu Iniciar.", 48, APP_TITLE
 End If
 
-' 8) Cleanup final
+' ── 8) Cleanup final ─────────────────────────────────────────────────────
 On Error Resume Next
 fso.DeleteFile SRC_PATH, True
 fso.DeleteFile BAK_PATH, True
@@ -5024,6 +5038,19 @@ class App(tk.Tk):
         self.lbl_wa.config(foreground=self._status_color(wa_ok))
 
 if __name__ == "__main__":
+    # ── Modo pre-extract ─────────────────────────────────────────────────────
+    # Acionado pelo updater VBS logo após copiar o novo exe.
+    # O bootloader PyInstaller já extraiu TODOS os DLLs antes de chegar aqui.
+    # Dormimos para o AV terminar de escanear os DLLs extraídos e adicioná-los
+    # ao seu cache por hash.  O updater então mata este processo com /F (sem
+    # cleanup do bootloader → _MEI persiste) e em seguida abre o exe de verdade.
+    # Como o AV já confia nos hashes, a segunda extração passa sem erro.
+    if "--pre-extract" in sys.argv:
+        import time as _t
+        _t.sleep(8)   # 8 s ≥ tempo médio de scan do Windows Defender
+        sys.exit(0)
+    # ─────────────────────────────────────────────────────────────────────────
+
     app = App()
     try:
         app.mainloop()

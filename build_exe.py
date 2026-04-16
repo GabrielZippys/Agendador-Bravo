@@ -1,185 +1,213 @@
 #!/usr/bin/env python3
 """
-Script para criar executável do Agendador-Bravo
-Inclui o logo.ico e todas as dependências necessárias
+Script para criar executável do Agendador-Bravo e (opcionalmente) o instalador.
+
+Uso rápido:
+    python build_exe.py            # só o .exe
+    python build_exe.py --installer  # .exe + instalador Inno Setup
 """
 
 import os
 import sys
 import subprocess
 import shutil
+import argparse
 from pathlib import Path
 
+
+# ── versão sincronizada com agendador.py ─────────────────────────────────────
+APP_VERSION = "2025.10.11.7"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def check_pyinstaller():
-    """Verifica se PyInstaller está instalado"""
     try:
-        import PyInstaller
-        print("✅ PyInstaller encontrado")
+        import PyInstaller  # noqa: F401
+        print("[OK] PyInstaller encontrado")
         return True
     except ImportError:
-        print("❌ PyInstaller não encontrado")
+        print("[ERRO] PyInstaller não encontrado")
         return False
+
 
 def install_pyinstaller():
-    """Instala PyInstaller"""
-    print("📦 Instalando PyInstaller...")
+    print("[PKG] Instalando PyInstaller...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pyinstaller"])
-        print("✅ PyInstaller instalado com sucesso")
+        print("[OK] PyInstaller instalado com sucesso")
         return True
     except subprocess.CalledProcessError:
-        print("❌ Erro ao instalar PyInstaller")
+        print("[ERRO] Erro ao instalar PyInstaller")
         return False
 
+
 def create_executable():
-    """Cria o executável"""
-    print("🔨 Criando executável...")
-    
-    # Diretório atual
+    """Cria o executável onefile."""
+    print("[BUILD] Criando executável (onefile)...")
+
     current_dir = Path(__file__).parent
-    
-    # Arquivos necessários
     main_script = current_dir / "agendador.py"
-    icon_file = current_dir / "Logo.ico"
-    
-    # Verifica se os arquivos existem
+    icon_file   = current_dir / "Logo.ico"
+
     if not main_script.exists():
-        print(f"❌ Arquivo principal não encontrado: {main_script}")
+        print(f"[ERRO] Arquivo principal não encontrado: {main_script}")
         return False
-    
     if not icon_file.exists():
-        print(f"❌ Ícone não encontrado: {icon_file}")
+        print(f"[ERRO] Ícone não encontrado: {icon_file}")
         return False
-    
-    # Comando PyInstaller
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--onefile",                    # Arquivo único
-        "--windowed",                   # Sem console
-        f"--icon={icon_file}",          # Ícone do executável
-        "--name=Agendador-Bravo",       # Nome do executável
-        "--add-data=Logo.ico;.",        # Inclui o ícone nos recursos
-        "--hidden-import=PIL",          # Importações ocultas
+        "--onefile",
+        "--windowed",
+        f"--icon={icon_file}",
+        "--name=AgendadorBravo",
+        "--add-data=Logo.ico;.",
+        "--hidden-import=PIL",
         "--hidden-import=PIL.Image",
         "--hidden-import=PIL.ImageTk",
         "--hidden-import=sv_ttk",
         "--hidden-import=apscheduler",
         "--hidden-import=requests",
-        # Runtime tmpdir ESTÁVEL: evita o %TEMP%\2\ em contextos Administrator
-        # e o race de antivírus quarentinando python313.dll na extração.
-        # O bootloader expande variáveis de ambiente neste path.
+        # Extrai sempre para path estável em user-space (evita %TEMP%\2\ admin)
         "--runtime-tmpdir=%LOCALAPPDATA%\\AgendadorBravo\\rt",
-        "--clean",                      # Limpa cache anterior
-        str(main_script)
+        "--clean",
+        str(main_script),
     ]
-    
-    try:
-        print("⚙️ Executando PyInstaller...")
-        print(f"Comando: {' '.join(cmd)}")
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, cwd=current_dir)
-        
-        if result.returncode == 0:
-            print("✅ Executável criado com sucesso!")
-            
-            # Localiza o executável
-            exe_path = current_dir / "dist" / "Agendador-Bravo.exe"
-            if exe_path.exists():
-                print(f"📁 Executável disponível em: {exe_path}")
-                print(f"📏 Tamanho: {exe_path.stat().st_size / (1024*1024):.1f} MB")
-                
-                # Cria pasta de distribuição limpa
-                dist_folder = current_dir / "Agendador-Bravo-Executavel"
-                if dist_folder.exists():
-                    shutil.rmtree(dist_folder)
-                dist_folder.mkdir()
-                
-                # Copia executável
-                shutil.copy2(exe_path, dist_folder / "Agendador-Bravo.exe")
-                
-                # Cria README
-                readme_content = """# Agendador-Bravo - Executável
 
-## Como usar:
-1. Execute o arquivo Agendador-Bravo.exe
-2. O programa iniciará automaticamente
-3. Todas as configurações são salvas em agendador_data.json
+    print(f"[RUN]  Executando PyInstaller...")
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=current_dir)
 
-## Recursos incluídos:
-- ✅ Interface moderna e responsiva
-- ✅ Sistema de temas (claro/escuro)
-- ✅ Controle de ativação/desativação de tarefas
-- ✅ Gráficos e histórico de execuções
-- ✅ Notificações por email e WhatsApp
-- ✅ Logs detalhados
-- ✅ Assistente inteligente
-
-## Requisitos:
-- Windows 10/11
-- Nenhuma instalação adicional necessária
-
-Desenvolvido com ❤️ usando Python e Tkinter
-"""
-                
-                with open(dist_folder / "README.txt", "w", encoding="utf-8") as f:
-                    f.write(readme_content)
-                
-                print(f"📦 Pacote completo criado em: {dist_folder}")
-                return True
-            else:
-                print("❌ Executável não encontrado após build")
-                return False
-        else:
-            print("❌ Erro durante a criação do executável:")
-            print(result.stdout)
-            print(result.stderr)
-            return False
-            
-    except Exception as e:
-        print(f"❌ Erro: {e}")
+    if result.returncode != 0:
+        print("[ERRO] Erro durante a criação do executável:")
+        print(result.stdout[-3000:])
+        print(result.stderr[-3000:])
         return False
 
-def cleanup():
-    """Limpa arquivos temporários"""
+    exe_path = current_dir / "dist" / "AgendadorBravo.exe"
+    if not exe_path.exists():
+        print("[ERRO] Executável não encontrado após build")
+        return False
+
+    size_mb = exe_path.stat().st_size / (1024 * 1024)
+    print(f"[OK] Executável criado: {exe_path}  ({size_mb:.1f} MB)")
+    return True
+
+
+def build_installer():
+    """
+    Compila o instalador Inno Setup usando agendador-setup.iss.
+    Requer que o Inno Setup 6 esteja instalado e 'iscc' acessível no PATH
+    (ou nos caminhos padrão do Inno Setup).
+    """
     current_dir = Path(__file__).parent
-    
-    # Remove pastas temporárias do PyInstaller
+    iss_file = current_dir / "agendador-setup.iss"
+
+    if not iss_file.exists():
+        print("[ERRO] agendador-setup.iss não encontrado")
+        return False
+
+    # Procura pelo compilador Inno Setup
+    iscc_candidates = [
+        Path(r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe"),
+        Path(r"C:\Program Files\Inno Setup 6\ISCC.exe"),
+        Path(r"C:\Program Files (x86)\Inno Setup 5\ISCC.exe"),
+        Path(r"C:\Program Files\Inno Setup 5\ISCC.exe"),
+        # via PATH
+    ]
+    iscc = None
+    for c in iscc_candidates:
+        if c.exists():
+            iscc = str(c)
+            break
+    if iscc is None:
+        # tenta pelo PATH
+        which = shutil.which("iscc") or shutil.which("ISCC")
+        if which:
+            iscc = which
+
+    if iscc is None:
+        print("[ERRO] Inno Setup não encontrado.")
+        print("   Baixe em https://jrsoftware.org/isdl.php e instale na pasta padrão.")
+        return False
+
+    print(f"[BUILD] Compilando instalador com: {iscc}")
+    result = subprocess.run(
+        [iscc, str(iss_file)],
+        capture_output=True,
+        text=True,
+        cwd=current_dir,
+    )
+
+    if result.returncode != 0:
+        print("[ERRO] Erro ao compilar instalador:")
+        print(result.stdout[-3000:])
+        print(result.stderr[-3000:])
+        return False
+
+    setup_exe = current_dir / "dist" / f"AgendadorBravo-Setup-{APP_VERSION}.exe"
+    if setup_exe.exists():
+        size_mb = setup_exe.stat().st_size / (1024 * 1024)
+        print(f"[OK] Instalador criado: {setup_exe}  ({size_mb:.1f} MB)")
+    else:
+        # Inno pode usar nome diferente — mostra o que tem em dist/
+        exes = list((current_dir / "dist").glob("AgendadorBravo-Setup*.exe"))
+        if exes:
+            print(f"[OK] Instalador criado: {exes[0]}")
+        else:
+            print("[AVISO]  Instalador compilado mas arquivo não localizado em dist/")
+    return True
+
+
+def cleanup():
+    current_dir = Path(__file__).parent
     for folder in ["build", "__pycache__"]:
-        folder_path = current_dir / folder
-        if folder_path.exists():
-            shutil.rmtree(folder_path)
-            print(f"🧹 Removido: {folder}")
-    
-    # Remove arquivo .spec
-    spec_file = current_dir / "Agendador-Bravo.spec"
-    if spec_file.exists():
-        spec_file.unlink()
-        print(f"🧹 Removido: {spec_file}")
+        p = current_dir / folder
+        if p.exists():
+            shutil.rmtree(p)
+            print(f"[CLEAN] Removido: {folder}")
+    spec = current_dir / "AgendadorBravo.spec"
+    if spec.exists():
+        spec.unlink()
+        print("[CLEAN] Removido: AgendadorBravo.spec")
+
 
 def main():
-    """Função principal"""
-    print("🚀 Agendador-Bravo - Criador de Executável")
-    print("=" * 50)
-    
-    # Verifica PyInstaller
+    parser = argparse.ArgumentParser(description="Build do Agendador-Bravo")
+    parser.add_argument(
+        "--installer", action="store_true",
+        help="Compila também o instalador Inno Setup após gerar o .exe",
+    )
+    args = parser.parse_args()
+
+    print(f"[>>] Agendador-Bravo v{APP_VERSION} — Build")
+    print("=" * 55)
+
     if not check_pyinstaller():
         if not install_pyinstaller():
-            print("❌ Não foi possível instalar PyInstaller")
-            return False
-    
-    # Cria executável
-    success = create_executable()
-    
-    # Limpa arquivos temporários
+            print("[ERRO] Não foi possível instalar PyInstaller")
+            sys.exit(1)
+
+    ok = create_executable()
     cleanup()
-    
-    if success:
-        print("\n🎉 Processo concluído com sucesso!")
-        print("📁 Verifique a pasta 'Agendador-Bravo-Executavel' para o arquivo final")
-    else:
-        print("\n❌ Falha na criação do executável")
-    
-    return success
+
+    if not ok:
+        print("\n[ERRO] Falha na criação do executável")
+        sys.exit(1)
+
+    if args.installer:
+        print()
+        ok_inst = build_installer()
+        if not ok_inst:
+            print("\n[AVISO]  Executável gerado, mas instalador falhou.")
+            print("   Instale o Inno Setup 6 e rode:  python build_exe.py --installer")
+            sys.exit(2)
+
+    print(f"\n[CONCLUIDO] Build concluído!")
+    print(f"   Executável : dist/AgendadorBravo.exe")
+    if args.installer:
+        print(f"   Instalador : dist/AgendadorBravo-Setup-{APP_VERSION}.exe")
+
 
 if __name__ == "__main__":
     main()
