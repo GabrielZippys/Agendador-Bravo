@@ -50,11 +50,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 ; Privilégios
 PrivilegesRequired=admin
-PrivilegesRequiredOverriding=commandline dialog
 
 ; Visual
 WizardStyle=modern
-WizardResizable=yes
+; WizardResizable removido (obsoleto no Inno 6.x)
 DisableWelcomePage=no
 LicenseFile=
 
@@ -139,8 +138,8 @@ Filename: "{app}\{#MyAppExeName}"; \
 ; ---------------------------------------------------------------------------
 [UninstallRun]
 ; Garante que o app esteja fechado antes de desinstalar
-Filename: "taskkill.exe"; Parameters: "/IM {#MyAppExeName} /F"; \
-          Flags: runhidden; RunOnceId: "KillApp"
+Filename: "{sys}\taskkill.exe"; Parameters: "/IM {#MyAppExeName} /F"; \
+          Flags: runhidden skipifdoesntexist; RunOnceId: "KillBeforeUninstall"
 
 ; ---------------------------------------------------------------------------
 [Code]
@@ -152,7 +151,8 @@ function GetUninstallString(): string;
 var
   sUnInstPath, sUnInstallString: string;
 begin
-  sUnInstPath := ExpandConstant('Software\Microsoft\Windows\CurrentVersion\Uninstall\{#emit SetupSetting("AppId")}_is1');
+  { O AppId do [Setup] sem as chaves é usado como chave de registro }
+  sUnInstPath := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{7D0C3A64-AB00-45A0-8E22-AGENDADORBRAVO}_is1';
   sUnInstallString := '';
   if not RegQueryStringValue(HKLM, sUnInstPath, 'UninstallString', sUnInstallString) then
     RegQueryStringValue(HKCU, sUnInstPath, 'UninstallString', sUnInstallString);
@@ -249,11 +249,13 @@ end;
 { Antes de instalar: mata versão rodando + desinstala versão antiga silenc.  }
 { -------------------------------------------------------------------------- }
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  RC: Integer;
 begin
   if CurStep = ssInstall then begin
     { Mata qualquer instância rodando }
     Exec(ExpandConstant('{sys}\taskkill.exe'),
-         '/IM {#MyAppExeName} /F', '', SW_HIDE, ewWaitUntilTerminated, []);
+         '/IM {#MyAppExeName} /F', '', SW_HIDE, ewWaitUntilTerminated, RC);
 
     { Cria config padrão se necessário }
     CreateDefaultConfig();

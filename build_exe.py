@@ -56,6 +56,9 @@ def create_executable():
         print(f"[ERRO] Ícone não encontrado: {icon_file}")
         return False
 
+    # Garante que o build dir exista antes do PyInstaller (evita race no zip)
+    (current_dir / "build" / "AgendadorBravo").mkdir(parents=True, exist_ok=True)
+
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
@@ -71,7 +74,6 @@ def create_executable():
         "--hidden-import=requests",
         # Extrai sempre para path estável em user-space (evita %TEMP%\2\ admin)
         "--runtime-tmpdir=%LOCALAPPDATA%\\AgendadorBravo\\rt",
-        "--clean",
         str(main_script),
     ]
 
@@ -178,34 +180,44 @@ def main():
         "--installer", action="store_true",
         help="Compila também o instalador Inno Setup após gerar o .exe",
     )
+    parser.add_argument(
+        "--installer-only", action="store_true",
+        help="Só compila o instalador (pula rebuild do .exe se já existir)",
+    )
     args = parser.parse_args()
 
     print(f"[>>] Agendador-Bravo v{APP_VERSION} — Build")
     print("=" * 55)
 
-    if not check_pyinstaller():
-        if not install_pyinstaller():
-            print("[ERRO] Não foi possível instalar PyInstaller")
+    exe_path = Path(__file__).parent / "dist" / "AgendadorBravo.exe"
+    skip_build = args.installer_only and exe_path.exists()
+
+    if not skip_build:
+        if not check_pyinstaller():
+            if not install_pyinstaller():
+                print("[ERRO] Nao foi possivel instalar PyInstaller")
+                sys.exit(1)
+
+        ok = create_executable()
+        cleanup()
+
+        if not ok:
+            print("\n[ERRO] Falha na criacao do executavel")
             sys.exit(1)
+    else:
+        print(f"[OK] Reutilizando exe existente: {exe_path}")
 
-    ok = create_executable()
-    cleanup()
-
-    if not ok:
-        print("\n[ERRO] Falha na criação do executável")
-        sys.exit(1)
-
-    if args.installer:
+    if args.installer or args.installer_only:
         print()
         ok_inst = build_installer()
         if not ok_inst:
-            print("\n[AVISO]  Executável gerado, mas instalador falhou.")
-            print("   Instale o Inno Setup 6 e rode:  python build_exe.py --installer")
+            print("\n[AVISO] Instalador falhou.")
+            print("   Instale o Inno Setup 6 e rode:  python build_exe.py --installer-only")
             sys.exit(2)
 
-    print(f"\n[CONCLUIDO] Build concluído!")
-    print(f"   Executável : dist/AgendadorBravo.exe")
-    if args.installer:
+    print(f"\n[CONCLUIDO] Build concluido!")
+    print(f"   Executavel : dist/AgendadorBravo.exe")
+    if args.installer or args.installer_only:
         print(f"   Instalador : dist/AgendadorBravo-Setup-{APP_VERSION}.exe")
 
 
