@@ -11,7 +11,7 @@
 ; =============================================================================
 
 #define MyAppName      "AgendadorBravo"
-#define MyAppVersion   "2025.10.11.9"
+#define MyAppVersion   "2025.10.11.10"
 #define MyAppPublisher "Bravo Logística"
 #define MyAppExeName   "AgendadorBravo.exe"
 #define MyAppURL       "https://github.com/GabrielZippys/Agendador-Bravo"
@@ -27,11 +27,13 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}/releases
 
-; Diretório de instalação — Program Files (requer admin) no modo servidor
-; Para instalar sem admin, troque {pf} por {localappdata}
-DefaultDirName={autopf}\{#MyAppName}
+; v2025.10.11.10 — Por DEFAULT instalamos em %LOCALAPPDATA% (sem admin).
+; Isso permite que o auto-update funcione SEM precisar de UAC a cada release.
+; Usuário pode mudar para Program Files no Wizard se quiser.
+DefaultDirName={localappdata}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+DisableDirPage=no
 
 ; Saída
 OutputDir=dist
@@ -48,8 +50,10 @@ LZMAUseSeparateProcess=yes
 ; Arquitetura
 ArchitecturesInstallIn64BitMode=x64compatible
 
-; Privilégios
-PrivilegesRequired=admin
+; v2025.10.11.10 — Privilégios: NÃO requer admin por default. O Inno Setup
+; vai elevar automaticamente se o usuário escolher Program Files manualmente.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
 
 ; Visual
 WizardStyle=modern

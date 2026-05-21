@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.9"   # << aumente em cada build
+APP_VERSION = "2025.10.11.10"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -156,20 +156,37 @@ def expand_start_repeat(start_hhmm: str, every_value: int, every_unit: str, repe
     return out
 
 
+def _can_write_to_dir(dir_path: Path) -> bool:
+    """v2025.10.11.10 — Testa se temos permissão de escrita no diretório."""
+    try:
+        test = dir_path / f".write_test_{os.getpid()}_{int(time.time())}.tmp"
+        test.write_text("x", encoding="utf-8")
+        test.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
 def _write_update_scripts(pid: int, src_new: Path, dst_exe: Path, sha256_hex: str = "") -> Path:
     """
-    Cria um script VBS puro que:
-      1) mata AgendadorBravo.exe
-      2) limpa _MEI* antigos
-      3) backup + copia novo exe (12 tentativas)
-      4) PRÉ-AQUECIMENTO AV: roda o novo exe com --pre-extract (janela oculta)
-         por ~12 s, depois mata com /F → _MEI fica no disco → AV cacheia hashes
-      5) MsgBox "Atualização concluída com sucesso"
-      6) Inicia o exe de verdade (AV já confia nos hashes → sem erro de DLL)
-      7) Até 3 retentativas se o processo morrer inesperadamente
-      8) Restaura backup se tudo falhar
+    v2025.10.11.10 — Updater BLINDADO. Resolve para sempre o ciclo de falha
+    "Não foi possível concluir a atualização":
 
-    Rodado via wscript.exe => 100% invisível (sem janela preta).
+      1) VBS gravado como UTF-16 LE com BOM → acentos sempre corretos
+      2) Mata processo via taskkill /F /T (com filhos)
+      3) Limpa _MEI* em múltiplos locais
+      4) Backup do exe atual
+      5) Cópia BLINDADA do novo exe:
+         - 30 tentativas × 1,5 s (45 s totais — tempo de scan do AV)
+         - Captura Err.Description em cada falha pro log
+         - Fallback A: MoveFile (renomeia ao invés de copiar)
+         - Fallback B: deleta destino antes de copiar
+      6) PRÉ-AQUECIMENTO AV (--pre-extract)
+      7) Inicia o exe (até 3 tentativas)
+      8) Em qualquer falha: MsgBox com 3 botões (Ver log / Abrir Releases /
+         Abrir pasta) → nunca deixa o usuário sem saída
+
+    Rodado via wscript.exe sob UAC quando o destino exige (Program Files).
     """
     exe_name = dst_exe.name
     backup = dst_exe.with_suffix(".exe.bak")
@@ -184,6 +201,9 @@ def _write_update_scripts(pid: int, src_new: Path, dst_exe: Path, sha256_hex: st
     BAK = q(backup)
     LOG = q(log)
     EXE = q(exe_name)
+    DST_DIR = q(str(Path(dst_exe).parent))
+
+    RELEASES_URL = "https://github.com/GabrielZippys/Agendador-Bravo/releases/latest"
 
     vbs = f'''Option Explicit
 
@@ -196,24 +216,73 @@ On Error Goto 0
 
 Const SRC_PATH = "{SRC}"
 Const DST_PATH = "{DST}"
+Const DST_DIR  = "{DST_DIR}"
 Const BAK_PATH = "{BAK}"
 Const LOG_PATH = "{LOG}"
 Const EXE_NAME = "{EXE}"
 Const APP_TITLE = "Agendador-Bravo"
+Const RELEASES_URL = "{RELEASES_URL}"
 
 Sub LogLine(msg)
     On Error Resume Next
     Dim ts, f
     ts = Now
-    Set f = fso.OpenTextFile(LOG_PATH, 8, True)
+    Set f = fso.OpenTextFile(LOG_PATH, 8, True, -1)  ' True=create, -1=Unicode
     f.WriteLine "[" & ts & "] " & msg
     f.Close
     On Error Goto 0
 End Sub
 
+Function HasWriteAccess(dirPath)
+    HasWriteAccess = False
+    On Error Resume Next
+    Dim test, f
+    test = dirPath & "\\.agendador_write_test.tmp"
+    Set f = fso.OpenTextFile(test, 2, True)
+    If Err.Number = 0 Then
+        f.Close
+        fso.DeleteFile test, True
+        HasWriteAccess = True
+    End If
+    Err.Clear
+    On Error Goto 0
+End Function
+
+Function AlreadyElevated()
+    Dim i
+    AlreadyElevated = False
+    For i = 0 To WScript.Arguments.Count - 1
+        If LCase(WScript.Arguments(i)) = "/elevated" Then
+            AlreadyElevated = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Sub MaybeElevate()
+    ' Se nao temos permissao, relanca o proprio VBS via UAC (uma vez).
+    If HasWriteAccess(DST_DIR) Then Exit Sub
+    If AlreadyElevated() Then
+        ' Ja relancou elevado e ainda assim nao tem perm: segue e falha
+        ' com erro claro depois — evita loop infinito.
+        LogLine "still no write access even after elevation request"
+        Exit Sub
+    End If
+    LogLine "no write access; requesting UAC elevation"
+    Dim args
+    args = Chr(34) & WScript.ScriptFullName & Chr(34) & " /elevated"
+    On Error Resume Next
+    Dim sa
+    Set sa = CreateObject("Shell.Application")
+    sa.ShellExecute "wscript.exe", args, "", "runas", 0
+    On Error Goto 0
+    WScript.Quit 0   ' o re-launch elevado faz o resto
+End Sub
+
 Sub KillApp()
     On Error Resume Next
-    sh.Run "taskkill /IM """ & EXE_NAME & """ /F", 0, True
+    ' /T mata processos filhos tambem; /F forca
+    sh.Run "taskkill /F /T /IM " & Chr(34) & EXE_NAME & Chr(34), 0, True
     On Error Goto 0
 End Sub
 
@@ -247,54 +316,126 @@ Sub CleanMEIIn(dirPath)
 End Sub
 
 Sub CleanMEI()
-    ' Limpa em todos os locais onde o PyInstaller pode extrair
     CleanMEIIn sh.ExpandEnvironmentStrings("%TEMP%")
     CleanMEIIn sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\\AgendadorBravo\\rt")
     CleanMEIIn sh.ExpandEnvironmentStrings("%TEMP%\\2")
 End Sub
 
-Function CopyWithRetry(src, dst, tries)
-    Dim i
-    For i = 1 To tries
+Function TryReplaceExe(src, dst)
+    ' Estrategia 1: CopyFile com sobrescrita (30 retries x 1.5s = 45s).
+    Dim i, lastErr
+    lastErr = ""
+    For i = 1 To 30
         On Error Resume Next
         fso.CopyFile src, dst, True
         If Err.Number = 0 Then
-            CopyWithRetry = True
+            TryReplaceExe = ""
             On Error Goto 0
             Exit Function
         End If
+        lastErr = "Copy " & i & ": #" & Err.Number & " " & Err.Description
+        LogLine lastErr
+        Err.Clear
         On Error Goto 0
-        WScript.Sleep 800
+        WScript.Sleep 1500
     Next
-    CopyWithRetry = False
+
+    ' Estrategia 2: deleta destino e tenta copiar
+    LogLine "fallback A: delete + copy"
+    On Error Resume Next
+    fso.DeleteFile dst, True
+    Err.Clear
+    fso.CopyFile src, dst, True
+    If Err.Number = 0 Then
+        TryReplaceExe = ""
+        On Error Goto 0
+        Exit Function
+    End If
+    lastErr = "Delete+Copy: #" & Err.Number & " " & Err.Description
+    LogLine lastErr
+    Err.Clear
+    On Error Goto 0
+
+    ' Estrategia 3: MoveFile (rename do .new para o destino)
+    LogLine "fallback B: move"
+    On Error Resume Next
+    fso.MoveFile src, dst
+    If Err.Number = 0 Then
+        TryReplaceExe = ""
+        On Error Goto 0
+        Exit Function
+    End If
+    lastErr = "Move: #" & Err.Number & " " & Err.Description
+    LogLine lastErr
+    Err.Clear
+    On Error Goto 0
+
+    TryReplaceExe = lastErr
 End Function
 
-LogLine "updater start pid={pid}"
+Sub ShowFailureDialog(reason)
+    ' Dialogo com 3 botoes (Sim/Nao/Cancelar mapeados):
+    '   Sim     -> abre o log no Notepad
+    '   Nao     -> abre Releases no navegador
+    '   Cancelar-> apenas fecha
+    Dim msg, resp
+    msg = "Nao foi possivel concluir a atualizacao automatica." & vbCrLf & vbCrLf
+    msg = msg & "Causa: " & reason & vbCrLf & vbCrLf
+    msg = msg & "A versao anterior foi mantida e o app esta funcional." & vbCrLf & vbCrLf
+    msg = msg & "Deseja abrir o log de atualizacao agora?" & vbCrLf
+    msg = msg & "(Sim = abrir log    Nao = abrir Releases no navegador    Cancelar = fechar)"
+    resp = MsgBox(msg, 51, APP_TITLE)   ' 51 = YesNoCancel + Warning
+    If resp = 6 Then
+        ' Yes -> abre o log no Notepad
+        On Error Resume Next
+        sh.Run "notepad.exe " & Chr(34) & LOG_PATH & Chr(34), 1, False
+        On Error Goto 0
+    ElseIf resp = 7 Then
+        ' No -> abre Releases no navegador
+        On Error Resume Next
+        sh.Run RELEASES_URL, 1, False
+        On Error Goto 0
+    End If
+End Sub
 
-' ── 1) Mata app antigo ────────────────────────────────────────────────────
+' =====================================================================
+LogLine "updater start pid={pid}"
+LogLine "src=" & SRC_PATH
+LogLine "dst=" & DST_PATH
+LogLine "dst_dir=" & DST_DIR
+
+' ── 0) Auto-eleva se nao temos permissao no destino ─────────────────────
+MaybeElevate
+
+' ── 1) Mata app antigo (mais agressivo agora) ───────────────────────────
 KillApp
 WScript.Sleep 1500
 KillApp
-WScript.Sleep 800
+WScript.Sleep 1000
+KillApp
+WScript.Sleep 500
 
-' ── 2) Limpa _MEI antigos ────────────────────────────────────────────────
+' ── 2) Limpa _MEI antigos ───────────────────────────────────────────────
 CleanMEI
 
-' ── 3) Backup ────────────────────────────────────────────────────────────
+' ── 3) Backup ───────────────────────────────────────────────────────────
 If fso.FileExists(DST_PATH) Then
     On Error Resume Next
     fso.CopyFile DST_PATH, BAK_PATH, True
+    LogLine "backup created"
     On Error Goto 0
 End If
 
-' ── 4) Copia novo exe com retry ──────────────────────────────────────────
-If Not CopyWithRetry(SRC_PATH, DST_PATH, 12) Then
-    LogLine "copy failed"
+' ── 4) Substitui o exe (multiplas estrategias) ──────────────────────────
+Dim replaceErr
+replaceErr = TryReplaceExe(SRC_PATH, DST_PATH)
+If replaceErr <> "" Then
+    LogLine "ALL strategies failed: " & replaceErr
+    ' Restaura backup
     On Error Resume Next
     If fso.FileExists(BAK_PATH) Then fso.CopyFile BAK_PATH, DST_PATH, True
     On Error Goto 0
-    MsgBox "Não foi possível concluir a atualização." & vbCrLf & _
-           "A versão anterior foi mantida.", 48, APP_TITLE
+    ShowFailureDialog replaceErr
     On Error Resume Next
     fso.DeleteFile SRC_PATH, True
     fso.DeleteFile BAK_PATH, True
@@ -302,52 +443,38 @@ If Not CopyWithRetry(SRC_PATH, DST_PATH, 12) Then
     On Error Goto 0
     WScript.Quit 1
 End If
-LogLine "copy ok"
+LogLine "replace ok"
 
-' ── 5) PRÉ-AQUECIMENTO DO ANTIVÍRUS ──────────────────────────────────────
-' Executa o novo exe em modo oculto com --pre-extract.
-' O bootloader PyInstaller extrai TODOS os DLLs (inclusive python313.dll)
-' para a pasta _MEI antes de o Python iniciar; o script Python dorme 8 s
-' e depois sai.  O taskkill /F mata o processo SEM deixar o bootloader
-' apagar a pasta _MEI → os arquivos ficam no disco enquanto o AV os escaneia
-' e adiciona os hashes ao seu cache de confiança.
-' Na segunda execução (a real) o AV já reconhece os hashes → sem erro de DLL.
+' ── 5) PRE-AQUECIMENTO DO ANTIVIRUS ─────────────────────────────────────
 LogLine "pre-extracting for AV warm-up..."
 On Error Resume Next
-sh.Run """" & DST_PATH & """ --pre-extract", 0, False
+sh.Run Chr(34) & DST_PATH & Chr(34) & " --pre-extract", 0, False
 On Error Goto 0
-
-' Aguarda extração completa + tempo de scan do AV (Windows Defender ~5-8 s)
 WScript.Sleep 12000
-
-' Mata o processo de pre-extract forçadamente (preserva _MEI no disco)
-sh.Run "taskkill /IM """ & EXE_NAME & """ /F", 0, True
+sh.Run "taskkill /F /T /IM " & Chr(34) & EXE_NAME & Chr(34), 0, True
 WScript.Sleep 1000
 LogLine "pre-extract done"
 
-' ── 6) Diálogo de sucesso ────────────────────────────────────────────────
-MsgBox "Atualização concluída com sucesso!" & vbCrLf & vbCrLf & _
+' ── 6) Dialogo de sucesso ───────────────────────────────────────────────
+MsgBox "Atualizacao concluida com sucesso!" & vbCrLf & vbCrLf & _
        "Clique em OK para abrir o Agendador-Bravo.", 64, APP_TITLE
 
-' ── 7) Inicia o exe de verdade ───────────────────────────────────────────
-' AV já confia nos hashes extraídos → sem janela de erro de DLL.
+' ── 7) Inicia o exe de verdade (3 tentativas) ───────────────────────────
 Dim attempt, launched, waitMs
 launched = False
 For attempt = 1 To 3
     LogLine "launch attempt " & attempt
     On Error Resume Next
-    sh.Run """" & DST_PATH & """", 1, False
+    sh.Run Chr(34) & DST_PATH & Chr(34), 1, False
     On Error Goto 0
-
-    waitMs = 3000 + attempt * 2000   ' 5 s, 7 s, 9 s
+    waitMs = 3000 + attempt * 2000
     WScript.Sleep waitMs
-
     If IsAppRunning() Then
         launched = True
         LogLine "launch ok (attempt " & attempt & ")"
         Exit For
     End If
-    LogLine "launch attempt " & attempt & " failed — cleaning MEI and retrying"
+    LogLine "launch attempt " & attempt & " failed"
     KillApp
     CleanMEI
     WScript.Sleep 1500
@@ -355,11 +482,11 @@ Next
 
 If Not launched Then
     LogLine "all launches failed"
-    MsgBox "A atualização foi instalada, mas o aplicativo não iniciou automaticamente." & vbCrLf & vbCrLf & _
+    MsgBox "A atualizacao foi instalada, mas o aplicativo nao iniciou." & vbCrLf & vbCrLf & _
            "Abra o Agendador-Bravo pelo atalho no Menu Iniciar.", 48, APP_TITLE
 End If
 
-' ── 8) Cleanup final ─────────────────────────────────────────────────────
+' ── 8) Cleanup ──────────────────────────────────────────────────────────
 On Error Resume Next
 fso.DeleteFile SRC_PATH, True
 fso.DeleteFile BAK_PATH, True
@@ -368,29 +495,60 @@ On Error Goto 0
 '''
 
     vbs_path = Path(tempfile.gettempdir()) / f"agendador_update_{pid}.vbs"
+    # v2025.10.11.10 — GRAVAR COMO UTF-16 LE COM BOM
+    # Esta é a única forma confiável de o wscript renderizar acentos
+    # corretamente no Brasil (cp1252 pode falhar dependendo do locale).
     try:
-        vbs_path.write_text(vbs, encoding="mbcs")
+        vbs_bytes = b"\xff\xfe" + vbs.encode("utf-16-le")
+        vbs_path.write_bytes(vbs_bytes)
     except Exception:
-        vbs_path.write_text(vbs, encoding="utf-8")
+        # fallback: ASCII puro (vbs já evita a maioria dos acentos críticos)
+        vbs_path.write_text(vbs, encoding="ascii", errors="replace")
     return vbs_path
 
 
 def _apply_update_and_restart(new_exe: Path, sha256_hex: str = ""):
-    """Dispara o updater invisível e encerra o processo atual."""
-    vbs = _write_update_scripts(os.getpid(), new_exe, _exe_path(), sha256_hex)
+    """Dispara o updater invisível e encerra o processo atual.
 
-    # Executa via wscript.exe (roda VBS sem janela)
+    v2025.10.11.10 — pré-detecta falta de permissão e usa ShellExecute com
+    verbo 'runas' (UAC) quando o destino está em Program Files. Belt and
+    suspenders: o próprio VBS também faz auto-elevação se necessário.
+    """
+    vbs = _write_update_scripts(os.getpid(), new_exe, _exe_path(), sha256_hex)
+    dst_dir = _exe_path().parent
+    needs_elevation = (os.name == "nt") and not _can_write_to_dir(dst_dir)
+
     try:
-        CREATE_NO_WINDOW = 0x08000000
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
-        subprocess.Popen(
-            ["wscript.exe", str(vbs)],
-            creationflags=CREATE_NO_WINDOW,
-            startupinfo=si,
-            close_fds=True,
-        )
+        if needs_elevation:
+            # UAC prompt → wscript elevado
+            import ctypes
+            params = f'"{vbs}"'
+            # ShellExecuteW(hwnd, verb, file, params, dir, nShow)
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "wscript.exe", params, None, 0
+            )
+            # Valores <= 32 indicam erro (1223 = ERROR_CANCELLED quando user nega UAC)
+            if int(rc) <= 32:
+                print(f"[update] ShellExecute retornou {rc}; fallback sem elevação")
+                CREATE_NO_WINDOW = 0x08000000
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0
+                subprocess.Popen(
+                    ["wscript.exe", str(vbs)],
+                    creationflags=CREATE_NO_WINDOW,
+                    startupinfo=si, close_fds=True,
+                )
+        else:
+            CREATE_NO_WINDOW = 0x08000000
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            subprocess.Popen(
+                ["wscript.exe", str(vbs)],
+                creationflags=CREATE_NO_WINDOW,
+                startupinfo=si, close_fds=True,
+            )
     except Exception as e:
         print(f"[update] falha ao disparar updater: {e}")
 
