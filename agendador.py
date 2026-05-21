@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.12"   # << aumente em cada build
+APP_VERSION = "2025.10.11.13"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -3144,25 +3144,42 @@ class SettingsDialog(tk.Toplevel):
         self.minsize(960, 620)
         self.result = None
 
-        # v2025.10.11.12 — Estilo de Notebook tipo SIDEBAR (tabs à esquerda).
-        # Cada tab vira uma linha vertical longa, sem chance de truncar.
+        # v2025.10.11.13 — Sidebar com cores MDW Bravo TI
         try:
             style = ttk.Style(self)
-            # cria estilo derivado para não afetar outros notebooks
+            # Cores Bravo TI (do BravoForm globals.css)
+            BR_BG_SIDEBAR  = "#dce0e4"  # primary-bg
+            BR_BG_CONTENT  = "#ffffff"
+            BR_TEXT        = "#343a40"  # text-primary
+            BR_SUBTEXT     = "#6c757d"
+            BR_ACCENT      = "#007bff"  # Bravo blue
+            BR_BORDER      = "#dee2e6"
             style.configure("Sidebar.TNotebook",
-                            tabposition="wn",        # West-North (esquerda)
-                            background="#f3f4f6",
+                            tabposition="wn",
+                            background=BR_BG_SIDEBAR,
                             borderwidth=0,
                             padding=0)
             style.configure("Sidebar.TNotebook.Tab",
-                            padding=[18, 12],
+                            padding=[20, 14],
                             font=("Segoe UI", 10),
-                            width=20)                # largura mínima do tab
+                            width=20,
+                            background=BR_BG_SIDEBAR,
+                            foreground=BR_SUBTEXT,
+                            focuscolor="")
             style.map("Sidebar.TNotebook.Tab",
-                      background=[("selected", "#ffffff"), ("!selected", "#f3f4f6")],
-                      foreground=[("selected", "#1f2937"), ("!selected", "#374151")])
-            style.configure("TLabelframe", padding=12)
-            style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+                      background=[("selected", BR_BG_CONTENT),
+                                  ("active", "#e9ecef"),
+                                  ("!selected", BR_BG_SIDEBAR)],
+                      foreground=[("selected", BR_ACCENT),
+                                  ("!selected", BR_TEXT)],
+                      font=[("selected", ("Segoe UI", 10, "bold")),
+                            ("!selected", ("Segoe UI", 10))])
+            style.configure("TLabelframe", padding=12, background=BR_BG_CONTENT,
+                            relief="solid", bordercolor=BR_BORDER, borderwidth=1)
+            style.configure("TLabelframe.Label",
+                            font=("Segoe UI", 10, "bold"),
+                            foreground=BR_ACCENT,
+                            background=BR_BG_CONTENT)
         except Exception:
             pass
 
@@ -4653,24 +4670,27 @@ class App(tk.Tk):
         ttk.Button(btns_up, text="Mais tarde", command=lambda: self._update_banner.grid_remove())\
        .pack(side="left", padx=4)
 
-        # v2025.10.11.9 — Welcome banner (Row 1, mesmo lugar do update banner mas
-        # exibido só se ainda não dispensado e o setup está incompleto)
-        self._welcome_banner = tk.Frame(self, bg="#dbeafe", padx=12, pady=10)
-        # Ícone + texto
-        wb_left = tk.Frame(self._welcome_banner, bg="#dbeafe")
+        # v2025.10.11.13 — Welcome banner com cores Bravo TI
+        # Fundo branco-azulado, texto Bravo blue
+        WB_BG = "#e7f1ff"   # Light blue tint (derivado do Bravo blue)
+        WB_FG = "#0056b3"   # Bravo blue dark (--primary-accent-dark)
+        self._welcome_banner = tk.Frame(self, bg=WB_BG, padx=16, pady=12,
+                                         highlightthickness=1,
+                                         highlightbackground="#b3d9ff")
+        wb_left = tk.Frame(self._welcome_banner, bg=WB_BG)
         wb_left.pack(side="left", fill="x", expand=True)
-        tk.Label(wb_left, text="👋  Bem-vindo ao Agendador-Bravo!",
-                 bg="#dbeafe", fg="#1e40af",
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(wb_left, text="👋  Bem-vindo ao Agendador-Bravo",
+                 bg=WB_BG, fg=WB_FG,
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
         tk.Label(wb_left,
                  text="Comece criando seu primeiro job e configurando notificações.",
-                 bg="#dbeafe", fg="#1e40af",
-                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
-        # Botões de ação (v.11: removida duplicidade "Configurar agora")
-        wb_right = tk.Frame(self._welcome_banner, bg="#dbeafe")
+                 bg=WB_BG, fg="#374151",
+                 font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
+        wb_right = tk.Frame(self._welcome_banner, bg=WB_BG)
         wb_right.pack(side="right")
-        ttk.Button(wb_right, text="📚 Começar tutorial",
-                   command=self.open_help_panel).pack(side="left", padx=4)
+        ttk.Button(wb_right, text="📚  Começar tutorial",
+                   command=self.open_help_panel,
+                   style="Accent.TButton").pack(side="left", padx=4)
         ttk.Button(wb_right, text="✕", width=3,
                    command=self._dismiss_welcome).pack(side="left", padx=(8, 0))
         # Inicialmente ocultado; mostrado em _maybe_show_welcome após startup
@@ -4701,8 +4721,12 @@ class App(tk.Tk):
         except Exception:
             pass
         
-        title_label = ttk.Label(logo_frame, text="🚀 Agendador-Bravo", font=("Segoe UI", 14, "bold"))
-        title_label.pack(side="left", padx=8)
+        # v2025.10.11.13 — título com tipografia Bravo (Montserrat)
+        # A fonte é definida em _apply_theme; aqui usamos o style Title.TLabel
+        self._title_label = ttk.Label(logo_frame, text="Agendador-Bravo",
+                                      style="Title.TLabel",
+                                      font=("Segoe UI", 16, "bold"))
+        self._title_label.pack(side="left", padx=10)
 
         # Controles (lado direito)
         controls_frame = ttk.Frame(header)
@@ -5051,75 +5075,104 @@ class App(tk.Tk):
 
     # ===== Tema / animações modernas =====
     def _apply_theme(self, dark: bool):
-        """Aplica tema moderno com cores e animações atualizadas"""
-        # Define paleta de cores moderna
+        """v2025.10.11.13 — Identidade visual MDW Bravo TI.
+
+        Paleta direta do globals.css do BravoForm (mesma da mdwbravo.com.br):
+        - Light: #007bff (azul Bravo) sobre #dce0e4/#ffffff
+        - Dark: variante escura preservando o azul como acento
+        Fonts: Montserrat (títulos) + Roboto (corpo), fallback Segoe UI.
+        """
         if dark:
             colors = {
-                'bg': '#1e1e2e',           # Fundo principal (Catppuccin Mocha)
-                'surface': '#313244',       # Superfícies (cards, frames)
-                'overlay': '#6c7086',       # Overlays e bordas
-                'text': '#cdd6f4',         # Texto principal
-                'subtext': '#a6adc8',      # Texto secundário
-                'accent': '#89b4fa',       # Azul accent
-                'success': '#a6e3a1',      # Verde sucesso
-                'warning': '#f9e2af',      # Amarelo aviso
-                'error': '#f38ba8',        # Rosa erro
-                'purple': '#cba6f7',       # Roxo
-                'teal': '#94e2d5',         # Teal
+                'bg':          '#0f1419',  # fundo principal escuro
+                'surface':     '#1a1f2e',  # cards/painéis
+                'overlay':     '#2d3748',  # bordas e separadores
+                'text':        '#e2e8f0',  # texto primário
+                'subtext':     '#94a3b8',  # texto secundário
+                'accent':      '#3b82f6',  # Bravo blue (variante clara)
+                'accent_dark': '#1d4ed8',
+                'success':     '#10b981',
+                'warning':     '#fbbf24',
+                'error':       '#ef4444',
+                'teal':        '#06b6d4',
+                'purple':      '#a78bfa',
             }
         else:
+            # Bravo TI Light — extraído de BRAVOFORM/app/globals.css
             colors = {
-                'bg': '#eff1f5',           # Fundo principal (Catppuccin Latte)
-                'surface': '#e6e9ef',       # Superfícies
-                'overlay': '#9ca0b0',       # Overlays
-                'text': '#4c4f69',         # Texto principal
-                'subtext': '#6c6f85',      # Texto secundário
-                'accent': '#1e66f5',       # Azul accent
-                'success': '#40a02b',      # Verde sucesso
-                'warning': '#df8e1d',      # Amarelo aviso
-                'error': '#d20f39',        # Vermelho erro
-                'purple': '#8839ef',       # Roxo
-                'teal': '#179299',         # Teal
+                'bg':          '#dce0e4',  # --primary-bg
+                'surface':     '#ffffff',  # --secondary-bg
+                'overlay':     '#dee2e6',  # --border-color
+                'text':        '#343a40',  # --text-primary
+                'subtext':     '#6c757d',  # --text-secondary
+                'accent':      '#007bff',  # --primary-accent (Bravo blue)
+                'accent_dark': '#0056b3',  # --primary-accent-dark
+                'success':     '#28a745',  # --success-green
+                'warning':     '#ffc107',
+                'error':       '#dc3545',  # --error-red
+                'teal':        '#17a2b8',
+                'purple':      '#6f42c1',
             }
-        
-        # Configura o tema base
+
+        # Tipografia oficial Bravo: Montserrat (display) + Roboto (sans).
+        # Fallback inteligente baseado no que está instalado.
+        try:
+            available = set(tkfont.families())
+        except Exception:
+            available = set()
+        if "Montserrat" in available:
+            font_title = "Montserrat"
+        elif "Segoe UI Variable" in available:
+            font_title = "Segoe UI Variable"
+        else:
+            font_title = "Segoe UI"
+        if "Roboto" in available:
+            font_body = "Roboto"
+        elif "Segoe UI Variable" in available:
+            font_body = "Segoe UI Variable"
+        else:
+            font_body = "Segoe UI"
+        self._font_title = font_title
+        self._font_body = font_body
+
+        # Tema base
         try:
             if sv_ttk:
                 sv_ttk.use_dark_theme() if dark else sv_ttk.use_light_theme()
         except Exception:
             pass
 
-        # Aplica estilos personalizados
         style = ttk.Style(self)
 
         # Paleta derivada
-        btn_bg   = colors['surface']
-        btn_fg   = colors['text']
-        btn_hv   = colors['overlay']
-        acc_bg   = colors['accent']
-        acc_fg   = '#ffffff' if dark else '#ffffff'
-        acc_hv   = self._lighten_color(colors['accent'], -0.12)
-        acc_ac   = self._lighten_color(colors['accent'], -0.22)
+        btn_bg = colors['surface']
+        btn_fg = colors['text']
+        btn_hv = colors['overlay']
+        acc_bg = colors['accent']
+        acc_fg = '#ffffff'
+        acc_hv = colors['accent_dark']
+        acc_ac = self._lighten_color(colors['accent_dark'], -0.10)
         danger_bg = colors['error']
         danger_hv = self._lighten_color(colors['error'], -0.15)
 
-        # Botões modernos
+        # Botões secundários
         style.configure("Modern.TButton",
                         padding=(12, 8),
-                        font=("Segoe UI", 9),
-                        borderwidth=0,
+                        font=(font_body, 10),
+                        borderwidth=1,
                         relief="flat",
                         focuscolor='none',
                         background=btn_bg,
-                        foreground=btn_fg)
+                        foreground=btn_fg,
+                        bordercolor=colors['overlay'])
         style.map("Modern.TButton",
-                  background=[('active', btn_hv), ('pressed', btn_hv)],
+                  background=[('active', colors['overlay']), ('pressed', colors['overlay'])],
                   foreground=[('disabled', colors['subtext'])])
 
-        # Botão de destaque (Executar)
+        # Botão de destaque (Bravo blue) — "+ Nova", "▶ Executar"
         style.configure("Accent.TButton",
-                        padding=(14, 9),
-                        font=("Segoe UI", 10, "bold"),
+                        padding=(16, 10),
+                        font=(font_body, 10, "bold"),
                         borderwidth=0,
                         relief="flat",
                         focuscolor='none',
@@ -5129,22 +5182,22 @@ class App(tk.Tk):
                   background=[('active', acc_hv), ('pressed', acc_ac)],
                   foreground=[('disabled', '#cbd5e1')])
 
-        # Botão de toggle
+        # Botão Toggle (Pausar)
         style.configure("Toggle.TButton",
-                        padding=(10, 6),
-                        font=("Segoe UI", 9),
-                        borderwidth=0,
+                        padding=(12, 8),
+                        font=(font_body, 10),
+                        borderwidth=1,
                         relief="flat",
                         focuscolor='none',
                         background=btn_bg,
                         foreground=btn_fg)
         style.map("Toggle.TButton",
-                  background=[('active', btn_hv), ('pressed', btn_hv)])
+                  background=[('active', colors['overlay']), ('pressed', colors['overlay'])])
 
-        # Botão de interrupção (Danger)
+        # Botão de perigo (Parar)
         style.configure("Danger.TButton",
-                        padding=(10, 6),
-                        font=("Segoe UI", 9, "bold"),
+                        padding=(12, 8),
+                        font=(font_body, 10, "bold"),
                         borderwidth=0,
                         relief="flat",
                         focuscolor='none',
@@ -5154,18 +5207,36 @@ class App(tk.Tk):
                   background=[('active', danger_hv), ('pressed', danger_hv)],
                   foreground=[('disabled', '#e2e8f0')])
 
-        # Labels com tipografia moderna
+        # Tipografia
         style.configure("Title.TLabel",
-                        font=("Segoe UI", 14, "bold"),
+                        font=(font_title, 14, "bold"),
                         padding=(0, 4),
                         foreground=colors['text'])
         style.configure("Subtitle.TLabel",
-                        font=("Segoe UI", 10),
+                        font=(font_body, 10),
                         padding=(0, 2),
                         foreground=colors['subtext'])
-        
-        # Configura cores do canvas
+
+        # Fundo da janela principal com cor Bravo
         self.configure(bg=colors['bg'])
+
+        # Atualiza o título principal com a fonte Montserrat (se disponível)
+        try:
+            if hasattr(self, '_title_label'):
+                self._title_label.configure(
+                    font=(font_title, 16, "bold"),
+                    foreground=colors['accent'])  # azul Bravo
+        except Exception:
+            pass
+
+        # Aplica fonte sans-serif Bravo em widgets padrão
+        try:
+            style.configure("TLabel", font=(font_body, 10), foreground=colors['text'])
+            style.configure("TCheckbutton", font=(font_body, 10), foreground=colors['text'])
+            style.configure("TEntry", font=(font_body, 10))
+            style.configure("TCombobox", font=(font_body, 10))
+        except Exception:
+            pass
         
         # Aplica estilos aos botões específicos
         try:
