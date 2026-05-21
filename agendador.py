@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.8"   # << aumente em cada build
+APP_VERSION = "2025.10.11.9"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -2503,6 +2503,473 @@ class AssistantDialog(tk.Toplevel):
 
 
 
+class HelpPanel(tk.Toplevel):
+    """v2025.10.11.9 — Painel de Ajuda lateral com tutoriais passo-a-passo."""
+
+    TOPICS = [
+        ("🚀  Início rápido (3 passos)", "intro"),
+        ("➕  Criar meu primeiro job", "first_job"),
+        ("📅  Tipos de agendamento", "schedule_types"),
+        ("✉️  Configurar e-mail (SMTP)", "email"),
+        ("🪝  Configurar webhook (Discord/Slack/Teams)", "webhook"),
+        ("💬  Configurar WhatsApp", "whatsapp"),
+        ("✨  Variáveis dinâmicas (${data_atual} etc.)", "dyn_vars"),
+        ("🔗  Dependências entre jobs", "depends"),
+        ("🔁  Retry automático em falha", "retry"),
+        ("🕓  Janelas de manutenção", "maintenance"),
+        ("🏷️  Tags e filtros", "tags"),
+        ("📊  Digest diário", "digest"),
+        ("🤖  Detectar variáveis Pentaho", "pentaho"),
+        ("💾  Backup, restauração e portabilidade", "backup"),
+        ("🔌  API REST local", "rest_api"),
+        ("⌨️  Atalhos de teclado", "shortcuts"),
+        ("🐛  Problemas comuns (troubleshooting)", "troubleshoot"),
+    ]
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Ajuda — Agendador-Bravo")
+        self.geometry("960x640")
+        self.minsize(820, 520)
+        try:
+            self.transient(master)   # mantém junto da janela principal
+        except Exception:
+            pass
+
+        # ícone
+        try:
+            ico = find_logo_ico()
+            if ico:
+                self.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+
+        # Layout: header + paned (lista esquerda + conteúdo direita) + footer
+        header = ttk.Frame(self, padding=(12, 10))
+        header.pack(side="top", fill="x")
+        ttk.Label(header, text="📚  Central de Ajuda",
+                  font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Label(header,
+                  text=f"v{APP_VERSION}  ·  pressione F1 para reabrir",
+                  foreground="#888", font=("Segoe UI", 9))\
+            .pack(side="right")
+
+        ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
+
+        paned = ttk.Panedwindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # ── Lista de tópicos (esquerda) ─────────────────────────────────
+        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        self.listbox = tk.Listbox(left, height=22, font=("Segoe UI", 10),
+                                  borderwidth=0, highlightthickness=0,
+                                  selectmode="single", exportselection=False)
+        for title, _key in self.TOPICS:
+            self.listbox.insert("end", title)
+        self.listbox.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(left, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+
+        # ── Conteúdo (direita) ──────────────────────────────────────────
+        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        self._text = tk.Text(right, wrap="word", padx=14, pady=12,
+                             font=("Segoe UI", 10), relief="flat", borderwidth=0)
+        self._text.grid(row=0, column=0, sticky="nsew")
+        tsb = ttk.Scrollbar(right, orient="vertical", command=self._text.yview)
+        self._text.configure(yscrollcommand=tsb.set)
+        tsb.grid(row=0, column=1, sticky="ns")
+
+        # Tags de estilo
+        self._text.tag_configure("h1", font=("Segoe UI", 14, "bold"), spacing3=8)
+        self._text.tag_configure("h2", font=("Segoe UI", 11, "bold"), spacing1=10, spacing3=6)
+        self._text.tag_configure("p", spacing3=6)
+        self._text.tag_configure("code", font=("Cascadia Mono", 9), background="#f5f5f5",
+                                 lmargin1=12, lmargin2=12, rmargin=12,
+                                 spacing1=4, spacing3=4)
+        self._text.tag_configure("step", font=("Segoe UI", 10, "bold"), foreground="#2563eb",
+                                 spacing1=8)
+        self._text.tag_configure("tip", foreground="#16a34a", font=("Segoe UI", 10, "italic"))
+        self._text.tag_configure("warn", foreground="#dc2626", font=("Segoe UI", 10, "bold"))
+
+        paned.add(left, weight=1)
+        paned.add(right, weight=3)
+
+        # Footer
+        ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
+        footer = ttk.Frame(self, padding=(10, 6))
+        footer.pack(side="bottom", fill="x")
+        ttk.Label(footer,
+                  text="Dica: este painel é não-modal — você pode deixar aberto enquanto configura.",
+                  foreground="#6b7280", font=("Segoe UI", 9))\
+            .pack(side="left")
+        ttk.Button(footer, text="Fechar", command=self.destroy).pack(side="right")
+
+        # Seleciona o primeiro tópico
+        self.listbox.selection_set(0)
+        self._render(self.TOPICS[0][1])
+
+    def _on_select(self, _evt=None):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        self._render(self.TOPICS[sel[0]][1])
+
+    def _set(self, *blocks):
+        """Helper: limpa e escreve uma lista de tuplas (texto, tag)."""
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        for text, tag in blocks:
+            self._text.insert("end", text, tag)
+        self._text.configure(state="disabled")
+
+    def _render(self, key):
+        renderer = getattr(self, f"_render_{key}", None)
+        if renderer:
+            renderer()
+
+    # ── Tópicos ───────────────────────────────────────────────────────
+    def _render_intro(self):
+        self._set(
+            ("Início rápido em 3 passos\n", "h1"),
+            ("O Agendador-Bravo automatiza qualquer arquivo executável "
+             "(.ktr, .kjb, .py, .bat, .exe, .ps1) em horários definidos. "
+             "Veja como começar.\n", "p"),
+            ("1️⃣  Configure o caminho do Pentaho\n", "step"),
+            ("Abra ⚙️ Configurações → aba Geral e aponte para a pasta do PDI "
+             "que contém Pan.bat e Kitchen.bat. Pule este passo se você não "
+             "usa Pentaho.\n", "p"),
+            ("2️⃣  Crie seu primeiro job\n", "step"),
+            ("Clique em 🧙 Assistente (mais rápido) ou ➕ Nova. Escolha o "
+             "arquivo, defina os horários e os dias da semana. O job já fica "
+             "agendado e rodará automaticamente.\n", "p"),
+            ("3️⃣  Configure como ser notificado de falhas\n", "step"),
+            ("Em ⚙️ Configurações habilite e-mail OU webhooks "
+             "(Discord/Slack/Teams). A cada job que falhar você recebe um aviso "
+             "com o log anexado.\n", "p"),
+            ("\n💡  Pronto. ", "tip"),
+            ("A partir daí, use a tabela principal para acompanhar status, "
+             "histórico e o dashboard de 7 dias (mostrado quando nada está "
+             "selecionado).\n", "p"),
+        )
+
+    def _render_first_job(self):
+        self._set(
+            ("Criar meu primeiro job\n", "h1"),
+            ("Caminho rápido: clique no botão 🧙 Assistente.\n", "p"),
+            ("Passo a passo\n", "h2"),
+            ("1.  Clique em ➕ Nova (ou Ctrl+N).\n", "p"),
+            ("2.  Dê um nome (sem espaços ou caracteres especiais — é usado como id).\n", "p"),
+            ("3.  Em Arquivo/Comando aponte para o .ktr/.kjb/.py/.bat/.exe.\n", "p"),
+            ("4.  Em Argumentos coloque parâmetros, se precisar (ex.: /param:nome=valor).\n", "p"),
+            ("5.  Escolha o tipo de agendamento:\n", "p"),
+            ("    • Horário fixo: lista de horários (ex.: 06:00, 12:00, 18:00).\n", "p"),
+            ("    • Intervalo: a cada N minutos/horas.\n", "p"),
+            ("    • Início + repetição: começa em HH:MM e repete N vezes.\n", "p"),
+            ("6.  Marque os dias da semana.\n", "p"),
+            ("7.  (Opcional) Expanda Avançado para configurar tags, retry, dependências, variáveis.\n", "p"),
+            ("8.  Salvar.\n", "p"),
+            ("\n💡  ", "tip"),
+            ("Você pode rodar imediatamente sem esperar o horário: selecione o job na tabela e clique ▶ Executar agora.\n", "p"),
+        )
+
+    def _render_schedule_types(self):
+        self._set(
+            ("Tipos de agendamento\n", "h1"),
+            ("Horário fixo (cron)\n", "h2"),
+            ("Dispara nos horários listados, nos dias marcados.\n", "p"),
+            ("Exemplo: times=['06:00','12:00','18:00'], days=[seg-sex] → "
+             "6 disparos por dia, 5 dias da semana.\n", "code"),
+            ("Intervalo (interval)\n", "h2"),
+            ("A cada N minutos ou horas, 24h por dia (filtrando dias da semana).\n", "p"),
+            ("Exemplo: every_value=15, every_unit='minutes' → "
+             "a cada 15 minutos.\n", "code"),
+            ("Início + repetição (start_repeat)\n", "h2"),
+            ("Começa num horário e repete N vezes.\n", "p"),
+            ("Exemplo: sr_start='14:25', sr_every_value=5, sr_count=10 → "
+             "14:25, 14:30, 14:35 ... até 15:15 (10 repetições + a inicial).\n", "code"),
+        )
+
+    def _render_email(self):
+        self._set(
+            ("Configurar notificações por e-mail\n", "h1"),
+            ("Em ⚙️ Configurações → aba ✉️ E-mail:\n", "p"),
+            ("1.  Marque Ativar notificações por e-mail.\n", "p"),
+            ("2.  SMTP host: smtp.gmail.com (Gmail), smtp.office365.com (Outlook), etc.\n", "p"),
+            ("3.  SMTP porta: geralmente 587 (TLS).\n", "p"),
+            ("4.  Usuário: seu e-mail completo.\n", "p"),
+            ("5.  Senha de app: NÃO use sua senha normal. ", "p"),
+            ("Para Gmail: myaccount.google.com → Segurança → Senhas de app.\n", "p"),
+            ("6.  De (from): geralmente o mesmo do usuário.\n", "p"),
+            ("7.  Para (vírgula): lista de destinatários separados por vírgula.\n", "p"),
+            ("8.  Clique Testar e-mail para validar.\n", "p"),
+            ("\n🔒  ", "tip"),
+            ("A senha é criptografada via Windows DPAPI no config.json — "
+             "só o seu usuário Windows consegue decifrar.\n", "p"),
+        )
+
+    def _render_webhook(self):
+        self._set(
+            ("Webhooks Discord / Slack / Teams\n", "h1"),
+            ("Webhooks são URLs que recebem mensagens via HTTP POST. "
+             "Mais estáveis que WhatsApp-web e não dependem de Node.js.\n", "p"),
+            ("Discord\n", "h2"),
+            ("1.  Editar canal → Integrações → Webhooks → Novo Webhook.\n", "p"),
+            ("2.  Copie o URL (começa com discord.com/api/webhooks/...).\n", "p"),
+            ("Slack\n", "h2"),
+            ("1.  api.slack.com → Apps → Your Apps → Create New App.\n", "p"),
+            ("2.  Ative Incoming Webhooks, adicione ao workspace.\n", "p"),
+            ("3.  Copie o URL (começa com hooks.slack.com/services/...).\n", "p"),
+            ("Microsoft Teams\n", "h2"),
+            ("1.  No canal: ⋮ → Connectors → Incoming Webhook → Configure.\n", "p"),
+            ("2.  Copie o URL (outlook.office.com/webhook/...).\n", "p"),
+            ("Configurar no Agendador\n", "h2"),
+            ("Em ⚙️ Configurações → aba 🪝 Webhooks:\n", "p"),
+            ("1.  Cole uma URL por linha (pode ter várias misturadas).\n", "p"),
+            ("2.  Escolha notificar sucessos, falhas ou ambos.\n", "p"),
+            ("3.  Testar webhooks → manda mensagem de teste em todas.\n", "p"),
+            ("\n💡  ", "tip"),
+            ("O tipo é detectado automaticamente pelo URL — você não precisa escolher.\n", "p"),
+        )
+
+    def _render_whatsapp(self):
+        self._set(
+            ("Configurar WhatsApp (modo QR)\n", "h1"),
+            ("Usa whatsapp-web.js via Node.js. Precisa ler o QR Code "
+             "uma vez por máquina. Para alta carga, prefira Webhooks.\n", "p"),
+            ("Pré-requisitos\n", "h2"),
+            ("•  Node.js instalado em C:\\Program Files\\nodejs\\.\n", "p"),
+            ("•  Pasta wa/ no aplicativo com wa_send.js.\n", "p"),
+            ("Configuração\n", "h2"),
+            ("1.  ⚙️ Configurações → aba 💬 WhatsApp.\n", "p"),
+            ("2.  Marque Ativar notificações por WhatsApp.\n", "p"),
+            ("3.  Confirme caminhos do Node.exe e wa_send.js.\n", "p"),
+            ("4.  Destinos (vírgula): números no formato 5511999999999@c.us "
+             "ou grupos como group:NomeDoGrupo.\n", "p"),
+            ("5.  Testar WhatsApp → abre uma janela com QR. Leia com seu celular.\n", "p"),
+        )
+
+    def _render_dyn_vars(self):
+        self._set(
+            ("Variáveis dinâmicas\n", "h1"),
+            ("Use ${VARIAVEL} nos Argumentos do job. O Agendador resolve "
+             "no momento da execução. Útil para passar datas em pipelines de ETL.\n", "p"),
+            ("Variáveis built-in\n", "h2"),
+            ("${data_atual}        →  2026-05-21 (YYYY-MM-DD)\n", "code"),
+            ("${hoje}              →  2026-05-21\n", "code"),
+            ("${ontem}             →  2026-05-20\n", "code"),
+            ("${amanha}            →  2026-05-22\n", "code"),
+            ("${ultimo_dia_util}   →  último dia útil (pula sáb/dom)\n", "code"),
+            ("${primeiro_dia_mes}  →  2026-05-01\n", "code"),
+            ("${ultimo_dia_mes}    →  2026-05-31\n", "code"),
+            ("${mes_anterior}      →  2026-04 (YYYY-MM)\n", "code"),
+            ("${ano_atual}         →  2026\n", "code"),
+            ("${mes_atual}         →  05\n", "code"),
+            ("${data_atual_br}     →  21/05/2026\n", "code"),
+            ("${timestamp}         →  20260521_153045\n", "code"),
+            ("Variáveis customizadas (por job)\n", "h2"),
+            ("Em ➕ Nova → Avançado → Variáveis → Editar... defina pares NOME=VALOR. "
+             "Use ${NOME} nos argumentos.\n", "p"),
+            ("\n💡  ", "tip"),
+            ("Para .ktr/.kjb com parâmetros do Pentaho, use 🔍 Detectar Pentaho: "
+             "o app lê o XML e cria as variáveis automaticamente.\n", "p"),
+        )
+
+    def _render_depends(self):
+        self._set(
+            ("Dependências entre jobs\n", "h1"),
+            ("Faça o job B só rodar se o job A teve sucesso na última execução.\n", "p"),
+            ("Como configurar\n", "h2"),
+            ("1.  Crie/edite o job dependente (B).\n", "p"),
+            ("2.  Expanda Avançado → clique Editar... ao lado de Depende de.\n", "p"),
+            ("3.  Marque os jobs A que precisam ter rodado com sucesso.\n", "p"),
+            ("4.  Salvar.\n", "p"),
+            ("Como funciona\n", "h2"),
+            ("No momento em que B for disparado pelo scheduler, ele consulta "
+             "o histórico: a última execução de cada A precisa ter RC=0. "
+             "Se algum A nunca rodou ou falhou na última, B é pulado e o "
+             "evento é registrado em logs/_scheduler.log.\n", "p"),
+            ("\n⚠️  ", "warn"),
+            ("Cuidado com ciclos: A→B→A não é detectado automaticamente. "
+             "Você precisa garantir que o grafo de dependências seja acíclico.\n", "p"),
+        )
+
+    def _render_retry(self):
+        self._set(
+            ("Retry automático em falha\n", "h1"),
+            ("Quando um job falha (RC ≠ 0), o Agendador pode reagendar "
+             "tentativas com backoff exponencial.\n", "p"),
+            ("Como configurar\n", "h2"),
+            ("Em Avançado do job:\n", "p"),
+            ("•  Marque Retry automático em falha.\n", "p"),
+            ("•  Tentativas: número total (incluindo a primeira). 3 = 1 inicial + 2 retries.\n", "p"),
+            ("•  Backoff (s, vírgula): segundos entre tentativas. "
+             "Ex.: 60,300,900 → espera 1min, depois 5min, depois 15min.\n", "p"),
+            ("Exemplo prático\n", "h2"),
+            ("Job ETL roda às 06:00, falha por SQL Server estar fora do ar:\n", "p"),
+            ("•  06:00 — falha, agenda retry 1 para 06:01.\n", "p"),
+            ("•  06:01 — falha, agenda retry 2 para 06:06.\n", "p"),
+            ("•  06:06 — falha, agenda retry 3 para 06:21.\n", "p"),
+            ("•  06:21 — sucesso ✅\n", "p"),
+            ("\n💡  ", "tip"),
+            ("Cada retry é registrado em logs/_scheduler.log com timestamp e número da tentativa.\n", "p"),
+        )
+
+    def _render_maintenance(self):
+        self._set(
+            ("Janelas de manutenção (blackout)\n", "h1"),
+            ("Períodos em que NENHUM job é disparado. Útil para reboot semanal "
+             "do servidor, deploy do ERP, manutenção do banco.\n", "p"),
+            ("Configurar\n", "h2"),
+            ("⚙️ Configurações → aba 🕓 Janelas → ➕ Adicionar.\n", "p"),
+            ("•  Nome: identificador (ex.: \"Manutenção banco\").\n", "p"),
+            ("•  Início e Fim: HH:MM. Janelas que atravessam meia-noite são suportadas (22:00→06:00).\n", "p"),
+            ("•  Dias: marque os dias da semana que se aplicam.\n", "p"),
+            ("Comportamento\n", "h2"),
+            ("Quando um job (com flag Respeitar janelas de manutenção ativada) "
+             "for disparado dentro de uma janela, ele é pulado silenciosamente "
+             "e o evento é gravado em logs/_scheduler.log.\n", "p"),
+            ("\n💡  ", "tip"),
+            ("Você pode desativar a respeitar por job. Edite o job → "
+             "Avançado → desmarque Respeitar janelas de manutenção.\n", "p"),
+        )
+
+    def _render_tags(self):
+        self._set(
+            ("Tags e filtros\n", "h1"),
+            ("Organize jobs em categorias e filtre a tabela.\n", "p"),
+            ("Criar tags\n", "h2"),
+            ("Em ➕ Nova/✏️ Editar → Avançado → Tags (vírgula): "
+             "digite separadas por vírgula. Ex.: ETL, Diário, Crítico.\n", "p"),
+            ("Filtrar a tabela\n", "h2"),
+            ("•  Caixa 🔎 no topo: filtra por nome, tipo, tag ou arquivo em tempo real.\n", "p"),
+            ("•  Combobox ao lado: filtra por uma tag específica.\n", "p"),
+            ("•  Botão ✕: limpa todos os filtros.\n", "p"),
+        )
+
+    def _render_digest(self):
+        self._set(
+            ("Digest diário\n", "h1"),
+            ("Resumo automático das últimas 24h enviado por e-mail e/ou webhook.\n", "p"),
+            ("Configurar\n", "h2"),
+            ("⚙️ Configurações → aba 📊 Digest.\n", "p"),
+            ("•  Habilite e escolha horário (ex.: 08:00).\n", "p"),
+            ("•  Dias da semana (padrão: seg-sex).\n", "p"),
+            ("•  Conteúdo: sucessos, falhas, top 5 lentos.\n", "p"),
+            ("•  Clique Enviar digest agora para testar.\n", "p"),
+            ("Conteúdo gerado\n", "h2"),
+            ("•  Total de execuções, sucessos, falhas, taxa de sucesso.\n", "p"),
+            ("•  Lista detalhada (último horário, RC).\n", "p"),
+            ("•  Top 5 jobs mais lentos.\n", "p"),
+        )
+
+    def _render_pentaho(self):
+        self._set(
+            ("Detectar variáveis Pentaho automaticamente\n", "h1"),
+            ("Lê o XML do .ktr/.kjb e identifica todas as ${VARIAVEIS} declaradas, "
+             "populando os campos automaticamente.\n", "p"),
+            ("Como usar\n", "h2"),
+            ("1.  Em ✏️ Editar/➕ Nova, defina o caminho do arquivo .ktr/.kjb.\n", "p"),
+            ("2.  Em Avançado → 🔍 Detectar Pentaho.\n", "p"),
+            ("3.  Uma caixa lista quantas variáveis foram encontradas.\n", "p"),
+            ("4.  Clique Editar... ao lado de Variáveis para preencher os valores.\n", "p"),
+            ("5.  Salvar.\n", "p"),
+            ("Resultado\n", "h2"),
+            ("O Pan/Kitchen recebe os valores via parâmetros na linha de comando. "
+             "Você pode misturar com variáveis built-in: ${data_atual} no valor de "
+             "uma var custom também funciona.\n", "p"),
+        )
+
+    def _render_backup(self):
+        self._set(
+            ("Backup, restauração e portabilidade\n", "h1"),
+            ("Três cenários comuns:\n", "p"),
+            ("1) Backup completo antes de mudanças grandes\n", "h2"),
+            ("💾 Backup na toolbar → gera .zip com config.json + logs + pids. "
+             "Guarde num pendrive ou OneDrive.\n", "p"),
+            ("Para restaurar: ↩ Restaurar e aponte para o .zip.\n", "p"),
+            ("2) Versionar jobs no Git\n", "h2"),
+            ("📤 Export YAML → gera um arquivo .yaml legível com apenas os jobs.\n", "p"),
+            ("Coloque no Git, ele segue convenções padrão de YAML "
+             "(comentários, anchors, etc.).\n", "p"),
+            ("📥 Import YAML para aplicar de volta — escolha mesclar ou substituir.\n", "p"),
+            ("3) Migrar para outra máquina\n", "h2"),
+            ("Opção A — backup completo: gere .zip aqui, restaure lá.\n", "p"),
+            ("Opção B — só os jobs: export YAML aqui, import YAML lá. "
+             "Configurações (e-mail, webhooks) ficam locais.\n", "p"),
+        )
+
+    def _render_rest_api(self):
+        self._set(
+            ("API REST local\n", "h1"),
+            ("Sobe um servidor HTTP no localhost para outros sistemas dispararem jobs.\n", "p"),
+            ("Configurar\n", "h2"),
+            ("⚙️ Configurações → aba 🔌 API REST → marque Ativar servidor HTTP local. "
+             "Reinicie o Agendador para entrar em vigor.\n", "p"),
+            ("Endpoints\n", "h2"),
+            ("GET  /            →  info do servidor\n", "code"),
+            ("GET  /health      →  ok/timestamp\n", "code"),
+            ("GET  /jobs        →  lista todos os jobs\n", "code"),
+            ("GET  /jobs/{nome} →  detalhes de 1 job\n", "code"),
+            ("POST /jobs/{nome}/run  →  dispara o job (assíncrono)\n", "code"),
+            ("Autenticação\n", "h2"),
+            ("Se você definir um Token, todas as requisições precisam do header:\n", "p"),
+            ("X-Auth-Token: seu-token-aqui\n", "code"),
+            ("Exemplo de chamada\n", "h2"),
+            ("curl -X POST http://127.0.0.1:17654/jobs/RelatorioVendas/run \\\n"
+             "     -H \"X-Auth-Token: meu-token\"\n", "code"),
+            ("\n🔒  ", "tip"),
+            ("Por padrão escuta apenas em 127.0.0.1 (localhost). "
+             "Mudar para 0.0.0.0 expõe o serviço na rede — use token forte.\n", "p"),
+        )
+
+    def _render_shortcuts(self):
+        self._set(
+            ("Atalhos de teclado\n", "h1"),
+            ("Ctrl+N        →  Novo job\n", "code"),
+            ("Ctrl+E        →  Editar job selecionado\n", "code"),
+            ("Del           →  Remover job selecionado\n", "code"),
+            ("Ctrl+R        →  Executar agora (job selecionado)\n", "code"),
+            ("Esc           →  Interromper job em execução\n", "code"),
+            ("Ctrl+,        →  Abrir Configurações\n", "code"),
+            ("F1            →  Abrir este painel de Ajuda\n", "code"),
+            ("F5            →  Atualizar tabela\n", "code"),
+            ("Ctrl+Click    →  Multi-seleção (para rodar vários em paralelo)\n", "code"),
+        )
+
+    def _render_troubleshoot(self):
+        self._set(
+            ("Problemas comuns\n", "h1"),
+            ("Job não dispara no horário\n", "h2"),
+            ("1.  Verifique se o job está ATIVO (coluna Status).\n", "p"),
+            ("2.  Verifique se o dia da semana está marcado.\n", "p"),
+            ("3.  Verifique se NÃO está em janela de manutenção.\n", "p"),
+            ("4.  Veja logs/_scheduler.log — qualquer skip/erro fica lá.\n", "p"),
+            ("E-mail de teste falha\n", "h2"),
+            ("•  Para Gmail: precisa de senha de app (não a senha do Google).\n", "p"),
+            ("•  Para Outlook: pode pedir token OAuth — use Gmail por simplicidade.\n", "p"),
+            ("•  Confira firewall corporativo bloqueando porta 587.\n", "p"),
+            ("Erro 'python313.dll não encontrado' após atualizar\n", "h2"),
+            ("Já corrigido em v2025.10.11.7 via AV pre-warm. "
+             "Se acontecer: aguarde 30s e reabra. Se persistir, restaure o "
+             "backup e reabra a issue no GitHub.\n", "p"),
+            ("API REST não responde\n", "h2"),
+            ("1.  Reinicie o Agendador depois de habilitar.\n", "p"),
+            ("2.  curl http://127.0.0.1:17654/health — se der refused, outra "
+             "instância pode estar usando a porta.\n", "p"),
+            ("3.  Mude a porta nas configurações e reinicie.\n", "p"),
+            ("Onde achar os logs\n", "h2"),
+            ("%PROGRAMDATA%\\AgendadorBravo\\logs\\\n", "code"),
+            ("Ou clique 📂 Logs na toolbar.\n", "p"),
+        )
+
+
 class SettingsDialog(tk.Toplevel):
     def __init__(self, master, settings, on_check_updates=None, current_version=APP_VERSION):
         self._on_check_updates = on_check_updates
@@ -2511,8 +2978,8 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Configurações")
         self.resizable(True, True)
-        self.geometry("680x540")  # v2025.10.11.8 — maior para acomodar novas abas
-        self.minsize(560, 420)
+        self.geometry("980x680")  # v2025.10.11.9 — bem maior para tabs não truncarem
+        self.minsize(820, 560)
         self.result = None
 
         # ----- PDI (Pentaho) -----
@@ -2588,19 +3055,25 @@ class SettingsDialog(tk.Toplevel):
         notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
 
         # === ABA 1: GERAL ===
-        tab_geral = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_geral, text="Geral")
-        
-        row = 0
+        tab_geral = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_geral, text="⚙️  Geral")
+        self._add_tab_header(tab_geral, "Configurações gerais",
+                             "Caminhos do Pentaho Data Integration usado para executar os arquivos `.ktr` / `.kjb`.")
+
+        row = 1
         ttk.Label(tab_geral, text="PDI Home (.ktr/.kjb):").grid(row=row, column=0, sticky="w")
         ttk.Entry(tab_geral, textvariable=self.var_pdi, width=40).grid(row=row, column=1, sticky="we", padx=(5, 5))
         ttk.Button(tab_geral, text="...", command=self.pick_pdi, width=3).grid(row=row, column=2); row += 1
+        ttk.Label(tab_geral, text="Aponte para a pasta do PDI que contém `Pan.bat` e `Kitchen.bat`.",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # === ABA 2: E-MAIL ===
-        tab_email = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_email, text="E-mail")
+        tab_email = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_email, text="✉️  E-mail")
+        self._add_tab_header(tab_email, "Notificações por e-mail (SMTP)",
+                             "Envia avisos quando um job falha. Para Gmail, gere uma 'Senha de app' em myaccount.google.com → Segurança.")
         
-        row = 0
+        row = 1
         ttk.Checkbutton(tab_email, text="Ativar notificações por e-mail (SMTP)", variable=self.var_mail_on)\
             .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
 
@@ -2616,14 +3089,16 @@ class SettingsDialog(tk.Toplevel):
             ttk.Entry(tab_email, textvariable=var, width=40, show="*" if "Senha" in label else "")\
                 .grid(row=row, column=1, columnspan=2, sticky="we", padx=(5, 0)); row += 1
 
-        ttk.Button(tab_email, text="Testar e-mail", command=self.test_email)\
+        ttk.Button(tab_email, text="✉️ Testar e-mail", command=self.test_email)\
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA 3: WHATSAPP ===
-        tab_wa = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_wa, text="WhatsApp")
+        tab_wa = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_wa, text="💬  WhatsApp")
+        self._add_tab_header(tab_wa, "Notificações por WhatsApp (whatsapp-web.js)",
+                             "Envia avisos via WhatsApp Web (precisa do Node.js + ler QR Code uma vez). Para uso intenso, prefira Webhooks ou Twilio.")
         
-        row = 0
+        row = 1
         ttk.Checkbutton(tab_wa, text="Ativar notificações por WhatsApp", variable=self.var_wa_on)\
             .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
 
@@ -2649,9 +3124,11 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA: WEBHOOKS (v2025.10.11.8) ===
-        tab_wh = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_wh, text="Webhooks")
-        row = 0
+        tab_wh = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_wh, text="🪝  Webhooks")
+        self._add_tab_header(tab_wh, "Webhooks Discord / Slack / Teams",
+                             "Cole o URL do webhook nos canais e o app já detecta o tipo. Crie em: Discord (Editar Canal → Integrações), Slack (Apps → Incoming Webhooks), Teams (Connectors).")
+        row = 1
         ttk.Checkbutton(tab_wh, text="Ativar webhooks (Discord/Slack/Teams)", variable=self.var_wh_on)\
             .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
         ttk.Label(tab_wh, text="URLs (uma por linha):").grid(row=row, column=0, sticky="nw")
@@ -2670,10 +3147,12 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA 4: LIMPEZA DE LOGS ===
-        tab_logs = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_logs, text="Logs")
-        
-        row = 0
+        tab_logs = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_logs, text="📂  Logs")
+        self._add_tab_header(tab_logs, "Limpeza automática de logs",
+                             "Os logs ficam em %PROGRAMDATA%\\AgendadorBravo\\logs\\. Em produção com muitos jobs, é fácil acumular GBs. Aqui você define a retenção.")
+
+        row = 1
         ttk.Checkbutton(tab_logs, text="Ativar limpeza automática de logs", variable=self.var_cleanup_enabled)\
             .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
 
@@ -2704,24 +3183,28 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=0, sticky="w", pady=(8, 0))
 
         # === ABA: JANELAS DE MANUTENÇÃO (v2025.10.11.8) ===
-        tab_mw = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_mw, text="Janelas")
-        ttk.Label(tab_mw, text="Janelas em que NENHUM job será disparado:",
-                  font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        tab_mw = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_mw, text="🕓  Janelas")
+        self._add_tab_header(tab_mw, "Janelas de manutenção (blackout)",
+                             "Períodos em que NENHUM job dispara. Útil para reboot semanal do servidor, deploy do ERP, backup. Jobs marcados com 'respeitar janelas' são pulados.")
+        ttk.Label(tab_mw, text="Janelas configuradas:",
+                  font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
         self._mw_listbox = tk.Listbox(tab_mw, height=8, width=72, exportselection=False)
-        self._mw_listbox.grid(row=1, column=0, sticky="we")
+        self._mw_listbox.grid(row=2, column=0, sticky="we")
         self._mw_refresh_list()
-        mw_btns = ttk.Frame(tab_mw); mw_btns.grid(row=2, column=0, pady=(8, 0), sticky="w")
-        ttk.Button(mw_btns, text="Adicionar", command=self._mw_add).pack(side="left", padx=4)
-        ttk.Button(mw_btns, text="Editar", command=self._mw_edit).pack(side="left", padx=4)
-        ttk.Button(mw_btns, text="Remover", command=self._mw_remove).pack(side="left", padx=4)
-        ttk.Label(tab_mw, text="Ex.: 'Madrugada' 22:00→06:00 todos os dias.",
-                  foreground="#888").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        mw_btns = ttk.Frame(tab_mw); mw_btns.grid(row=3, column=0, pady=(8, 0), sticky="w")
+        ttk.Button(mw_btns, text="➕ Adicionar", command=self._mw_add).pack(side="left", padx=4)
+        ttk.Button(mw_btns, text="✏️ Editar", command=self._mw_edit).pack(side="left", padx=4)
+        ttk.Button(mw_btns, text="🗑️ Remover", command=self._mw_remove).pack(side="left", padx=4)
+        ttk.Label(tab_mw, text="Ex.: 'Madrugada' 22:00→06:00 todos os dias · 'Deploy ERP' 03:00→05:00 dom.",
+                  foreground="#888").grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         # === ABA: DIGEST DIÁRIO (v2025.10.11.8) ===
-        tab_dg = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_dg, text="Digest")
-        row = 0
+        tab_dg = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_dg, text="📊  Digest")
+        self._add_tab_header(tab_dg, "Digest diário",
+                             "Resumo automático no e-mail/webhook todo dia no horário escolhido: nº execuções, sucessos, falhas, taxa, top 5 lentos das últimas 24h.")
+        row = 1
         ttk.Checkbutton(tab_dg, text="Enviar digest diário por e-mail",
                         variable=self.var_dg_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
         ttk.Label(tab_dg, text="Horário (HH:MM):").grid(row=row, column=0, sticky="w", pady=(8, 0))
@@ -2744,9 +3227,11 @@ class SettingsDialog(tk.Toplevel):
                    command=self._test_digest).grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA: API REST (v2025.10.11.8) ===
-        tab_api = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_api, text="API REST")
-        row = 0
+        tab_api = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_api, text="🔌  API REST")
+        self._add_tab_header(tab_api, "API REST local (HTTP)",
+                             "Sobe um servidor leve no localhost para outros sistemas dispararem jobs via HTTP. Útil para integrar com webhooks de ERP/CRM. Token protege contra acesso indevido.")
+        row = 1
         ttk.Checkbutton(tab_api, text="Ativar servidor HTTP local",
                         variable=self.var_api_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
         ttk.Label(tab_api, text="Host:").grid(row=row, column=0, sticky="w", pady=(8, 0))
@@ -2765,10 +3250,12 @@ class SettingsDialog(tk.Toplevel):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         # === ABA 5: SISTEMA ===
-        tab_sistema = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_sistema, text="Sistema")
+        tab_sistema = ttk.Frame(notebook, padding=14)
+        notebook.add(tab_sistema, text="🛡️  Sistema")
+        self._add_tab_header(tab_sistema, "Sistema e segurança",
+                             "Atualizações, autostart com Windows, backup, rollback automático e info sobre criptografia DPAPI.")
 
-        row = 0
+        row = 1
         # Atualizações
         up_frame = ttk.LabelFrame(tab_sistema, text="Atualizações", padding=(8, 8))
         up_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 10)); row += 1
@@ -2998,6 +3485,21 @@ class SettingsDialog(tk.Toplevel):
             )
         except Exception as e:
             messagebox.showerror("Falha", f"Não foi possível abrir o teste do WhatsApp:\n{e}")
+
+    # v2025.10.11.9 — header descritivo no topo de cada aba -----------------
+    def _add_tab_header(self, tab, title, description):
+        """Cria um header com título + descrição no topo da aba (row 0)."""
+        header = ttk.Frame(tab)
+        header.grid(row=0, column=0, columnspan=4, sticky="we", pady=(0, 12))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text=title,
+                  font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=description,
+                  font=("Segoe UI", 9), foreground="#6b7280",
+                  wraplength=900, justify="left")\
+            .grid(row=1, column=0, sticky="we", pady=(2, 0))
+        ttk.Separator(header, orient="horizontal")\
+            .grid(row=2, column=0, sticky="we", pady=(8, 0))
 
     # v2025.10.11.8 — helpers das novas abas ---------------------------------
     def test_webhooks(self):
@@ -3871,6 +4373,30 @@ class App(tk.Tk):
         ttk.Button(btns_up, text="Mais tarde", command=lambda: self._update_banner.grid_remove())\
        .pack(side="left", padx=4)
 
+        # v2025.10.11.9 — Welcome banner (Row 1, mesmo lugar do update banner mas
+        # exibido só se ainda não dispensado e o setup está incompleto)
+        self._welcome_banner = tk.Frame(self, bg="#dbeafe", padx=12, pady=10)
+        # Ícone + texto
+        wb_left = tk.Frame(self._welcome_banner, bg="#dbeafe")
+        wb_left.pack(side="left", fill="x", expand=True)
+        tk.Label(wb_left, text="👋  Bem-vindo ao Agendador-Bravo!",
+                 bg="#dbeafe", fg="#1e40af",
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(wb_left,
+                 text="Comece criando seu primeiro job e configurando notificações.",
+                 bg="#dbeafe", fg="#1e40af",
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+        # Botões de ação
+        wb_right = tk.Frame(self._welcome_banner, bg="#dbeafe")
+        wb_right.pack(side="right")
+        ttk.Button(wb_right, text="📚 Abrir Ajuda",
+                   command=self.open_help_panel).pack(side="left", padx=4)
+        ttk.Button(wb_right, text="⚙️ Configurar agora",
+                   command=self.open_settings).pack(side="left", padx=4)
+        ttk.Button(wb_right, text="✕", width=3,
+                   command=self._dismiss_welcome).pack(side="left", padx=(8, 0))
+        # Inicialmente ocultado; mostrado em _maybe_show_welcome após startup
+
 
                 # --- Ícone da janela / barra de tarefas + logo no cabeçalho ---
                 # --- Ícone da janela / barra de tarefas + logo no cabeçalho (somente .ico) ---
@@ -3936,51 +4462,100 @@ class App(tk.Tk):
                                              "break"))
         
         bar = self._toolbar_inner
-        
-        # Botões principais com estilos modernos e espaçamento melhorado
-        ttk.Button(bar, text="➕ Nova", command=self.add_task, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="✏️ Editar", command=self.edit_task, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="🗑️ Remover", command=self.remove_task, style="Modern.TButton").pack(side="left", padx=3)
-        
-        # Separador visual
+
+        # v2025.10.11.9 — tooltips em todos os botões; helper local
+        def _tip(widget, text):
+            ToolTip(widget, text)
+            return widget
+
+        # ── Grupo 1: Criar/Editar jobs ─────────────────────────────────────
+        b = ttk.Button(bar, text="➕ Nova", command=self.add_task, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Criar um novo job manualmente (Ctrl+N).\nVocê define nome, arquivo, horário, tags e opções avançadas.")
+
+        b = ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Assistente guiado: escolha um arquivo (.ktr, .py, .bat, .exe) e o app sugere\nnome e comando automaticamente. Bom para começar rápido.")
+
+        b = ttk.Button(bar, text="✏️ Editar", command=self.edit_task, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Editar o job selecionado (Ctrl+E).\nSelecione uma linha na tabela antes.")
+
+        b = ttk.Button(bar, text="🗑️ Remover", command=self.remove_task, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Excluir o job selecionado (Del).\nO histórico de execuções é preservado.")
+
+        # ── Grupo 2: Estado ────────────────────────────────────────────────
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        
-        # Botão de ativar/desativar
+
         self.btn_toggle = ttk.Button(bar, text="⏸️ Desativar", command=self.toggle_task_status, style="Toggle.TButton")
         self.btn_toggle.pack(side="left", padx=3)
-        
-        # Botão de execução (destaque)
-        self.btn_run = ttk.Button(bar, text="▶ Executar agora", 
-                                 command=self.run_now, 
+        _tip(self.btn_toggle, "Pausa/retoma o job selecionado.\nJob pausado fica salvo mas não é disparado pelo scheduler.")
+
+        # ── Grupo 3: Execução ──────────────────────────────────────────────
+        self.btn_run = ttk.Button(bar, text="▶ Executar agora",
+                                 command=self.run_now,
                                  style="Accent.TButton")
         self.btn_run.pack(side="left", padx=(10, 3))
-        
-        # Dica de ferramenta para o botão de execução
-        ToolTip(self.btn_run, "Executa a tarefa selecionada. Selecione múltiplas tarefas para executá-las simultaneamente.")
-        
-        # Botão de interrupção
-        self.btn_stop = ttk.Button(bar, text="⏹️ Interromper", 
+        _tip(self.btn_run, "Roda o(s) job(s) selecionado(s) agora, ignorando o agendamento (Ctrl+R).\nSelecione múltiplos com Ctrl+Click para rodar em paralelo.")
+
+        self.btn_stop = ttk.Button(bar, text="⏹️ Interromper",
                                  command=self.stop_running_tasks,
                                  style="Danger.TButton")
         self.btn_stop.pack(side="left", padx=3)
-        self.btn_stop.config(state="disabled")  # Inicialmente desabilitado
-        
-        # Separador visual
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        
-        # Botões secundários
-        ttk.Button(bar, text="🧪 Simular erro", command=self.simulate_error, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton").pack(side="left", padx=3)
+        self.btn_stop.config(state="disabled")
+        _tip(self.btn_stop, "Mata o processo do(s) job(s) que está(ão) rodando agora (Esc).\nFica habilitado só quando há algo executando.")
 
-        # v2025.10.11.8 — Backup/Restore + YAML
+        # ── Grupo 4: Configuração/Logs/Ajuda ───────────────────────────────
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-        ttk.Button(bar, text="💾 Backup", command=self.action_backup, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="↩ Restaurar", command=self.action_restore, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="📤 Export YAML", command=self.action_export_yaml, style="Modern.TButton").pack(side="left", padx=3)
-        ttk.Button(bar, text="📥 Import YAML", command=self.action_import_yaml, style="Modern.TButton").pack(side="left", padx=3)
+
+        b = ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Abre o painel de configurações (Ctrl+,).\nE-mail, WhatsApp, webhooks, janelas de manutenção, API REST, etc.")
+
+        b = ttk.Button(bar, text="❓ Ajuda", command=self.open_help_panel, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Abre o painel de ajuda com tutoriais passo-a-passo (F1).\nComo criar jobs, configurar notificações, usar variáveis dinâmicas, etc.")
+
+        b = ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Abre a pasta de logs no Explorer.\nUm arquivo .log por execução, com saída completa do job.")
+
+        b = ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Abre o último log do job selecionado no editor de texto padrão.\nSelecione uma linha primeiro.")
+
+        # ── Grupo 5: Backup/Portabilidade (v.8) ────────────────────────────
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+
+        b = ttk.Button(bar, text="💾 Backup", command=self.action_backup, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Gera um .zip com config.json + logs + pids.\nÓtimo antes de fazer mudanças grandes ou migrar de máquina.")
+
+        b = ttk.Button(bar, text="↩ Restaurar", command=self.action_restore, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Restaura um backup .zip criado anteriormente.\nSobrescreve o config.json atual — faça backup antes!")
+
+        b = ttk.Button(bar, text="📤 Export YAML", command=self.action_export_yaml, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Exporta apenas os jobs em formato YAML.\nÚtil para versionar no Git ou copiar jobs entre máquinas.")
+
+        b = ttk.Button(bar, text="📥 Import YAML", command=self.action_import_yaml, style="Modern.TButton")
+        b.pack(side="left", padx=3)
+        _tip(b, "Importa jobs de um arquivo YAML/JSON.\nVocê escolhe entre mesclar (adicionar/substituir por nome) ou substituir tudo.")
+
+        # ── Atalhos de teclado (v2025.10.11.9) ────────────────────────────
+        self.bind("<Control-n>", lambda e: self.add_task())
+        self.bind("<Control-N>", lambda e: self.add_task())
+        self.bind("<Control-e>", lambda e: self.edit_task())
+        self.bind("<Control-E>", lambda e: self.edit_task())
+        self.bind("<Delete>", lambda e: self.remove_task() if self.tree.selection() else None)
+        self.bind("<Control-r>", lambda e: self.run_now())
+        self.bind("<Control-R>", lambda e: self.run_now())
+        self.bind("<Escape>", lambda e: self.stop_running_tasks() if str(self.btn_stop.cget("state")) == "normal" else None)
+        self.bind("<Control-comma>", lambda e: self.open_settings())
+        self.bind("<F1>", lambda e: self.open_help_panel())
+        self.bind("<F5>", lambda e: self.refresh_table())
 
 
         # --------- Layout principal ---------- Row 3 (principal, expansível)
@@ -4185,6 +4760,10 @@ class App(tk.Tk):
 
         # Prompt de autostart (somente na 1ª vez, e só em modo compilado)
         self.after(400, self._maybe_prompt_autostart)
+
+        # v2025.10.11.9 — Welcome banner se setup incompleto
+        self.after(600, self._maybe_show_welcome)
+        self.after(700, self._update_empty_state)
 
     def _maybe_prompt_autostart(self):
         """Se ainda não perguntamos e o app não está no autostart, pergunta ao usuário."""
@@ -5120,6 +5699,83 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export YAML", f"Falha:\n{e}")
 
+    # v2025.10.11.9 — Welcome banner + empty state ------------------------
+    def _dismiss_welcome(self):
+        try:
+            self._welcome_banner.grid_remove()
+            self.data.setdefault("settings", {})["welcome_dismissed"] = True
+            save_data(self.data)
+        except Exception:
+            pass
+
+    def _maybe_show_welcome(self):
+        """Mostra o welcome banner se setup ainda está incompleto e não foi dispensado."""
+        try:
+            settings = self.data.get("settings", {})
+            if settings.get("welcome_dismissed"):
+                return
+            has_tasks = bool(self.data.get("tasks"))
+            has_email = bool(settings.get("email", {}).get("enabled"))
+            has_wa = bool(settings.get("whatsapp", {}).get("enabled"))
+            has_wh = bool(settings.get("webhooks", {}).get("enabled"))
+            # Mostra se não tem nenhum job OU se não tem notificação configurada
+            should_show = (not has_tasks) or not (has_email or has_wa or has_wh)
+            if should_show:
+                self._welcome_banner.grid(row=1, column=0, sticky="ew")
+                self._welcome_banner.lift()
+        except Exception:
+            pass
+
+    def _update_empty_state(self):
+        """Mostra label sobrepondo a tabela quando 0 jobs."""
+        try:
+            has_tasks = bool(self.data.get("tasks"))
+            if has_tasks:
+                # esconde
+                if getattr(self, "_empty_state_lbl", None):
+                    try:
+                        self._empty_state_lbl.place_forget()
+                    except Exception:
+                        pass
+                return
+            # mostra (cria se não existir)
+            if not getattr(self, "_empty_state_lbl", None):
+                parent = self.tree.master  # left frame
+                lbl = tk.Frame(parent, bg="#f9fafb")
+                tk.Label(lbl, text="📋",
+                         bg="#f9fafb", fg="#9ca3af",
+                         font=("Segoe UI Emoji", 48)).pack(pady=(40, 8))
+                tk.Label(lbl, text="Nenhum job ainda",
+                         bg="#f9fafb", fg="#374151",
+                         font=("Segoe UI", 14, "bold")).pack()
+                tk.Label(lbl, text="Crie seu primeiro job para começar.",
+                         bg="#f9fafb", fg="#6b7280",
+                         font=("Segoe UI", 10)).pack(pady=(4, 16))
+                btns = tk.Frame(lbl, bg="#f9fafb")
+                btns.pack()
+                ttk.Button(btns, text="🧙 Abrir Assistente",
+                           command=self.open_assistant).pack(side="left", padx=4)
+                ttk.Button(btns, text="➕ Criar do zero",
+                           command=self.add_task).pack(side="left", padx=4)
+                ttk.Button(btns, text="📚 Ver tutorial",
+                           command=self.open_help_panel).pack(side="left", padx=4)
+                self._empty_state_lbl = lbl
+            self._empty_state_lbl.place(relx=0.5, rely=0.5, anchor="center")
+        except Exception as e:
+            print(f"[empty_state] {e}")
+
+    # v2025.10.11.9 — Painel de Ajuda --------------------------------------
+    def open_help_panel(self):
+        """Abre (ou foca) o painel de Ajuda."""
+        try:
+            if getattr(self, "_help_window", None) and self._help_window.winfo_exists():
+                self._help_window.lift()
+                self._help_window.focus_force()
+                return
+        except Exception:
+            pass
+        self._help_window = HelpPanel(self)
+
     def action_import_yaml(self):
         try:
             src = filedialog.askopenfilename(
@@ -5751,7 +6407,13 @@ class App(tk.Tk):
         # Aplica as cores de status após inserir todos os itens
         for task in self.data.get("tasks", []):
             self._update_task_status_color(task["name"])
-        
+
+        # v2025.10.11.9 — empty state quando 0 jobs
+        try:
+            self._update_empty_state()
+        except Exception:
+            pass
+
         # Ajusta o tamanho das colunas
         self._resize_columns()
         
