@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.13"   # << aumente em cada build
+APP_VERSION = "2025.10.11.14"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -507,6 +507,96 @@ On Error Goto 0
     return vbs_path
 
 
+def _apply_folder_update_and_restart(new_folder: Path, sha256_hex: str = ""):
+    """v2025.10.11.14 — Updater FOLDER-based (modo --onedir).
+
+    Mais robusto que o updater legado de .exe único:
+    - Não depende de extração runtime do _MEI (que conflita com AV).
+    - Usa robocopy /MIR para mirror da pasta — robocopy lida bem com
+      arquivos em uso, faz retries internamente e suporta paths longos.
+    - Mata o app atual, espera 2s, faz o mirror, lança o novo exe.
+
+    A "atomicidade" não é perfeita (alguns arquivos podem ficar mistos
+    durante o copy), mas robocopy minimiza isso e o backup .bak é mantido
+    pra rollback automático em caso de falha.
+    """
+    install_dir = _exe_path().parent  # onde o app está instalado
+    exe_name = _exe_path().name
+    log_path = Path(tempfile.gettempdir()) / f"agendador_update_{os.getpid()}.log"
+
+    # Script CMD que faz o trabalho. Roda invisível via wscript launcher.
+    # /MIR mirror, /R:30 30 retries por arquivo, /W:1 1s entre retries,
+    # /NJH /NJS sem header/summary, /NP sem progresso.
+    cmd_path = Path(tempfile.gettempdir()) / f"agendador_update_{os.getpid()}.cmd"
+    cmd_content = f"""@echo off
+chcp 65001 > nul
+echo [%date% %time%] === update folder-based start === >> "{log_path}"
+echo [src] {new_folder} >> "{log_path}"
+echo [dst] {install_dir} >> "{log_path}"
+
+rem 1) Kill app
+taskkill /F /T /IM "{exe_name}" >> "{log_path}" 2>&1
+ping 127.0.0.1 -n 3 > nul
+
+rem 2) Robocopy mirror (resiliente a arquivos travados)
+robocopy "{new_folder}" "{install_dir}" /MIR /R:30 /W:1 /NJH /NJS /NDL /NP /XD logs pids wa_data rt >> "{log_path}" 2>&1
+set ROBO_RC=%ERRORLEVEL%
+echo [robocopy exitcode] %ROBO_RC% >> "{log_path}"
+
+rem Robocopy considera 0-7 sucesso, >=8 falha
+if %ROBO_RC% LSS 8 (
+  echo [ok] copy succeeded >> "{log_path}"
+  rem 3) Launch new app
+  start "" "{install_dir}\\{exe_name}"
+  echo [launched] new exe >> "{log_path}"
+) else (
+  echo [FAIL] robocopy failed; old install preserved >> "{log_path}"
+  msg * "Falha na atualizacao automatica. Veja {log_path}. Abra Releases pra baixar o instalador manualmente."
+)
+
+rem 4) Cleanup
+rmdir /s /q "{new_folder}" 2>nul
+del /q "{cmd_path}" 2>nul
+"""
+    cmd_path.write_text(cmd_content, encoding="utf-8")
+
+    # Verifica permissão. Se não pode escrever no install_dir, vai pedir UAC.
+    needs_elevation = (os.name == "nt") and not _can_write_to_dir(install_dir)
+
+    try:
+        if needs_elevation:
+            import ctypes
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "cmd.exe", f'/c "{cmd_path}"', None, 0
+            )
+            if int(rc) <= 32:
+                print(f"[update] ShellExecute runas falhou (rc={rc}); tentando sem elevação")
+                CREATE_NO_WINDOW = 0x08000000
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0
+                subprocess.Popen(["cmd.exe", "/c", str(cmd_path)],
+                                 creationflags=CREATE_NO_WINDOW,
+                                 startupinfo=si, close_fds=True)
+        else:
+            CREATE_NO_WINDOW = 0x08000000
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0
+            subprocess.Popen(["cmd.exe", "/c", str(cmd_path)],
+                             creationflags=CREATE_NO_WINDOW,
+                             startupinfo=si, close_fds=True)
+    except Exception as e:
+        print(f"[update] falha ao disparar updater folder-based: {e}")
+
+    # Encerra o app pra liberar handles
+    try:
+        import ctypes
+        ctypes.windll.kernel32.ExitProcess(0)
+    except Exception:
+        os._exit(0)
+
+
 def _apply_update_and_restart(new_exe: Path, sha256_hex: str = ""):
     """Dispara o updater invisível e encerra o processo atual.
 
@@ -617,13 +707,16 @@ def fetch_update_info() -> tuple[bool, dict | str]:
             return (False, "Manifesto sem 'version'.")
         if _ver_tuple(remote_v) <= _ver_tuple(APP_VERSION):
             return (False, "Já está na última versão.")
+        # v2025.10.11.14 — suporta tanto exe_url (legado --onefile) quanto
+        # zip_url (novo --onedir). zip_url tem prioridade quando ambos existem.
         info = {
-        "version": remote_v,
-        "exe_url": mf.get("exe_url") or mf.get("url") or "",
-        "sha256": (mf.get("sha256") or "").lower(),
+            "version": remote_v,
+            "exe_url": mf.get("exe_url") or mf.get("url") or "",
+            "zip_url": mf.get("zip_url") or "",
+            "sha256":  (mf.get("sha256") or "").lower(),
         }
-        if not info["exe_url"]:
-         return (False, "Manifesto sem 'exe_url'.")
+        if not info["exe_url"] and not info["zip_url"]:
+            return (False, "Manifesto sem 'exe_url' nem 'zip_url'.")
 
         return (True, info)
     except Exception as e:
@@ -631,21 +724,54 @@ def fetch_update_info() -> tuple[bool, dict | str]:
 
 
 def apply_update_now(info: dict) -> tuple[bool, str]:
-    """
-    Baixa e troca o EXE. Em modo dev (não frozen), só informa.
+    """v2025.10.11.14 — Baixa e aplica update.
+
+    Detecta automaticamente o formato:
+    - zip_url presente → update FOLDER-based (descompacta o ZIP, swap da pasta)
+    - exe_url presente → update LEGACY (troca o .exe único — pode falhar com
+                          AV bloqueando python313.dll)
     """
     if not _is_frozen():
         return (False, f"Nova versão {info.get('version')} disponível (modo dev: não aplica).")
+    sha_expected = (info.get("sha256") or "").lower()
+
+    # === Caminho NOVO: ZIP-based (onedir) ===
+    if info.get("zip_url"):
+        try:
+            tmp_zip = Path(tempfile.gettempdir()) / f"{APP_BASENAME}.new.zip"
+            _download(info["zip_url"], tmp_zip)
+            if sha_expected:
+                got = _sha256(tmp_zip).lower()
+                if got != sha_expected:
+                    tmp_zip.unlink(missing_ok=True)
+                    return (False, f"SHA256 divergente (esperado {sha_expected}, obtido {got}).")
+            # Extrai o ZIP para temp/AgendadorBravo_new/
+            extract_dir = Path(tempfile.gettempdir()) / f"{APP_BASENAME}_new"
+            if extract_dir.exists():
+                import shutil as _sh
+                _sh.rmtree(extract_dir, ignore_errors=True)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(tmp_zip, "r") as zf:
+                zf.extractall(extract_dir)
+            # O ZIP contém uma pasta AgendadorBravo/... — pegamos esse caminho
+            roots = [p for p in extract_dir.iterdir() if p.is_dir()]
+            if not roots:
+                return (False, "ZIP não tem a pasta esperada.")
+            new_folder = roots[0]
+            _apply_folder_update_and_restart(new_folder, sha_expected)
+            return (True, f"Atualizando para {info.get('version')} (folder-based)...")
+        except Exception as e:
+            return (False, f"Falha ao aplicar (ZIP): {e}")
+
+    # === Caminho LEGADO: troca de .exe único ===
     try:
         tmp_new = Path(tempfile.gettempdir()) / f"{APP_BASENAME}.new.exe"
         _download(info["exe_url"], tmp_new)
-        sha_expected = (info.get("sha256") or "").lower()
         if sha_expected:
             got = _sha256(tmp_new).lower()
             if got != sha_expected:
                 tmp_new.unlink(missing_ok=True)
                 return (False, f"SHA256 divergente (esperado {sha_expected}, obtido {got}).")
-        # agenda troca e reinicia
         _apply_update_and_restart(tmp_new, sha_expected)
         return (True, f"Atualizando para {info.get('version')}...")
     except Exception as e:

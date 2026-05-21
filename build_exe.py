@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # ── versão sincronizada com agendador.py ─────────────────────────────────────
-APP_VERSION = "2025.10.11.13"
+APP_VERSION = "2025.10.11.14"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -42,8 +42,17 @@ def install_pyinstaller():
 
 
 def create_executable():
-    """Cria o executável onefile."""
-    print("[BUILD] Criando executável (onefile)...")
+    """v2025.10.11.14 — Cria a aplicação em modo ONEDIR (pasta com .exe + DLLs).
+
+    Por que mudamos de --onefile pra --onedir:
+    - O bug 'Failed to load python313.dll' acontecia porque --onefile extraía
+      todos os DLLs num _MEI temporário a cada execução. O antivírus (Defender)
+      bloqueava ou removia DLLs durante a extração → LoadLibrary falhava.
+    - Com --onedir, todos os arquivos ficam no disco desde o install. O AV
+      escaneia UMA vez (no install), e o app abre direto sem extração.
+    - Boot time fica mais rápido (sem extrair 25 MB de DLLs a cada run).
+    """
+    print("[BUILD] Criando aplicacao em modo ONEDIR (pasta com .exe + DLLs)...")
 
     current_dir = Path(__file__).parent
     main_script = current_dir / "agendador.py"
@@ -56,13 +65,11 @@ def create_executable():
         print(f"[ERRO] Ícone não encontrado: {icon_file}")
         return False
 
-    # Garante que o build dir exista antes do PyInstaller (evita race no zip)
-    (current_dir / "build" / "AgendadorBravo").mkdir(parents=True, exist_ok=True)
-
     cmd = [
         sys.executable, "-m", "PyInstaller",
-        "--onefile",
+        "--onedir",                    # << pasta com tudo (não mais .exe único)
         "--windowed",
+        "--noupx",                     # << evita UPX (AV trata UPX como suspeito)
         f"--icon={icon_file}",
         "--name=AgendadorBravo",
         "--add-data=Logo.ico;.",
@@ -74,15 +81,12 @@ def create_executable():
         "--hidden-import=apscheduler.triggers.date",
         "--hidden-import=apscheduler.triggers.cron",
         "--hidden-import=requests",
-        # v2025.10.11.8 — novas deps
         "--hidden-import=yaml",
         "--hidden-import=win32crypt",
         "--hidden-import=pywintypes",
         "--hidden-import=http.server",
         "--hidden-import=socketserver",
         "--hidden-import=urllib.parse",
-        # Extrai sempre para path estável em user-space (evita %TEMP%\2\ admin)
-        "--runtime-tmpdir=%LOCALAPPDATA%\\AgendadorBravo\\rt",
         str(main_script),
     ]
 
@@ -95,13 +99,41 @@ def create_executable():
         print(result.stderr[-3000:])
         return False
 
-    exe_path = current_dir / "dist" / "AgendadorBravo.exe"
-    if not exe_path.exists():
-        print("[ERRO] Executável não encontrado após build")
+    # Em modo onedir, o resultado é uma PASTA dist/AgendadorBravo/ contendo
+    # AgendadorBravo.exe + _internal/ com todos os DLLs e libs.
+    onedir_path = current_dir / "dist" / "AgendadorBravo"
+    exe_inside = onedir_path / "AgendadorBravo.exe"
+    if not onedir_path.exists() or not exe_inside.exists():
+        print("[ERRO] Pasta onedir não criada conforme esperado")
         return False
 
-    size_mb = exe_path.stat().st_size / (1024 * 1024)
-    print(f"[OK] Executável criado: {exe_path}  ({size_mb:.1f} MB)")
+    # Conta tamanho total da pasta
+    total_size = sum(p.stat().st_size for p in onedir_path.rglob("*") if p.is_file())
+    file_count = sum(1 for p in onedir_path.rglob("*") if p.is_file())
+    print(f"[OK] Build onedir: {onedir_path}")
+    print(f"     {file_count} arquivos, {total_size / 1024 / 1024:.1f} MB total")
+    return True
+
+
+def create_distribution_zip():
+    """v2025.10.11.14 — Gera ZIP da pasta onedir pra auto-update."""
+    import zipfile
+    current_dir = Path(__file__).parent
+    onedir = current_dir / "dist" / "AgendadorBravo"
+    if not onedir.exists():
+        print("[ERRO] dist/AgendadorBravo nao existe; rode o build primeiro")
+        return False
+    zip_path = current_dir / "dist" / f"AgendadorBravo-{APP_VERSION}.zip"
+    print(f"[ZIP] Empacotando {onedir} -> {zip_path.name}...")
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for p in onedir.rglob("*"):
+            if p.is_file():
+                # arcname mantém estrutura AgendadorBravo/...
+                zf.write(p, arcname=str(p.relative_to(onedir.parent)))
+    size_mb = zip_path.stat().st_size / (1024 * 1024)
+    print(f"[OK] ZIP criado: {zip_path}  ({size_mb:.1f} MB)")
     return True
 
 
@@ -198,8 +230,8 @@ def main():
     print(f"[>>] Agendador-Bravo v{APP_VERSION} — Build")
     print("=" * 55)
 
-    exe_path = Path(__file__).parent / "dist" / "AgendadorBravo.exe"
-    skip_build = args.installer_only and exe_path.exists()
+    onedir_path = Path(__file__).parent / "dist" / "AgendadorBravo"
+    skip_build = args.installer_only and (onedir_path / "AgendadorBravo.exe").exists()
 
     if not skip_build:
         if not check_pyinstaller():
@@ -213,8 +245,11 @@ def main():
         if not ok:
             print("\n[ERRO] Falha na criacao do executavel")
             sys.exit(1)
+
+        # v2025.10.11.14 — Gera ZIP do onedir pra auto-update
+        create_distribution_zip()
     else:
-        print(f"[OK] Reutilizando exe existente: {exe_path}")
+        print(f"[OK] Reutilizando onedir existente: {onedir_path}")
 
     if args.installer or args.installer_only:
         print()
@@ -225,9 +260,10 @@ def main():
             sys.exit(2)
 
     print(f"\n[CONCLUIDO] Build concluido!")
-    print(f"   Executavel : dist/AgendadorBravo.exe")
+    print(f"   App (onedir) : dist/AgendadorBravo/")
+    print(f"   ZIP update   : dist/AgendadorBravo-{APP_VERSION}.zip")
     if args.installer or args.installer_only:
-        print(f"   Instalador : dist/AgendadorBravo-Setup-{APP_VERSION}.exe")
+        print(f"   Instalador   : dist/AgendadorBravo-Setup-{APP_VERSION}.exe")
 
 
 if __name__ == "__main__":

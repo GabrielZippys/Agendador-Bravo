@@ -11,11 +11,12 @@
 ; =============================================================================
 
 #define MyAppName      "AgendadorBravo"
-#define MyAppVersion   "2025.10.11.13"
+#define MyAppVersion   "2025.10.11.14"
 #define MyAppPublisher "Bravo Logística"
 #define MyAppExeName   "AgendadorBravo.exe"
 #define MyAppURL       "https://github.com/GabrielZippys/Agendador-Bravo"
-#define MySrcExe       "dist\AgendadorBravo.exe"
+; v2025.10.11.14 — agora apontamos para a PASTA onedir, não para um único exe
+#define MySrcDir       "dist\AgendadorBravo"
 
 ; ---------------------------------------------------------------------------
 [Setup]
@@ -85,9 +86,12 @@ Name: "autostart";    Description: "Iniciar &automaticamente com o Windows"; \
 
 ; ---------------------------------------------------------------------------
 [Files]
-; Executável principal (onefile — inclui toda a runtime Python embutida)
-Source: "{#MySrcExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; \
-        Flags: ignoreversion
+; v2025.10.11.14 — Modo ONEDIR: instala a PASTA inteira do build
+; (AgendadorBravo.exe + _internal/ com todos os DLLs e libs).
+; Resolve definitivamente o erro 'Failed to load python313.dll' que ocorria
+; com --onefile (extração em runtime conflitava com antivírus).
+Source: "{#MySrcDir}\*"; DestDir: "{app}"; \
+        Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Ícone (para atalhos e painel de controle)
 Source: "Logo.ico"; DestDir: "{app}"; Flags: ignoreversion
@@ -102,7 +106,8 @@ Name: "{commonappdata}\AgendadorBravo";           Permissions: users-full
 Name: "{commonappdata}\AgendadorBravo\logs";      Permissions: users-full
 Name: "{commonappdata}\AgendadorBravo\wa_data";   Permissions: users-full
 
-; Pasta de extração PyInstaller estável (evita %TEMP%\2\ em contexto admin)
+; v2025.10.11.14: a pasta 'rt' nao e mais necessaria (modo onedir nao extrai),
+; mas mantemos pra limpar instalacoes antigas/orfas.
 Name: "{localappdata}\AgendadorBravo\rt";         Permissions: users-full
 
 ; ---------------------------------------------------------------------------
