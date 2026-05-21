@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.11"   # << aumente em cada build
+APP_VERSION = "2025.10.11.12"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -2031,14 +2031,18 @@ class TaskDialog(tk.Toplevel):
         self.days_vars = [tk.BooleanVar(value=days[i]) for i in range(7)]
 
         # ---------- Layout ----------
-        frm = ttk.Frame(self, padding=10)
+        # v2025.10.11.12 — mais padding interno
+        frm = ttk.Frame(self, padding=18)
         frm.grid(sticky="nsew")
         frm.columnconfigure(1, weight=1)
 
+        # default pad entre linhas
+        rowpad = {"pady": 4}
+
         row = 0
-        ttk.Label(frm, text="Nome:").grid(row=row, column=0, sticky="w")
+        ttk.Label(frm, text="Nome:").grid(row=row, column=0, sticky="w", **rowpad)
         ttk.Entry(frm, textvariable=self.var_name, width=42)\
-            .grid(row=row, column=1, columnspan=3, sticky="we")
+            .grid(row=row, column=1, columnspan=3, sticky="we", **rowpad)
         row += 1
 
         ttk.Label(frm, text="Arquivo/Comando:").grid(row=row, column=0, sticky="w")
@@ -3136,16 +3140,29 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Configurações")
         self.resizable(True, True)
-        self.geometry("1120x720")  # v2025.10.11.11 — mais largo + mais respiro
-        self.minsize(900, 600)
+        self.geometry("1180x740")  # v2025.10.11.12 — sidebar à esquerda, content respirado
+        self.minsize(960, 620)
         self.result = None
 
-        # v2025.10.11.11 — reduz padding dos tabs para caberem sem truncar
+        # v2025.10.11.12 — Estilo de Notebook tipo SIDEBAR (tabs à esquerda).
+        # Cada tab vira uma linha vertical longa, sem chance de truncar.
         try:
             style = ttk.Style(self)
-            style.configure("TNotebook.Tab", padding=[10, 6])
-            style.configure("TNotebook", tabmargins=[4, 6, 4, 0])
-            style.configure("TLabelframe", padding=10)
+            # cria estilo derivado para não afetar outros notebooks
+            style.configure("Sidebar.TNotebook",
+                            tabposition="wn",        # West-North (esquerda)
+                            background="#f3f4f6",
+                            borderwidth=0,
+                            padding=0)
+            style.configure("Sidebar.TNotebook.Tab",
+                            padding=[18, 12],
+                            font=("Segoe UI", 10),
+                            width=20)                # largura mínima do tab
+            style.map("Sidebar.TNotebook.Tab",
+                      background=[("selected", "#ffffff"), ("!selected", "#f3f4f6")],
+                      foreground=[("selected", "#1f2937"), ("!selected", "#374151")])
+            style.configure("TLabelframe", padding=12)
+            style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         except Exception:
             pass
 
@@ -3217,14 +3234,14 @@ class SettingsDialog(tk.Toplevel):
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(0, weight=1)
 
-        # Notebook para abas
-        notebook = ttk.Notebook(main_frame)
+        # Notebook com tabs verticais à esquerda (sidebar)
+        notebook = ttk.Notebook(main_frame, style="Sidebar.TNotebook")
         notebook.grid(row=0, column=0, sticky="nsew", pady=(0, 10))
 
         # === ABA 1: GERAL ===
-        tab_geral = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_geral, text="⚙️  Geral")
-        self._add_tab_header(tab_geral, "Configurações gerais",
+        tab_geral = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_geral, text="  Geral  ")
+        self._add_tab_header(tab_geral, "⚙️  Configurações gerais",
                              "Caminhos do Pentaho Data Integration usado para executar os arquivos `.ktr` / `.kjb`.")
 
         row = 1
@@ -3235,9 +3252,9 @@ class SettingsDialog(tk.Toplevel):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # === ABA 2: E-MAIL ===
-        tab_email = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_email, text="✉️  E-mail")
-        self._add_tab_header(tab_email, "Notificações por e-mail (SMTP)",
+        tab_email = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_email, text="  E-mail  ")
+        self._add_tab_header(tab_email, "✉️  Notificações por e-mail (SMTP)",
                              "Envia avisos quando um job falha. Para Gmail, gere uma 'Senha de app' em myaccount.google.com → Segurança.")
         
         row = 1
@@ -3260,9 +3277,9 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA 3: WHATSAPP ===
-        tab_wa = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_wa, text="💬  WhatsApp")
-        self._add_tab_header(tab_wa, "Notificações por WhatsApp (whatsapp-web.js)",
+        tab_wa = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_wa, text="  WhatsApp  ")
+        self._add_tab_header(tab_wa, "💬  Notificações por WhatsApp (whatsapp-web.js)",
                              "Envia avisos via WhatsApp Web (precisa do Node.js + ler QR Code uma vez). Para uso intenso, prefira Webhooks ou Twilio.")
         
         row = 1
@@ -3291,9 +3308,9 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA: WEBHOOKS (v2025.10.11.8) ===
-        tab_wh = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_wh, text="🪝  Webhooks")
-        self._add_tab_header(tab_wh, "Webhooks Discord / Slack / Teams",
+        tab_wh = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_wh, text="  Webhooks  ")
+        self._add_tab_header(tab_wh, "🪝  Webhooks Discord / Slack / Teams",
                              "Cole o URL do webhook nos canais e o app já detecta o tipo. Crie em: Discord (Editar Canal → Integrações), Slack (Apps → Incoming Webhooks), Teams (Connectors).")
         row = 1
         ttk.Checkbutton(tab_wh, text="Ativar webhooks (Discord/Slack/Teams)", variable=self.var_wh_on)\
@@ -3314,9 +3331,9 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA 4: LIMPEZA DE LOGS ===
-        tab_logs = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_logs, text="📂  Logs")
-        self._add_tab_header(tab_logs, "Limpeza automática de logs",
+        tab_logs = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_logs, text="  Logs  ")
+        self._add_tab_header(tab_logs, "📂  Limpeza automática de logs",
                              "Os logs ficam em %PROGRAMDATA%\\AgendadorBravo\\logs\\. Em produção com muitos jobs, é fácil acumular GBs. Aqui você define a retenção.")
 
         row = 1
@@ -3346,13 +3363,29 @@ class SettingsDialog(tk.Toplevel):
         day_combo["values"] = ("0 - Segunda", "1 - Terça", "2 - Quarta", "3 - Quinta", "4 - Sexta", "5 - Sábado", "6 - Domingo")
         day_combo.grid(row=0, column=1, padx=(5, 0), sticky="w")
 
-        ttk.Button(tab_logs, text="Limpar logs agora", command=self.cleanup_logs_now)\
+        ttk.Button(tab_logs, text="🧹 Limpar logs agora", command=self.cleanup_logs_now)\
             .grid(row=row, column=0, sticky="w", pady=(8, 0))
+        row += 1
+
+        # v2025.10.11.12 — Painel de status: o que existe HOJE
+        status_frame = ttk.LabelFrame(tab_logs, text="📊 Status atual da pasta de logs", padding=12)
+        status_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(20, 0))
+        status_frame.columnconfigure(1, weight=1)
+        self._logs_status_lbl = ttk.Label(status_frame,
+                                          text="Calculando…",
+                                          font=("Segoe UI", 10),
+                                          foreground="#374151",
+                                          justify="left")
+        self._logs_status_lbl.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Button(status_frame, text="🔄 Atualizar",
+                   command=self._refresh_logs_status).grid(row=0, column=2, sticky="e")
+        # popula na primeira vez
+        self.after(150, self._refresh_logs_status)
 
         # === ABA: JANELAS DE MANUTENÇÃO (v2025.10.11.8) ===
-        tab_mw = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_mw, text="🕓  Janelas")
-        self._add_tab_header(tab_mw, "Janelas de manutenção (blackout)",
+        tab_mw = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_mw, text="  Janelas  ")
+        self._add_tab_header(tab_mw, "🕓  Janelas de manutenção (blackout)",
                              "Períodos em que NENHUM job dispara. Útil para reboot semanal do servidor, deploy do ERP, backup. Jobs marcados com 'respeitar janelas' são pulados.")
         ttk.Label(tab_mw, text="Janelas configuradas:",
                   font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
@@ -3367,9 +3400,9 @@ class SettingsDialog(tk.Toplevel):
                   foreground="#888").grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         # === ABA: DIGEST DIÁRIO (v2025.10.11.8) ===
-        tab_dg = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_dg, text="📊  Digest")
-        self._add_tab_header(tab_dg, "Digest diário",
+        tab_dg = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_dg, text="  Digest  ")
+        self._add_tab_header(tab_dg, "📊  Digest diário",
                              "Resumo automático no e-mail/webhook todo dia no horário escolhido: nº execuções, sucessos, falhas, taxa, top 5 lentos das últimas 24h.")
         row = 1
         ttk.Checkbutton(tab_dg, text="Enviar digest diário por e-mail",
@@ -3394,9 +3427,9 @@ class SettingsDialog(tk.Toplevel):
                    command=self._test_digest).grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA: API REST (v2025.10.11.8) ===
-        tab_api = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_api, text="🔌  API REST")
-        self._add_tab_header(tab_api, "API REST local (HTTP)",
+        tab_api = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_api, text="  API REST  ")
+        self._add_tab_header(tab_api, "🔌  API REST local (HTTP)",
                              "Sobe um servidor leve no localhost para outros sistemas dispararem jobs via HTTP. Útil para integrar com webhooks de ERP/CRM. Token protege contra acesso indevido.")
         row = 1
         ttk.Checkbutton(tab_api, text="Ativar servidor HTTP local",
@@ -3417,9 +3450,9 @@ class SettingsDialog(tk.Toplevel):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         # === ABA 5: SISTEMA ===
-        tab_sistema = ttk.Frame(notebook, padding=14)
-        notebook.add(tab_sistema, text="🛡️  Sistema")
-        self._add_tab_header(tab_sistema, "Sistema e segurança",
+        tab_sistema = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_sistema, text="  Sistema  ")
+        self._add_tab_header(tab_sistema, "🛡️  Sistema e segurança",
                              "Atualizações, autostart com Windows, backup, rollback automático e info sobre criptografia DPAPI.")
 
         row = 1
@@ -3781,33 +3814,113 @@ class SettingsDialog(tk.Toplevel):
             messagebox.showerror("Digest", f"Falha:\n{e}")
 
     def cleanup_logs_now(self):
-        """Executa limpeza de logs imediatamente."""
+        """v2025.10.11.12 — Limpeza com preview + confirmação + feedback real."""
         try:
-            # Cria configuração temporária baseada nos valores atuais da tela
-            temp_settings = {
-                "log_cleanup": {
-                    "enabled": self.var_cleanup_enabled.get(),
-                    "keep_days": int(self.var_cleanup_days.get() or 7)
-                }
-            }
-            
-            # Conta logs antes da limpeza
-            log_count_before = len(list(LOG_DIR.glob("*.log"))) if LOG_DIR.exists() else 0
-            
-            # Executa limpeza
-            cleanup_logs(temp_settings)
-            
-            # Conta logs após a limpeza
-            log_count_after = len(list(LOG_DIR.glob("*.log"))) if LOG_DIR.exists() else 0
-            removed = log_count_before - log_count_after
-            
-            if removed > 0:
-                messagebox.showinfo("Limpeza de logs", f"Limpeza concluída!\n{removed} arquivo(s) de log removido(s).")
-            else:
-                messagebox.showinfo("Limpeza de logs", "Nenhum arquivo de log antigo encontrado para remoção.")
-                
+            try:
+                keep_days = int(self.var_cleanup_days.get() or 7)
+            except Exception:
+                keep_days = 7
+
+            if not LOG_DIR.exists():
+                messagebox.showinfo("Limpeza de logs",
+                                    "A pasta de logs ainda não existe.\nNada para limpar.",
+                                    parent=self)
+                return
+
+            # Preview: o que será deletado
+            from datetime import timedelta as _td
+            cutoff = datetime.now() - _td(days=keep_days)
+            all_logs = list(LOG_DIR.glob("*.log"))
+            to_remove = [p for p in all_logs
+                         if datetime.fromtimestamp(p.stat().st_mtime) < cutoff]
+
+            if not to_remove:
+                messagebox.showinfo("Limpeza de logs",
+                                    f"Nenhum log mais velho que {keep_days} dias encontrado.\n"
+                                    f"Total de arquivos na pasta: {len(all_logs)}",
+                                    parent=self)
+                self._refresh_logs_status()
+                return
+
+            total_bytes = sum(p.stat().st_size for p in to_remove)
+            mb = total_bytes / (1024 * 1024)
+
+            if not messagebox.askyesno(
+                "Confirmar limpeza",
+                f"Encontrei {len(to_remove)} arquivos antigos (>{keep_days} dias).\n"
+                f"Total: {mb:.2f} MB.\n\n"
+                f"Deseja remover?",
+                parent=self):
+                return
+
+            # Executa de fato — usamos os arquivos do preview
+            actually_removed = 0
+            errors = []
+            for p in to_remove:
+                try:
+                    p.unlink()
+                    actually_removed += 1
+                except Exception as e:
+                    errors.append(f"{p.name}: {e}")
+            log_count_after = len(list(LOG_DIR.glob("*.log")))
+            msg = (f"{actually_removed} arquivo(s) removido(s).\n"
+                   f"Espaço liberado: ~{mb:.2f} MB.\n"
+                   f"Restam: {log_count_after} arquivos.")
+            if errors:
+                msg += f"\n\n⚠️ {len(errors)} erro(s):\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    msg += f"\n... e mais {len(errors)-5}"
+            messagebox.showinfo("Limpeza concluída", msg, parent=self)
+            self._refresh_logs_status()
         except Exception as e:
-            messagebox.showerror("Erro", f"Erro ao executar limpeza de logs:\n{e}")
+            messagebox.showerror("Erro", f"Erro ao executar limpeza de logs:\n{e}",
+                                 parent=self)
+
+    def _refresh_logs_status(self):
+        """v2025.10.11.12 — Mostra estado atual da pasta de logs."""
+        try:
+            if not LOG_DIR.exists():
+                self._logs_status_lbl.config(text="A pasta de logs ainda não foi criada.")
+                return
+            files = list(LOG_DIR.glob("*.log"))
+            n = len(files)
+            if n == 0:
+                self._logs_status_lbl.config(text="Pasta vazia. Nenhum log gerado ainda.")
+                return
+            total_bytes = sum(p.stat().st_size for p in files)
+            mb = total_bytes / (1024 * 1024)
+            # mais antigo
+            oldest = min(files, key=lambda p: p.stat().st_mtime)
+            oldest_dt = datetime.fromtimestamp(oldest.stat().st_mtime)
+            age_days = (datetime.now() - oldest_dt).days
+
+            try:
+                keep_days = int(self.var_cleanup_days.get() or 7)
+            except Exception:
+                keep_days = 7
+            from datetime import timedelta as _td
+            cutoff = datetime.now() - _td(days=keep_days)
+            to_remove = [p for p in files if datetime.fromtimestamp(p.stat().st_mtime) < cutoff]
+            to_remove_mb = sum(p.stat().st_size for p in to_remove) / (1024 * 1024)
+
+            # Próxima limpeza agendada
+            try:
+                day_name = ["Segunda","Terça","Quarta","Quinta","Sexta","Sábado","Domingo"][
+                    int(self.var_cleanup_day.get().split(" ")[0]) % 7]
+            except Exception:
+                day_name = "Domingo"
+            sched_time = self.var_cleanup_time.get() or "02:00"
+
+            text = (
+                f"📁 Pasta: {LOG_DIR}\n"
+                f"📄 Arquivos: {n}    💾 Tamanho total: {mb:.2f} MB\n"
+                f"🕐 Mais antigo: {oldest_dt.strftime('%d/%m/%Y %H:%M')} ({age_days} dias atrás)\n\n"
+                f"🧹 Próxima limpeza automática: {day_name} às {sched_time}\n"
+                f"   → {len(to_remove)} arquivo(s) com >{keep_days}d ({to_remove_mb:.2f} MB) serão removidos."
+            )
+            self._logs_status_lbl.config(text=text)
+        except Exception as e:
+            self._logs_status_lbl.config(text=f"Erro ao calcular status: {e}")
 
     # ===== Coleta / salvar =====
     def get_result_preview(self):
