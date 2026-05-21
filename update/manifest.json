@@ -1,6 +1,6 @@
 {
-  "version": "2025.10.11.15",
-  "zip_url": "https://github.com/GabrielZippys/Agendador-Bravo/releases/download/v2025.10.11.15/AgendadorBravo-2025.10.11.15.zip",
-  "sha256": "6f5585b1dd6396b71231f89d34a0978955ad2916b89d7a90421c7fbb71bf842e",
+  "version": "2025.10.11.16",
+  "zip_url": "https://github.com/GabrielZippys/Agendador-Bravo/releases/download/v2025.10.11.16/AgendadorBravo-2025.10.11.16.zip",
+  "sha256": "f92dacbb90e563b3d3f519fc6a979502fc96015eb88a8002d5b173a450025324",
   "note": "v.14+ usa modo onedir. Clientes v.13 ou anteriores precisam baixar o Setup manualmente uma vez."
 }

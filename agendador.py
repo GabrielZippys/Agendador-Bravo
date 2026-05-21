@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.15"   # << aumente em cada build
+APP_VERSION = "2025.10.11.16"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -5117,6 +5117,9 @@ class App(tk.Tk):
         _tip(b, "Mais ações: Assistente, Editar, Remover, Logs, Backup, YAML")
 
         # ── Atalhos de teclado ────────────────────────────────────────────
+        # v2025.10.11.16 — Ctrl+Shift+T = Executar tag
+        self.bind("<Control-Shift-T>", lambda e: self.run_tag())
+        self.bind("<Control-Shift-t>", lambda e: self.run_tag())
         self.bind("<Control-n>", lambda e: self.add_task())
         self.bind("<Control-N>", lambda e: self.add_task())
         self.bind("<Control-e>", lambda e: self.edit_task())
@@ -5151,10 +5154,20 @@ class App(tk.Tk):
         self.tag_filter = ttk.Combobox(search_frame, textvariable=self.tag_filter_var,
                                        state="readonly", width=22)
         self.tag_filter.grid(row=0, column=2, padx=(6, 0))
+        # v2025.10.11.16 — Botão "Rodar tag": dispara TODOS os jobs da tag
+        # selecionada de uma vez. Caso de uso típico: modo "manhã emergencial"
+        # quando o time de TI precisa rodar 4-5 jobs em paralelo rapidamente.
+        self.btn_run_tag = ttk.Button(search_frame, text="▶ Rodar tag",
+                                       command=self.run_tag,
+                                       style="Accent.TButton")
+        self.btn_run_tag.grid(row=0, column=3, padx=(6, 0))
+        ToolTip(self.btn_run_tag,
+                "Executa AGORA todos os jobs marcados com a tag selecionada (Ctrl+Shift+T).\n"
+                "Útil para 'modo emergência': dispara 5 jobs em 1 clique em vez de 5.")
         ttk.Button(search_frame, text="✕", width=3,
                    command=lambda: (self.search_var.set(""),
                                     self.tag_filter_var.set("(todas as tags)"),
-                                    self.refresh_table())).grid(row=0, column=3, padx=(4, 0))
+                                    self.refresh_table())).grid(row=0, column=4, padx=(4, 0))
         # liga atualização em tempo real
         self.search_var.trace_add("write", lambda *_: self.refresh_table())
         self.tag_filter.bind("<<ComboboxSelected>>", lambda *_: self.refresh_table())
@@ -6408,11 +6421,198 @@ class App(tk.Tk):
         except Exception as e:
             print(f"[empty_state] {e}")
 
+    # v2025.10.11.16 — Executar todos jobs de uma tag --------------------
+    def run_tag(self):
+        """Abre modal pra disparar todos jobs marcados com a tag selecionada."""
+        try:
+            tag = (self.tag_filter_var.get() or "").strip()
+        except Exception:
+            tag = ""
+        if not tag or tag == "(todas as tags)":
+            messagebox.showwarning(
+                "Executar tag",
+                "Selecione uma tag específica no filtro antes.\n\n"
+                "Como adicionar tags: edite um job → seção Avançado → campo Tags.\n"
+                "Depois escolha a tag no combobox no topo da tabela e clique\n"
+                "'▶ Rodar tag'.",
+                parent=self)
+            return
+        # Coleta jobs com a tag (apenas ativos)
+        jobs = [t for t in self.data.get("tasks", [])
+                if tag in (t.get("tags") or []) and t.get("enabled", True)]
+        if not jobs:
+            messagebox.showinfo(
+                "Executar tag",
+                f"Nenhum job ATIVO com a tag '{tag}'.\n\n"
+                "Verifique se os jobs com essa tag não estão pausados.",
+                parent=self)
+            return
+        self._show_run_tag_dialog(tag, jobs)
+
+    def _show_run_tag_dialog(self, tag, jobs):
+        """v2025.10.11.16 — Modal de confirmação + opções para Executar tag."""
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+        font_title, font_body = _resolve_fonts()
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Executar tag — {tag}")
+        dlg.geometry("560x560")
+        dlg.minsize(480, 480)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=T['bg_app'])
+        try:
+            ico = find_logo_ico()
+            if ico:
+                dlg.iconbitmap(default=str(ico))
+        except Exception:
+            pass
+
+        # Header
+        header = tk.Frame(dlg, bg=T['bg_surface'])
+        header.pack(fill="x")
+        h_inner = tk.Frame(header, bg=T['bg_surface'])
+        h_inner.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(h_inner, text=f"🚀  Executar tag",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(font_title, 15, "bold")).pack(anchor="w")
+        tk.Label(h_inner,
+                 text=f"{len(jobs)} job(s) ativo(s) com a tag '{tag}' serão disparados em paralelo.",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(font_body, 9)).pack(anchor="w", pady=(4, 0))
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+
+        # Body
+        body = tk.Frame(dlg, bg=T['bg_app'])
+        body.pack(fill="both", expand=True, padx=20, pady=14)
+
+        # Lista de jobs
+        list_lbl = tk.Label(body, text="Jobs que serão executados:",
+                            bg=T['bg_app'], fg=T['text'],
+                            font=(font_body, 10, "bold"))
+        list_lbl.pack(anchor="w", pady=(0, 6))
+
+        list_container = tk.Frame(body, bg=T['border'], bd=0)
+        list_container.pack(fill="both", expand=True)
+        listbox = tk.Listbox(list_container,
+                             font=(font_body, 10),
+                             bg=T['bg_surface'], fg=T['text'],
+                             selectbackground=T['accent'],
+                             selectforeground='#ffffff',
+                             activestyle='none',
+                             borderwidth=0, highlightthickness=0,
+                             height=8)
+        for j in jobs:
+            listbox.insert("end", f"   ✓   {j['name']}")
+        listbox.pack(fill="both", expand=True, padx=1, pady=1)
+
+        # Opções
+        opt_lbl = tk.Label(body, text="Opções:",
+                          bg=T['bg_app'], fg=T['text'],
+                          font=(font_body, 10, "bold"))
+        opt_lbl.pack(anchor="w", pady=(14, 6))
+
+        opt_frame = tk.Frame(body, bg=T['bg_surface'],
+                             highlightthickness=1, highlightbackground=T['border'])
+        opt_frame.pack(fill="x")
+        opt_inner = tk.Frame(opt_frame, bg=T['bg_surface'])
+        opt_inner.pack(fill="x", padx=12, pady=10)
+
+        var_deps = tk.BooleanVar(value=True)
+        var_ignore_mw = tk.BooleanVar(value=False)
+        var_ignore_running = tk.BooleanVar(value=True)
+        tk.Checkbutton(opt_inner,
+                       text="Respeitar dependências entre jobs (depends_on)",
+                       variable=var_deps,
+                       bg=T['bg_surface'], fg=T['text'],
+                       activebackground=T['bg_surface'],
+                       selectcolor=T['bg_surface'],
+                       font=(font_body, 9)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opt_inner,
+                       text="Ignorar janelas de manutenção (modo emergência)",
+                       variable=var_ignore_mw,
+                       bg=T['bg_surface'], fg=T['text'],
+                       activebackground=T['bg_surface'],
+                       selectcolor=T['bg_surface'],
+                       font=(font_body, 9)).pack(anchor="w", pady=2)
+        tk.Checkbutton(opt_inner,
+                       text="Pular jobs já em execução (recomendado)",
+                       variable=var_ignore_running,
+                       bg=T['bg_surface'], fg=T['text'],
+                       activebackground=T['bg_surface'],
+                       selectcolor=T['bg_surface'],
+                       font=(font_body, 9)).pack(anchor="w", pady=2)
+
+        # Footer com botões
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+        footer = tk.Frame(dlg, bg=T['bg_surface'])
+        footer.pack(fill="x")
+        f_inner = tk.Frame(footer, bg=T['bg_surface'])
+        f_inner.pack(fill="x", padx=20, pady=14)
+        ttk.Button(f_inner, text="Cancelar",
+                   command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(f_inner, text=f"▶ Executar {len(jobs)} jobs",
+                   style="Accent.TButton",
+                   command=lambda: self._do_run_tag(
+                       tag, jobs,
+                       var_deps.get(), var_ignore_mw.get(),
+                       var_ignore_running.get(), dlg
+                   )).pack(side="right")
+
+    def _do_run_tag(self, tag, jobs, respect_deps, ignore_mw, skip_running, dialog):
+        """Dispara todos os jobs em paralelo, aplicando os overrides escolhidos."""
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+
+        # Salva última tag (futuro: 'Modo Manhã' usa essa)
+        self.data["last_run_tag"] = tag
+        try:
+            save_data(self.data)
+        except Exception:
+            pass
+
+        launched = 0
+        skipped = 0
+        for task in jobs:
+            # Skip se já está rodando (opção)
+            if skip_running:
+                with self.running_lock:
+                    if task["name"] in self.running_processes:
+                        skipped += 1
+                        continue
+            # Cópia com overrides
+            t_run = dict(task)
+            if not respect_deps:
+                t_run["depends_on"] = []
+            if ignore_mw:
+                t_run["respect_maintenance"] = False
+            # Dispara em thread (igual ao run_now)
+            threading.Thread(
+                target=lambda t=t_run: self._job_wrapper(t),
+                daemon=True
+            ).start()
+            launched += 1
+
+        msg = f"🏃 Rodando {launched} job(s) da tag '{tag}'"
+        if skipped:
+            msg += f"  ·  {skipped} já estavam rodando (pulados)"
+        self.set_status_line(msg)
+
     # v2025.10.11.11 — Menu "Mais" + context menu --------------------------
     def _show_more_menu(self):
         """Menu dropdown com tudo que tirei da toolbar pra ficar minimalista."""
         try:
             m = tk.Menu(self, tearoff=0)
+            m.add_command(label="🚀  Executar todos da tag...",
+                          accelerator="Ctrl+Shift+T",
+                          command=self.run_tag)
+            m.add_separator()
             m.add_command(label="🧙  Assistente de criação...",
                           command=self.open_assistant)
             m.add_command(label="✏️  Editar job selecionado",
