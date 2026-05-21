@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # ── versão sincronizada com agendador.py ─────────────────────────────────────
-APP_VERSION = "2025.10.11.7"
+APP_VERSION = "2025.10.11.8"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -71,7 +71,16 @@ def create_executable():
         "--hidden-import=PIL.ImageTk",
         "--hidden-import=sv_ttk",
         "--hidden-import=apscheduler",
+        "--hidden-import=apscheduler.triggers.date",
+        "--hidden-import=apscheduler.triggers.cron",
         "--hidden-import=requests",
+        # v2025.10.11.8 — novas deps
+        "--hidden-import=yaml",
+        "--hidden-import=win32crypt",
+        "--hidden-import=pywintypes",
+        "--hidden-import=http.server",
+        "--hidden-import=socketserver",
+        "--hidden-import=urllib.parse",
         # Extrai sempre para path estável em user-space (evita %TEMP%\2\ admin)
         "--runtime-tmpdir=%LOCALAPPDATA%\\AgendadorBravo\\rt",
         str(main_script),

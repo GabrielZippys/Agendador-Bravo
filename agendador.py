@@ -1,16 +1,33 @@
 # agendador_pro.py
 
 import os, sys, json, subprocess, traceback, time, smtplib, ssl, threading, shlex
+import zipfile, base64, calendar
 from email.mime.text import MIMEText
 from email.utils import formatdate
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from pathlib import Path
 import re
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 
 # --- AUTOUPDATE (com aviso na UI) -------------------------------------------
-import urllib.request, hashlib, tempfile
+import urllib.request, urllib.error, hashlib, tempfile
+
+# YAML para export/import de jobs (lazy: importa só quando precisar)
+def _lazy_yaml():
+    try:
+        import yaml  # PyYAML
+        return yaml
+    except Exception:
+        return None
+
+# DPAPI (Windows) para criptografia de credenciais
+def _lazy_dpapi():
+    try:
+        import win32crypt  # pywin32
+        return win32crypt
+    except Exception:
+        return None
 
 # --- CONECTIVIDADE / FILA DE ATUALIZAÇÕES ----------------------------------
 NET_CHECK_EVERY_SEC = int(os.getenv("AGENDADOR_NET_EVERY_SEC", "30"))  # Reduzido para 30s (menos overhead)
@@ -61,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.7"   # << aumente em cada build
+APP_VERSION = "2025.10.11.8"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -593,6 +610,42 @@ def format_days_bool(days_list):
 # Cache de dados para evitar leituras repetidas
 _data_cache = {"data": None, "mtime": 0}
 
+def _migrate_data_schema(data: dict) -> dict:
+    """Adiciona keys novas (v2025.10.11.8) em config.json antigos, sem destruir nada."""
+    settings = data.setdefault("settings", {})
+    # webhooks
+    settings.setdefault("webhooks", {
+        "enabled": False, "urls": [],
+        "notify_success": False, "notify_failure": True,
+    })
+    # maintenance_windows
+    settings.setdefault("maintenance_windows", [])
+    # digest_email
+    settings.setdefault("digest_email", {
+        "enabled": False, "time": "08:00",
+        "days": [True]*5 + [False, False],
+        "include_success": True, "include_failures": True, "include_top_slow": True,
+    })
+    # rest_api
+    settings.setdefault("rest_api", {
+        "enabled": False, "port": 17654, "token": "", "bind_host": "127.0.0.1",
+    })
+    # rollback
+    settings.setdefault("rollback", {"enabled": True, "crash_threshold": 3})
+    # secrets_encrypted flag
+    settings.setdefault("secrets_encrypted", False)
+    # tags universe
+    data.setdefault("tags", [])
+    # garante que cada task tenha defaults dos campos novos
+    for t in data.get("tasks", []):
+        t.setdefault("tags", [])
+        t.setdefault("depends_on", [])
+        t.setdefault("retry", {"enabled": False, "max_attempts": 3, "backoff_seconds": [60, 300, 900]})
+        t.setdefault("respect_maintenance", True)
+        t.setdefault("dynamic_params", True)
+        t.setdefault("variables", {})  # {"VAR_NAME": "valor"} usado em ${VAR_NAME}
+    return data
+
 def load_data():
     """Carrega config.json com cache; cria defaults se não existir/corrompido."""
     ensure_dirs()
@@ -606,6 +659,7 @@ def load_data():
             
             # Carrega e atualiza cache
             data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            data = _migrate_data_schema(data)
             _data_cache["data"] = data
             _data_cache["mtime"] = current_mtime
             return data
@@ -633,11 +687,47 @@ def load_data():
                 "keep_days": 7,
                 "schedule_day": 6,  # 0=segunda, 6=domingo
                 "schedule_time": "02:00"
-            }
+            },
+            # v2025.10.11.8 — webhooks outbound (Discord/Slack/Teams)
+            "webhooks": {
+                "enabled": False,
+                "urls": [],          # lista de URLs (auto-detectadas Discord/Slack/Teams)
+                "notify_success": False,
+                "notify_failure": True,
+            },
+            # v2025.10.11.8 — janelas de manutenção (blackout windows)
+            "maintenance_windows": [
+                # {"name":"Madrugada","start":"22:00","end":"06:00","days":[True]*7}
+            ],
+            # v2025.10.11.8 — digest diário por e-mail
+            "digest_email": {
+                "enabled": False,
+                "time": "08:00",         # HH:MM
+                "days": [True]*5 + [False, False],   # seg-sex por padrão
+                "include_success": True,
+                "include_failures": True,
+                "include_top_slow": True,
+            },
+            # v2025.10.11.8 — API REST local
+            "rest_api": {
+                "enabled": False,
+                "port": 17654,
+                "token": "",              # vazio = sem auth (só localhost)
+                "bind_host": "127.0.0.1",
+            },
+            # v2025.10.11.8 — rollback automático após N crashes seguidos
+            "rollback": {
+                "enabled": True,
+                "crash_threshold": 3,
+            },
+            # v2025.10.11.8 — flag indicando que segredos estão criptografados (DPAPI)
+            "secrets_encrypted": False,
         },
         "tasks": [],
-        "history": {}
+        "history": {},
+        "tags": []  # v2025.10.11.8 — universo de tags disponíveis
     }
+    default_data = _migrate_data_schema(default_data)
     _data_cache["data"] = default_data
     return default_data
 
@@ -740,6 +830,512 @@ def cleanup_logs(settings):
         print(f"[CLEANUP] Erro ao criar log de limpeza: {e}")
 
 # ======================================================================================
+#  v2025.10.11.8 — Utilidades novas (DPAPI, webhooks, dyn params, KTR parser,
+#                  maintenance, digest, backup, YAML, rollback, REST API)
+# ======================================================================================
+
+# ---- DPAPI (Windows) -------------------------------------------------------
+_DPAPI_PREFIX = "dpapi::"
+
+def dpapi_encrypt(plaintext: str) -> str:
+    """Criptografa string com DPAPI do Windows (escopo CurrentUser).
+    Retorna string com prefixo 'dpapi::' + base64. Se DPAPI não disponível,
+    retorna o próprio plaintext sem alterar."""
+    if not plaintext:
+        return plaintext
+    if plaintext.startswith(_DPAPI_PREFIX):
+        return plaintext  # já criptografado
+    w = _lazy_dpapi()
+    if not w or os.name != "nt":
+        return plaintext
+    try:
+        blob = w.CryptProtectData(plaintext.encode("utf-8"), "AgendadorBravo", None, None, None, 0)
+        return _DPAPI_PREFIX + base64.b64encode(blob).decode("ascii")
+    except Exception:
+        return plaintext
+
+def dpapi_decrypt(value: str) -> str:
+    """Decifra string DPAPI. Se não tiver prefixo, retorna como veio (plain)."""
+    if not value or not isinstance(value, str):
+        return value or ""
+    if not value.startswith(_DPAPI_PREFIX):
+        return value
+    w = _lazy_dpapi()
+    if not w or os.name != "nt":
+        return ""  # impossível decifrar
+    try:
+        blob = base64.b64decode(value[len(_DPAPI_PREFIX):].encode("ascii"))
+        desc, data = w.CryptUnprotectData(blob, None, None, None, 0)
+        return data.decode("utf-8")
+    except Exception:
+        return ""
+
+def migrate_secrets_to_dpapi(data: dict) -> bool:
+    """Migra senhas plain text em settings para DPAPI. Retorna True se algo foi migrado."""
+    if os.name != "nt" or not _lazy_dpapi():
+        return False
+    settings = data.get("settings", {})
+    changed = False
+    em = settings.get("email", {})
+    if em.get("password") and not str(em["password"]).startswith(_DPAPI_PREFIX):
+        em["password"] = dpapi_encrypt(em["password"]); changed = True
+    wa = settings.get("whatsapp", {})
+    if wa.get("auth_token") and not str(wa.get("auth_token","")).startswith(_DPAPI_PREFIX):
+        wa["auth_token"] = dpapi_encrypt(wa["auth_token"]); changed = True
+    api = settings.get("rest_api", {})
+    if api.get("token") and not str(api.get("token","")).startswith(_DPAPI_PREFIX):
+        api["token"] = dpapi_encrypt(api["token"]); changed = True
+    if changed:
+        settings["secrets_encrypted"] = True
+    return changed
+
+# ---- Webhooks outbound (Discord/Slack/Teams) -------------------------------
+def _detect_webhook_kind(url: str) -> str:
+    u = (url or "").lower()
+    if "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u:
+        return "discord"
+    if "hooks.slack.com" in u:
+        return "slack"
+    if "outlook.office.com/webhook" in u or "webhook.office.com" in u:
+        return "teams"
+    return "generic"
+
+def _webhook_payload(kind: str, subject: str, body: str, ok: bool) -> dict:
+    icon = "✅" if ok else "❌"
+    color = 0x22c55e if ok else 0xef4444  # decimal
+    text = f"{icon} **{subject}**\n```\n{body[:1800]}\n```"
+    if kind == "discord":
+        return {
+            "username": "Agendador-Bravo",
+            "embeds": [{
+                "title": f"{icon} {subject}"[:256],
+                "description": body[:4000],
+                "color": color,
+                "timestamp": datetime.now().isoformat(),
+            }]
+        }
+    if kind == "slack":
+        return {
+            "text": f"{icon} {subject}",
+            "attachments": [{
+                "color": "#22c55e" if ok else "#ef4444",
+                "text": body[:2000],
+                "footer": "Agendador-Bravo",
+                "ts": int(time.time()),
+            }]
+        }
+    if kind == "teams":
+        return {
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "themeColor": "22c55e" if ok else "ef4444",
+            "summary": subject[:140],
+            "title": f"{icon} {subject}"[:120],
+            "text": body[:4000].replace("\n", "  \n"),
+        }
+    # generic
+    return {"subject": subject, "body": body, "ok": ok, "ts": now_str()}
+
+def send_webhook(settings, subject, body, ok: bool):
+    cfg = (settings or {}).get("webhooks", {})
+    if not cfg.get("enabled"):
+        return
+    if ok and not cfg.get("notify_success", False):
+        return
+    if (not ok) and not cfg.get("notify_failure", True):
+        return
+    urls = cfg.get("urls", []) or []
+    if isinstance(urls, str):
+        urls = [u.strip() for u in urls.split(",") if u.strip()]
+    errors = []
+    for url in urls:
+        kind = _detect_webhook_kind(url)
+        payload = _webhook_payload(kind, subject, body, ok)
+        try:
+            data_bytes = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data_bytes,
+                headers={"Content-Type": "application/json", "User-Agent": "AgendadorBravo/1.0"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                _ = r.read()
+        except Exception as e:
+            errors.append(f"{kind}: {e}")
+    if errors:
+        raise RuntimeError("Webhook: " + " | ".join(errors))
+
+# ---- Parâmetros dinâmicos --------------------------------------------------
+_DYN_PARAM_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+def _last_business_day(ref: date) -> date:
+    """Retorna o último dia útil estritamente anterior a ref (pula sábado/domingo)."""
+    d = ref - timedelta(days=1)
+    while d.weekday() >= 5:  # 5=sab, 6=dom
+        d -= timedelta(days=1)
+    return d
+
+def _dynamic_param_values(today: date | None = None, custom: dict | None = None) -> dict:
+    """Constrói o dicionário de valores para substituição de ${VAR}."""
+    today = today or date.today()
+    yesterday = today - timedelta(days=1)
+    tomorrow = today + timedelta(days=1)
+    first_day = today.replace(day=1)
+    last_day = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+    prev_month_last = first_day - timedelta(days=1)
+    prev_month_first = prev_month_last.replace(day=1)
+    util = _last_business_day(today)
+    vals = {
+        "data_atual": today.strftime("%Y-%m-%d"),
+        "hoje": today.strftime("%Y-%m-%d"),
+        "ontem": yesterday.strftime("%Y-%m-%d"),
+        "amanha": tomorrow.strftime("%Y-%m-%d"),
+        "primeiro_dia_mes": first_day.strftime("%Y-%m-%d"),
+        "ultimo_dia_mes": last_day.strftime("%Y-%m-%d"),
+        "ultimo_dia_util": util.strftime("%Y-%m-%d"),
+        "mes_anterior": prev_month_first.strftime("%Y-%m"),
+        "ano_atual": today.strftime("%Y"),
+        "mes_atual": today.strftime("%m"),
+        "data_atual_br": today.strftime("%d/%m/%Y"),
+        "hoje_br": today.strftime("%d/%m/%Y"),
+        "ontem_br": yesterday.strftime("%d/%m/%Y"),
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+    }
+    if custom:
+        for k, v in custom.items():
+            if k and v is not None:
+                vals[str(k)] = str(v)
+    return vals
+
+def resolve_dynamic(text: str, custom: dict | None = None) -> str:
+    """Substitui ${var} pelos valores conhecidos. Variáveis não encontradas
+    são preservadas como ${var} para o subprocess decidir."""
+    if not text or "${" not in text:
+        return text or ""
+    vals = _dynamic_param_values(custom=custom)
+    def _sub(m):
+        key = m.group(1)
+        return vals.get(key, m.group(0))
+    return _DYN_PARAM_PATTERN.sub(_sub, text)
+
+# ---- Pentaho .ktr/.kjb parser ---------------------------------------------
+def parse_ktr_variables(file_path: str) -> list[str]:
+    """Extrai nomes de variáveis ${...} de um arquivo .ktr/.kjb. Lê XML."""
+    try:
+        if not file_path or not os.path.exists(file_path):
+            return []
+        # Lê como texto bruto e procura ${...} — é mais robusto que XML parsing
+        # porque cobre variáveis em values, defaults, descriptions, etc.
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        found = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_\.\-]*)\}", content))
+        # Tenta também via XML parsing para pegar <parameter name="..."> declarados
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(content)
+            for param in root.iter("parameter"):
+                nm = (param.findtext("name") or "").strip()
+                if nm:
+                    found.add(nm)
+        except Exception:
+            pass
+        # Remove variáveis built-in conhecidas que o usuário não precisa setar
+        BUILTINS = {"Internal.Transformation.Filename.Directory",
+                    "Internal.Job.Filename.Directory",
+                    "Internal.Entry.Current.Directory"}
+        found = {f for f in found if f not in BUILTINS}
+        return sorted(found)
+    except Exception:
+        return []
+
+# ---- Maintenance windows --------------------------------------------------
+def _hhmm_to_minutes(s: str) -> int:
+    try:
+        hh, mm = s.split(":")
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return -1
+
+def in_maintenance_window(settings, now: datetime | None = None) -> tuple[bool, str]:
+    """Retorna (in_window, window_name) se 'now' cair dentro de alguma janela."""
+    now = now or datetime.now()
+    cur_min = now.hour * 60 + now.minute
+    weekday = now.weekday()  # 0=seg, 6=dom
+    for w in (settings or {}).get("maintenance_windows", []) or []:
+        if not w:
+            continue
+        days = w.get("days") or [True]*7
+        if not (0 <= weekday < len(days) and days[weekday]):
+            continue
+        a = _hhmm_to_minutes(w.get("start", ""))
+        b = _hhmm_to_minutes(w.get("end", ""))
+        if a < 0 or b < 0:
+            continue
+        if a <= b:
+            inside = (a <= cur_min < b)
+        else:
+            # janela atravessa meia-noite
+            inside = (cur_min >= a) or (cur_min < b)
+        if inside:
+            return True, w.get("name", "manutenção")
+    return False, ""
+
+# ---- Backup / Restore ZIP --------------------------------------------------
+def backup_to_zip(dest_zip: Path) -> Path:
+    """Empacota config.json + logs/ + pids/ + tags + history em um ZIP."""
+    dest_zip = Path(dest_zip)
+    dest_zip.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dest_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        if DATA_FILE.exists():
+            zf.write(DATA_FILE, arcname="config.json")
+        for d_name in ("logs", "pids"):
+            d = APP_DIR / d_name
+            if d.exists():
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        zf.write(p, arcname=str(p.relative_to(APP_DIR)))
+        meta = {
+            "backup_at": now_str(),
+            "version": APP_VERSION,
+            "app_dir": str(APP_DIR),
+        }
+        zf.writestr("backup_meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
+    return dest_zip
+
+def restore_from_zip(src_zip: Path) -> tuple[bool, str]:
+    """Restaura backup. Retorna (ok, msg). Não toca em logs/pids do app rodando."""
+    src_zip = Path(src_zip)
+    if not src_zip.exists():
+        return False, f"Arquivo não encontrado: {src_zip}"
+    try:
+        with zipfile.ZipFile(src_zip, "r") as zf:
+            names = zf.namelist()
+            if "config.json" not in names:
+                return False, "Backup inválido: falta config.json"
+            ensure_dirs()
+            zf.extract("config.json", path=APP_DIR)
+        # invalida cache
+        _data_cache["data"] = None
+        _data_cache["mtime"] = 0
+        return True, "Backup restaurado. Reinicie o Agendador para aplicar."
+    except Exception as e:
+        return False, f"Falha ao restaurar: {e}"
+
+# ---- Export/Import YAML ---------------------------------------------------
+def export_tasks_yaml(dest_path: Path, tasks: list) -> tuple[bool, str]:
+    y = _lazy_yaml()
+    if not y:
+        # fallback JSON com extensão .yaml
+        try:
+            Path(dest_path).write_text(
+                "# Fallback JSON (PyYAML não instalado)\n" +
+                json.dumps({"tasks": tasks}, ensure_ascii=False, indent=2),
+                encoding="utf-8")
+            return True, "Exportado (JSON, sem PyYAML)."
+        except Exception as e:
+            return False, str(e)
+    try:
+        Path(dest_path).write_text(
+            y.safe_dump({"tasks": tasks}, sort_keys=False, allow_unicode=True),
+            encoding="utf-8")
+        return True, "Exportado em YAML."
+    except Exception as e:
+        return False, str(e)
+
+def import_tasks_yaml(src_path: Path) -> tuple[bool, list, str]:
+    try:
+        text = Path(src_path).read_text(encoding="utf-8")
+    except Exception as e:
+        return False, [], f"Falha ao ler: {e}"
+    parsed = None
+    y = _lazy_yaml()
+    if y:
+        try:
+            parsed = y.safe_load(text)
+        except Exception:
+            parsed = None
+    if parsed is None:
+        try:
+            parsed = json.loads(text)
+        except Exception as e:
+            return False, [], f"Conteúdo inválido (não é YAML/JSON): {e}"
+    tasks = []
+    if isinstance(parsed, dict):
+        tasks = parsed.get("tasks", []) or []
+    elif isinstance(parsed, list):
+        tasks = parsed
+    if not isinstance(tasks, list):
+        return False, [], "Estrutura inválida: 'tasks' deve ser uma lista."
+    return True, tasks, f"{len(tasks)} job(s) lidos."
+
+# ---- Rollback automático (counter de crashes no startup) ------------------
+_CRASH_COUNTER_FILE = lambda: APP_DIR / "startup_counter.json"
+
+def _read_crash_counter() -> int:
+    try:
+        p = _CRASH_COUNTER_FILE()
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8") or "{}")
+            return int(data.get("count", 0) or 0)
+    except Exception:
+        pass
+    return 0
+
+def _write_crash_counter(count: int):
+    try:
+        ensure_dirs()
+        _CRASH_COUNTER_FILE().write_text(
+            json.dumps({"count": int(count), "ts": now_str()}, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+def startup_increment_and_check() -> tuple[int, bool]:
+    """Incrementa contador de crash e retorna (novo_valor, should_rollback).
+    Deve ser chamado no __main__ antes do App() iniciar."""
+    c = _read_crash_counter() + 1
+    _write_crash_counter(c)
+    threshold = 3
+    try:
+        d = load_data()
+        threshold = int(d.get("settings", {}).get("rollback", {}).get("crash_threshold", 3) or 3)
+    except Exception:
+        pass
+    return c, c >= threshold
+
+def startup_mark_success():
+    """Chamado quando a UI aparece com sucesso — zera o contador."""
+    _write_crash_counter(0)
+
+def try_rollback_exe() -> tuple[bool, str]:
+    """Tenta restaurar o backup .exe.bak (criado pelo updater) e re-lançar."""
+    if not _is_frozen():
+        return False, "Modo dev: rollback ignorado"
+    exe = _exe_path()
+    bak = exe.with_suffix(".exe.bak")
+    if not bak.exists():
+        return False, "Sem backup (.exe.bak) para fazer rollback"
+    try:
+        # Não dá pra sobrescrever o próprio exe enquanto roda → grava VBS pra fazer
+        ensure_dirs()
+        vbs = APP_DIR / "_rollback.vbs"
+        log = APP_DIR / "logs" / f"rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        script = f'''Option Explicit
+Dim sh, fso
+Set sh = CreateObject("WScript.Shell")
+Set fso = CreateObject("Scripting.FileSystemObject")
+On Error Resume Next
+sh.Run "taskkill /IM """ & "{exe.name}" & """ /F", 0, True
+WScript.Sleep 1500
+fso.CopyFile "{str(bak).replace(chr(92), chr(92)+chr(92))}", "{str(exe).replace(chr(92), chr(92)+chr(92))}", True
+Dim f
+Set f = fso.OpenTextFile("{str(log).replace(chr(92), chr(92)+chr(92))}", 8, True)
+f.WriteLine "[" & Now & "] rollback executado: " & "{exe.name}" & " <- .exe.bak"
+f.Close
+sh.Run """" & "{str(exe).replace(chr(92), chr(92)+chr(92))}" & """", 1, False
+'''
+        vbs.write_text(script, encoding="utf-8")
+        subprocess.Popen(["wscript.exe", str(vbs)], shell=False)
+        return True, f"Rollback acionado; veja {log}"
+    except Exception as e:
+        return False, f"Falha no rollback: {e}"
+
+# ---- REST API local (http.server stdlib) ----------------------------------
+class _RestAPIHandler:
+    """Compactado em closure dentro de start_rest_api para acessar o app."""
+    pass
+
+def start_rest_api(app_ref):
+    """Inicia (uma vez) o servidor HTTP local. Lê settings em runtime."""
+    import http.server, socketserver
+
+    cfg = app_ref.data.get("settings", {}).get("rest_api", {}) or {}
+    if not cfg.get("enabled"):
+        return None
+    port = int(cfg.get("port", 17654) or 17654)
+    host = cfg.get("bind_host", "127.0.0.1") or "127.0.0.1"
+    token_enc = cfg.get("token", "")
+    token = dpapi_decrypt(token_enc) if token_enc else ""
+
+    def _ok():
+        return token  # cache
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):  # silencia stdout
+            pass
+
+        def _auth(self):
+            if not token:
+                return True
+            got = self.headers.get("X-Auth-Token") or ""
+            return got == token
+
+        def _send(self, code, payload):
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if not self._auth():
+                return self._send(401, {"error": "unauthorized"})
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if path in ("", "/"):
+                return self._send(200, {
+                    "app": APP_NAME, "version": APP_VERSION,
+                    "tasks_count": len(app_ref.data.get("tasks", [])),
+                    "endpoints": ["GET /jobs", "GET /jobs/{name}", "POST /jobs/{name}/run", "GET /health"]
+                })
+            if path == "/health":
+                return self._send(200, {"ok": True, "ts": now_str()})
+            if path == "/jobs":
+                tasks = app_ref.data.get("tasks", [])
+                return self._send(200, {"jobs": [
+                    {"name": t["name"], "enabled": t.get("enabled", True),
+                     "schedule_type": t.get("schedule_type", "cron"),
+                     "tags": t.get("tags", []),
+                     "path": t.get("path", "")}
+                    for t in tasks]})
+            if path.startswith("/jobs/"):
+                name = urllib.parse.unquote(path.split("/jobs/", 1)[1])
+                t = next((x for x in app_ref.data.get("tasks", []) if x.get("name") == name), None)
+                if not t:
+                    return self._send(404, {"error": "not_found"})
+                return self._send(200, t)
+            return self._send(404, {"error": "not_found"})
+
+        def do_POST(self):
+            if not self._auth():
+                return self._send(401, {"error": "unauthorized"})
+            path = self.path.split("?", 1)[0].rstrip("/")
+            if path.startswith("/jobs/") and path.endswith("/run"):
+                name = urllib.parse.unquote(path[len("/jobs/"):-len("/run")])
+                t = next((x for x in app_ref.data.get("tasks", []) if x.get("name") == name), None)
+                if not t:
+                    return self._send(404, {"error": "not_found"})
+                try:
+                    threading.Thread(target=lambda: app_ref._job_wrapper(t), daemon=True).start()
+                    return self._send(202, {"queued": name})
+                except Exception as e:
+                    return self._send(500, {"error": str(e)})
+            return self._send(404, {"error": "not_found"})
+
+    try:
+        server = http.server.ThreadingHTTPServer((host, port), Handler)
+    except Exception as e:
+        print(f"[REST API] falha ao iniciar em {host}:{port}: {e}")
+        return None
+
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[REST API] escutando em http://{host}:{port}")
+    return server
+
+import urllib.parse  # usado na REST API
+
+# ======================================================================================
 #  Notificações
 # ======================================================================================
 
@@ -760,10 +1356,11 @@ def send_email(settings, subject, body):
     msg["Date"] = formatdate(localtime=True)
 
     context = ssl.create_default_context()
+    pwd = dpapi_decrypt(cfg.get("password", "")) if cfg.get("password") else ""
     with smtplib.SMTP(cfg["smtp_host"], int(cfg.get("smtp_port", 587)), timeout=30) as server:
         server.ehlo()
         server.starttls(context=context)
-        server.login(cfg["username"], cfg["password"])
+        server.login(cfg["username"], pwd)
         server.sendmail(msg["From"], to_emails, msg.as_string())
 
 def send_whatsapp(settings, subject, body, timeout_sec=45):
@@ -777,7 +1374,8 @@ def send_whatsapp(settings, subject, body, timeout_sec=45):
             from twilio.rest import Client
         except Exception:
             return
-        client = Client(cfg.get("account_sid",""), cfg.get("auth_token",""))
+        auth_token = dpapi_decrypt(cfg.get("auth_token","")) if cfg.get("auth_token") else ""
+        client = Client(cfg.get("account_sid",""), auth_token)
         to_numbers = cfg.get("to_numbers") or cfg.get("to_targets") or []
         if isinstance(to_numbers, str):
             to_numbers = [n.strip() for n in to_numbers.split(",") if n.strip()]
@@ -822,6 +1420,12 @@ def send_whatsapp(settings, subject, body, timeout_sec=45):
 def build_command(task, pdi_home):
     path = task["path"]
     args = task.get("args","").strip()
+    # v2025.10.11.8 — parâmetros dinâmicos: ${data_atual}, ${ultimo_dia_util}, etc.
+    # Também substitui vars custom definidas em task["variables"].
+    if task.get("dynamic_params", True):
+        custom = task.get("variables", {}) or {}
+        args = resolve_dynamic(args, custom=custom)
+        path = resolve_dynamic(path, custom=custom)
     arg_list = shlex.split(args, posix=False) if args else []
     ext = Path(path).suffix.lower()
 
@@ -957,7 +1561,13 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
     log_file = LOG_DIR / f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     pdi_home = settings.get("pdi_home", r"C:\Pentaho\data-integration")
     cmd = build_command(task, pdi_home)
-    workdir = task.get("working_dir") or str(Path(task["path"]).parent)
+    # workdir resolvido também (caso o path use ${variáveis})
+    custom = task.get("variables", {}) or {}
+    raw_path = task.get("path", "")
+    resolved_path = resolve_dynamic(raw_path, custom=custom) if task.get("dynamic_params", True) else raw_path
+    raw_workdir = task.get("working_dir") or str(Path(resolved_path).parent)
+    workdir = resolve_dynamic(raw_workdir, custom=custom) if task.get("dynamic_params", True) else raw_workdir
+    # timeout pode ser numero (segundos) ou string vazia
     timeout = int(task.get("timeout", "0") or 0) or None
     spawn = bool(task.get("spawn", False))
 
@@ -1208,17 +1818,31 @@ class ToolTip:
             self.tw = None
 
 class TaskDialog(tk.Toplevel):
-    def __init__(self, master, task=None):
+    def __init__(self, master, task=None, existing_jobs=None, all_tags=None):
         super().__init__(master)
         self.title("Tarefa")
-        self.resizable(False, False)
+        self.resizable(True, True)   # v2025.10.11.8 — agora tem mais campos
         self.result = None
+        # Lista de outros jobs (para depends_on) e universo de tags (para combobox)
+        self._existing_jobs = list(existing_jobs or [])
+        self._all_tags = list(all_tags or [])
 
         # ---------- Vars ----------
         self.var_name = tk.StringVar(value=(task or {}).get("name", ""))
         self.var_path = tk.StringVar(value=(task or {}).get("path", ""))
         self.var_args = tk.StringVar(value=(task or {}).get("args", ""))
         self.var_work = tk.StringVar(value=(task or {}).get("working_dir", ""))
+        # v2025.10.11.8 — campos novos
+        self.var_tags = tk.StringVar(value=", ".join((task or {}).get("tags", []) or []))
+        self.var_dyn = tk.BooleanVar(value=(task or {}).get("dynamic_params", True))
+        self.var_resp_mw = tk.BooleanVar(value=(task or {}).get("respect_maintenance", True))
+        _retry = (task or {}).get("retry", {}) or {}
+        self.var_retry_on = tk.BooleanVar(value=_retry.get("enabled", False))
+        self.var_retry_max = tk.StringVar(value=str(_retry.get("max_attempts", 3)))
+        backoff_list = _retry.get("backoff_seconds", [60, 300, 900]) or [60, 300, 900]
+        self.var_retry_backoff = tk.StringVar(value=",".join(str(x) for x in backoff_list))
+        self._depends_on = list((task or {}).get("depends_on", []) or [])
+        self._variables = dict((task or {}).get("variables", {}) or {})
         # ---- "Início + repetição" (start_repeat) ----
         self.var_sr_start      = tk.StringVar(value=(task or {}).get("sr_start", (task or {}).get("time", "06:00")))
         self.var_sr_every_val  = tk.StringVar(value=str((task or {}).get("sr_every_value", (task or {}).get("every_value", 5))))
@@ -1358,6 +1982,60 @@ class TaskDialog(tk.Toplevel):
             .grid(row=row, column=0, columnspan=4, sticky="w")
         row += 1
 
+        # ---- v2025.10.11.8 — Avançado ----
+        adv = ttk.LabelFrame(frm, text="Avançado", padding=(6, 6))
+        adv.grid(row=row, column=0, columnspan=4, sticky="we", pady=(8, 0))
+        adv.columnconfigure(1, weight=1)
+        row += 1
+
+        # Tags
+        ttk.Label(adv, text="Tags (vírgula):").grid(row=0, column=0, sticky="w")
+        tags_combo = ttk.Combobox(adv, textvariable=self.var_tags,
+                                   values=self._all_tags, width=42)
+        tags_combo.grid(row=0, column=1, columnspan=3, sticky="we", padx=(4, 0))
+        ToolTip(tags_combo, "Etiquetas separadas por vírgula. Ex.: ETL, Diário")
+
+        # Retry
+        ttk.Checkbutton(adv, text="Retry automático em falha",
+                        variable=self.var_retry_on)\
+            .grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(adv, text="Tentativas:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(adv, textvariable=self.var_retry_max, width=6).grid(row=2, column=1, sticky="w")
+        ttk.Label(adv, text="Backoff (s, vírgula):").grid(row=2, column=2, sticky="e")
+        ttk.Entry(adv, textvariable=self.var_retry_backoff, width=24).grid(row=2, column=3, sticky="we")
+
+        # Dependências
+        dep_frame = ttk.Frame(adv)
+        dep_frame.grid(row=3, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        dep_frame.columnconfigure(1, weight=1)
+        ttk.Label(dep_frame, text="Depende de:").grid(row=0, column=0, sticky="w")
+        self._lbl_depends = ttk.Label(dep_frame, text=self._fmt_depends_label())
+        self._lbl_depends.grid(row=0, column=1, sticky="we", padx=(4, 4))
+        ttk.Button(dep_frame, text="Editar…", width=10,
+                   command=self._edit_depends).grid(row=0, column=2, sticky="e")
+
+        # Variáveis customizadas + Pentaho detector
+        var_frame = ttk.Frame(adv)
+        var_frame.grid(row=4, column=0, columnspan=4, sticky="we", pady=(6, 0))
+        var_frame.columnconfigure(1, weight=1)
+        ttk.Label(var_frame, text="Variáveis:").grid(row=0, column=0, sticky="w")
+        self._lbl_vars = ttk.Label(var_frame, text=self._fmt_vars_label())
+        self._lbl_vars.grid(row=0, column=1, sticky="we", padx=(4, 4))
+        ttk.Button(var_frame, text="Editar…", width=10,
+                   command=self._edit_vars).grid(row=0, column=2, sticky="e")
+        ttk.Button(var_frame, text="🔍 Detectar Pentaho", width=18,
+                   command=self._detect_pentaho_vars).grid(row=0, column=3, padx=(4, 0))
+
+        # Toggles
+        ttk.Checkbutton(adv,
+                        text="Resolver ${data_atual}, ${ultimo_dia_util}, etc. nos args/path",
+                        variable=self.var_dyn)\
+            .grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(adv,
+                        text="Respeitar janelas de manutenção",
+                        variable=self.var_resp_mw)\
+            .grid(row=6, column=0, columnspan=4, sticky="w")
+
         # ---- Botões ----
         btns = ttk.Frame(frm)
         btns.grid(row=row, column=0, columnspan=4, pady=(10, 0))
@@ -1371,6 +2049,103 @@ class TaskDialog(tk.Toplevel):
     # ---------- Helpers UI ----------
     def _fmt_times(self):
         return ", ".join(self.times) if self.times else "— nenhum —"
+
+    def _fmt_depends_label(self):
+        if not self._depends_on:
+            return "— nenhum —"
+        return ", ".join(self._depends_on[:3]) + (f" (+{len(self._depends_on)-3})" if len(self._depends_on) > 3 else "")
+
+    def _fmt_vars_label(self):
+        if not self._variables:
+            return "— nenhuma —"
+        items = list(self._variables.items())[:3]
+        s = ", ".join(f"{k}={v}" for k, v in items)
+        if len(self._variables) > 3:
+            s += f" (+{len(self._variables)-3})"
+        return s
+
+    def _edit_depends(self):
+        """Multi-select de jobs existentes para depends_on."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Dependências")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        frm = ttk.Frame(dlg, padding=10); frm.grid(sticky="nsew")
+        ttk.Label(frm, text="Marque os jobs que precisam rodar com SUCESSO antes deste:").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        lb = tk.Listbox(frm, selectmode="multiple", height=10, width=42, exportselection=False)
+        lb.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        # popula com jobs (exceto este mesmo)
+        my_name = self.var_name.get().strip()
+        for n in self._existing_jobs:
+            if n == my_name:
+                continue
+            lb.insert("end", n)
+        # pré-seleciona
+        for i in range(lb.size()):
+            if lb.get(i) in self._depends_on:
+                lb.selection_set(i)
+        def _save():
+            self._depends_on = [lb.get(i) for i in lb.curselection()]
+            self._lbl_depends.config(text=self._fmt_depends_label())
+            dlg.destroy()
+        ttk.Button(frm, text="OK", command=_save).grid(row=2, column=0, pady=(8, 0), sticky="e", padx=4)
+        ttk.Button(frm, text="Cancelar", command=dlg.destroy).grid(row=2, column=1, pady=(8, 0), sticky="w", padx=4)
+
+    def _edit_vars(self):
+        """Editor simples de variáveis NAME=valor."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Variáveis customizadas")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+        frm = ttk.Frame(dlg, padding=10); frm.grid(sticky="nsew")
+        ttk.Label(frm, text="Uma variável por linha: NOME=VALOR\nUse ${NOME} nos args/path.",
+                  foreground="#666").grid(row=0, column=0, columnspan=2, sticky="w")
+        txt = tk.Text(frm, height=12, width=48)
+        txt.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        for k, v in self._variables.items():
+            txt.insert("end", f"{k}={v}\n")
+        def _save():
+            new = {}
+            for line in txt.get("1.0", "end").splitlines():
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k:
+                    new[k] = v.strip()
+            self._variables = new
+            self._lbl_vars.config(text=self._fmt_vars_label())
+            dlg.destroy()
+        ttk.Button(frm, text="OK", command=_save).grid(row=2, column=0, pady=(8, 0), sticky="e", padx=4)
+        ttk.Button(frm, text="Cancelar", command=dlg.destroy).grid(row=2, column=1, pady=(8, 0), sticky="w", padx=4)
+
+    def _detect_pentaho_vars(self):
+        """Lê o .ktr/.kjb e popula variáveis automaticamente."""
+        path = self.var_path.get().strip()
+        if not path:
+            messagebox.showwarning("Detectar Pentaho", "Defina o caminho do arquivo primeiro.", parent=self)
+            return
+        if not path.lower().endswith((".ktr", ".kjb")):
+            messagebox.showwarning("Detectar Pentaho",
+                                   "Funciona apenas para .ktr / .kjb.", parent=self)
+            return
+        found = parse_ktr_variables(path)
+        if not found:
+            messagebox.showinfo("Detectar Pentaho",
+                                "Nenhuma variável detectada.\n"
+                                "Use ${VAR} no .ktr/.kjb para que apareça aqui.", parent=self)
+            return
+        added = 0
+        for v in found:
+            if v not in self._variables:
+                self._variables[v] = ""
+                added += 1
+        self._lbl_vars.config(text=self._fmt_vars_label())
+        messagebox.showinfo("Detectar Pentaho",
+                            f"{len(found)} variável(is) detectada(s) ({added} nova(s)).\n"
+                            "Clique em 'Editar…' para preencher os valores.", parent=self)
 
     def _toggle_schedule_ui(self):
      mode = (self.var_schedule.get() or "cron").lower()
@@ -1442,6 +2217,17 @@ class TaskDialog(tk.Toplevel):
             # fallback seguro
             times_list = ["06:00"]
 
+        # v2025.10.11.8 — backoff list
+        try:
+            backoff = [int(x.strip()) for x in self.var_retry_backoff.get().split(",") if x.strip()]
+        except Exception:
+            backoff = [60, 300, 900]
+        try:
+            max_attempts = int(self.var_retry_max.get())
+        except Exception:
+            max_attempts = 3
+        tags_list = [t.strip() for t in self.var_tags.get().split(",") if t.strip()]
+
         # monta o payload final
         self.result = {
             "name": self.var_name.get().strip(),
@@ -1469,6 +2255,18 @@ class TaskDialog(tk.Toplevel):
             "sr_count": int(self.var_sr_count.get() or 0),
 
             "spawn": self.var_spawn.get(),
+
+            # v2025.10.11.8 — campos novos
+            "tags": tags_list,
+            "depends_on": list(self._depends_on),
+            "retry": {
+                "enabled": self.var_retry_on.get(),
+                "max_attempts": max_attempts,
+                "backoff_seconds": backoff,
+            },
+            "respect_maintenance": self.var_resp_mw.get(),
+            "dynamic_params": self.var_dyn.get(),
+            "variables": dict(self._variables),
         }
         self.destroy()
 
@@ -1713,8 +2511,8 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Configurações")
         self.resizable(True, True)
-        self.geometry("500x400")  # Tamanho inicial mais compacto
-        self.minsize(450, 350)    # Tamanho mínimo
+        self.geometry("680x540")  # v2025.10.11.8 — maior para acomodar novas abas
+        self.minsize(560, 420)
         self.result = None
 
         # ----- PDI (Pentaho) -----
@@ -1726,7 +2524,8 @@ class SettingsDialog(tk.Toplevel):
         self.var_host    = tk.StringVar(value=email.get("smtp_host", "smtp.gmail.com"))
         self.var_port    = tk.StringVar(value=str(email.get("smtp_port", 587)))
         self.var_user    = tk.StringVar(value=email.get("username", ""))
-        self.var_pass    = tk.StringVar(value=email.get("password", ""))
+        # Mostra senha decifrada na UI (DPAPI transparente)
+        self.var_pass    = tk.StringVar(value=dpapi_decrypt(email.get("password", "")) if email.get("password") else "")
         self.var_from    = tk.StringVar(value=email.get("from_email", ""))
         self.var_to      = tk.StringVar(value=",".join(email.get("to_emails", [])))
 
@@ -1744,6 +2543,39 @@ class SettingsDialog(tk.Toplevel):
         self.var_cleanup_days = tk.StringVar(value=str(cleanup.get("keep_days", 7)))
         self.var_cleanup_day = tk.StringVar(value=str(cleanup.get("schedule_day", 6)))
         self.var_cleanup_time = tk.StringVar(value=cleanup.get("schedule_time", "02:00"))
+
+        # ----- v2025.10.11.8 — Webhooks (Discord/Slack/Teams) -----
+        wh = settings.get("webhooks", {}) or {}
+        self.var_wh_on = tk.BooleanVar(value=wh.get("enabled", False))
+        self.var_wh_urls = tk.StringVar(value="\n".join(wh.get("urls", []) or []))
+        self.var_wh_success = tk.BooleanVar(value=wh.get("notify_success", False))
+        self.var_wh_failure = tk.BooleanVar(value=wh.get("notify_failure", True))
+
+        # ----- v2025.10.11.8 — Maintenance windows -----
+        self._mw_list = list(settings.get("maintenance_windows", []) or [])
+
+        # ----- v2025.10.11.8 — Digest diário -----
+        dg = settings.get("digest_email", {}) or {}
+        self.var_dg_on = tk.BooleanVar(value=dg.get("enabled", False))
+        self.var_dg_time = tk.StringVar(value=dg.get("time", "08:00"))
+        dg_days = dg.get("days") or [True]*5 + [False, False]
+        self.var_dg_days = [tk.BooleanVar(value=bool(dg_days[i])) for i in range(7)]
+        self.var_dg_success = tk.BooleanVar(value=dg.get("include_success", True))
+        self.var_dg_failures = tk.BooleanVar(value=dg.get("include_failures", True))
+        self.var_dg_top_slow = tk.BooleanVar(value=dg.get("include_top_slow", True))
+
+        # ----- v2025.10.11.8 — REST API -----
+        api = settings.get("rest_api", {}) or {}
+        self.var_api_on = tk.BooleanVar(value=api.get("enabled", False))
+        self.var_api_port = tk.StringVar(value=str(api.get("port", 17654)))
+        self.var_api_host = tk.StringVar(value=api.get("bind_host", "127.0.0.1"))
+        # token decifrado para UI
+        self.var_api_token = tk.StringVar(value=dpapi_decrypt(api.get("token", "")) if api.get("token") else "")
+
+        # ----- v2025.10.11.8 — Rollback -----
+        rb = settings.get("rollback", {}) or {}
+        self.var_rb_on = tk.BooleanVar(value=rb.get("enabled", True))
+        self.var_rb_thr = tk.StringVar(value=str(rb.get("crash_threshold", 3)))
 
         # ---------- LAYOUT COM ABAS ----------
         main_frame = ttk.Frame(self, padding=10)
@@ -1816,6 +2648,27 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(tab_wa, text="Testar WhatsApp", command=self.test_whatsapp_qr)\
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
+        # === ABA: WEBHOOKS (v2025.10.11.8) ===
+        tab_wh = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_wh, text="Webhooks")
+        row = 0
+        ttk.Checkbutton(tab_wh, text="Ativar webhooks (Discord/Slack/Teams)", variable=self.var_wh_on)\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8)); row += 1
+        ttk.Label(tab_wh, text="URLs (uma por linha):").grid(row=row, column=0, sticky="nw")
+        self._wh_text = tk.Text(tab_wh, height=6, width=58)
+        self._wh_text.grid(row=row, column=1, columnspan=2, sticky="we", padx=(5, 0))
+        self._wh_text.insert("1.0", self.var_wh_urls.get())
+        row += 1
+        ttk.Label(tab_wh, text="").grid(row=row, column=0); row += 1
+        ttk.Checkbutton(tab_wh, text="Notificar sucessos", variable=self.var_wh_success)\
+            .grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Checkbutton(tab_wh, text="Notificar falhas", variable=self.var_wh_failure)\
+            .grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Label(tab_wh, text="Tipo de webhook detectado automaticamente pelo URL.",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)); row += 1
+        ttk.Button(tab_wh, text="Testar webhooks", command=self.test_webhooks)\
+            .grid(row=row, column=1, sticky="w", pady=(8, 0))
+
         # === ABA 4: LIMPEZA DE LOGS ===
         tab_logs = ttk.Frame(notebook, padding=10)
         notebook.add(tab_logs, text="Logs")
@@ -1850,6 +2703,67 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(tab_logs, text="Limpar logs agora", command=self.cleanup_logs_now)\
             .grid(row=row, column=0, sticky="w", pady=(8, 0))
 
+        # === ABA: JANELAS DE MANUTENÇÃO (v2025.10.11.8) ===
+        tab_mw = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_mw, text="Janelas")
+        ttk.Label(tab_mw, text="Janelas em que NENHUM job será disparado:",
+                  font=("Segoe UI", 9, "bold")).grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._mw_listbox = tk.Listbox(tab_mw, height=8, width=72, exportselection=False)
+        self._mw_listbox.grid(row=1, column=0, sticky="we")
+        self._mw_refresh_list()
+        mw_btns = ttk.Frame(tab_mw); mw_btns.grid(row=2, column=0, pady=(8, 0), sticky="w")
+        ttk.Button(mw_btns, text="Adicionar", command=self._mw_add).pack(side="left", padx=4)
+        ttk.Button(mw_btns, text="Editar", command=self._mw_edit).pack(side="left", padx=4)
+        ttk.Button(mw_btns, text="Remover", command=self._mw_remove).pack(side="left", padx=4)
+        ttk.Label(tab_mw, text="Ex.: 'Madrugada' 22:00→06:00 todos os dias.",
+                  foreground="#888").grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        # === ABA: DIGEST DIÁRIO (v2025.10.11.8) ===
+        tab_dg = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_dg, text="Digest")
+        row = 0
+        ttk.Checkbutton(tab_dg, text="Enviar digest diário por e-mail",
+                        variable=self.var_dg_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Label(tab_dg, text="Horário (HH:MM):").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(tab_dg, textvariable=self.var_dg_time, width=10)\
+            .grid(row=row, column=1, sticky="w", pady=(8, 0)); row += 1
+        ttk.Label(tab_dg, text="Dias da semana:").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        dg_days_frame = ttk.Frame(tab_dg)
+        dg_days_frame.grid(row=row, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        for i, lab in enumerate(["Seg","Ter","Qua","Qui","Sex","Sáb","Dom"]):
+            ttk.Checkbutton(dg_days_frame, text=lab, variable=self.var_dg_days[i])\
+                .pack(side="left", padx=2)
+        row += 1
+        ttk.Checkbutton(tab_dg, text="Incluir sucessos", variable=self.var_dg_success)\
+            .grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)); row += 1
+        ttk.Checkbutton(tab_dg, text="Incluir falhas", variable=self.var_dg_failures)\
+            .grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Checkbutton(tab_dg, text="Incluir top 5 mais lentos", variable=self.var_dg_top_slow)\
+            .grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Button(tab_dg, text="Enviar digest agora (teste)",
+                   command=self._test_digest).grid(row=row, column=1, sticky="w", pady=(8, 0))
+
+        # === ABA: API REST (v2025.10.11.8) ===
+        tab_api = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_api, text="API REST")
+        row = 0
+        ttk.Checkbutton(tab_api, text="Ativar servidor HTTP local",
+                        variable=self.var_api_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Label(tab_api, text="Host:").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(tab_api, textvariable=self.var_api_host, width=18)\
+            .grid(row=row, column=1, sticky="w", pady=(8, 0)); row += 1
+        ttk.Label(tab_api, text="Porta:").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_api, textvariable=self.var_api_port, width=10)\
+            .grid(row=row, column=1, sticky="w"); row += 1
+        ttk.Label(tab_api, text="Token (opcional):").grid(row=row, column=0, sticky="w")
+        ttk.Entry(tab_api, textvariable=self.var_api_token, width=42, show="*")\
+            .grid(row=row, column=1, columnspan=2, sticky="we"); row += 1
+        ttk.Label(tab_api,
+                  text=("Endpoints: GET /, GET /health, GET /jobs, GET /jobs/{nome},\n"
+                        "POST /jobs/{nome}/run\n"
+                        "Token é enviado no header X-Auth-Token. Mudar requer reiniciar o app."),
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
         # === ABA 5: SISTEMA ===
         tab_sistema = ttk.Frame(notebook, padding=10)
         notebook.add(tab_sistema, text="Sistema")
@@ -1883,8 +2797,27 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(backup_frame, text="Importar configurações", command=self.import_all)\
             .grid(row=0, column=1, pady=2, sticky="w")
 
+        # v2025.10.11.8 — Rollback automático
+        rb_frame = ttk.LabelFrame(tab_sistema, text="Rollback automático", padding=(8, 8))
+        rb_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(10, 0)); row += 1
+        ttk.Checkbutton(rb_frame, text="Voltar à versão anterior se travar N vezes seguidas no startup",
+                        variable=self.var_rb_on).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(rb_frame, text="Threshold:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(rb_frame, textvariable=self.var_rb_thr, width=6)\
+            .grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(rb_frame, text="crashes consecutivos").grid(row=1, column=2, sticky="w", pady=(6, 0))
+
+        # v2025.10.11.8 — Segurança DPAPI
+        sec_frame = ttk.LabelFrame(tab_sistema, text="Segurança", padding=(8, 8))
+        sec_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(10, 0)); row += 1
+        ttk.Label(sec_frame,
+                  text=("Senhas (SMTP, Twilio, API token) ficam criptografadas\n"
+                        "via Windows DPAPI no config.json. Migração ocorre automaticamente\n"
+                        "no primeiro uso. Só este usuário do Windows decifra."),
+                  foreground="#666").grid(row=0, column=0, sticky="w")
+
         # Configurar expansão das colunas nas abas
-        for tab in [tab_geral, tab_email, tab_wa, tab_logs, tab_sistema]:
+        for tab in [tab_geral, tab_email, tab_wa, tab_wh, tab_logs, tab_mw, tab_dg, tab_api, tab_sistema]:
             tab.columnconfigure(1, weight=1)
 
         # Botões principais
@@ -2066,6 +2999,118 @@ class SettingsDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Falha", f"Não foi possível abrir o teste do WhatsApp:\n{e}")
 
+    # v2025.10.11.8 — helpers das novas abas ---------------------------------
+    def test_webhooks(self):
+        try:
+            wh_text = self._wh_text.get("1.0", "end").strip()
+            urls = [u.strip() for u in re.split(r"[,\n]+", wh_text or "") if u.strip()]
+            if not urls:
+                messagebox.showwarning("Webhooks", "Adicione pelo menos 1 URL.")
+                return
+            test_settings = {"webhooks": {
+                "enabled": True, "urls": urls,
+                "notify_success": True, "notify_failure": True,
+            }}
+            send_webhook(test_settings,
+                         "[Agendador-Bravo] Teste de webhook",
+                         f"Teste enviado em {now_str()}.\nFuncionando corretamente.",
+                         ok=True)
+            messagebox.showinfo("Webhooks", "Teste enviado com sucesso!")
+        except Exception as e:
+            messagebox.showerror("Webhooks", f"Falha:\n{e}")
+
+    def _mw_refresh_list(self):
+        try:
+            self._mw_listbox.delete(0, "end")
+            for w in self._mw_list:
+                days = w.get("days") or [True]*7
+                day_lbls = "".join("STQQSSD"[i] if days[i] else "·" for i in range(7))
+                self._mw_listbox.insert(
+                    "end",
+                    f"{w.get('name','sem-nome')}  {w.get('start','--:--')}→{w.get('end','--:--')}  [{day_lbls}]")
+        except Exception:
+            pass
+
+    def _mw_edit_dialog(self, initial=None):
+        dlg = tk.Toplevel(self)
+        dlg.title("Janela de manutenção")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        frm = ttk.Frame(dlg, padding=10); frm.grid(sticky="nsew")
+        vname = tk.StringVar(value=(initial or {}).get("name", "Madrugada"))
+        vstart = tk.StringVar(value=(initial or {}).get("start", "22:00"))
+        vend = tk.StringVar(value=(initial or {}).get("end", "06:00"))
+        days_init = (initial or {}).get("days", [True]*7)
+        vdays = [tk.BooleanVar(value=bool(days_init[i])) for i in range(7)]
+        ttk.Label(frm, text="Nome:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=vname, width=20).grid(row=0, column=1, columnspan=2, sticky="we")
+        ttk.Label(frm, text="Início (HH:MM):").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=vstart, width=10).grid(row=1, column=1, sticky="w")
+        ttk.Label(frm, text="Fim (HH:MM):").grid(row=2, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=vend, width=10).grid(row=2, column=1, sticky="w")
+        ttk.Label(frm, text="Dias:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        df = ttk.Frame(frm); df.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        for i, lab in enumerate(["Seg","Ter","Qua","Qui","Sex","Sáb","Dom"]):
+            ttk.Checkbutton(df, text=lab, variable=vdays[i]).pack(side="left", padx=2)
+        result = {"ok": False}
+        def _save():
+            try:
+                a = _hhmm_to_minutes(vstart.get())
+                b = _hhmm_to_minutes(vend.get())
+                if a < 0 or b < 0:
+                    messagebox.showerror("Inválido", "Horários inválidos (use HH:MM).", parent=dlg)
+                    return
+            except Exception:
+                return
+            result["ok"] = True
+            result["data"] = {
+                "name": vname.get().strip() or "Janela",
+                "start": vstart.get().strip(),
+                "end": vend.get().strip(),
+                "days": [v.get() for v in vdays],
+            }
+            dlg.destroy()
+        btns = ttk.Frame(frm); btns.grid(row=4, column=0, columnspan=3, pady=(8, 0))
+        ttk.Button(btns, text="OK", command=_save).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancelar", command=dlg.destroy).pack(side="left", padx=6)
+        self.wait_window(dlg)
+        return result.get("data") if result.get("ok") else None
+
+    def _mw_add(self):
+        new = self._mw_edit_dialog()
+        if new:
+            self._mw_list.append(new)
+            self._mw_refresh_list()
+
+    def _mw_edit(self):
+        sel = self._mw_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        edited = self._mw_edit_dialog(initial=self._mw_list[idx])
+        if edited:
+            self._mw_list[idx] = edited
+            self._mw_refresh_list()
+
+    def _mw_remove(self):
+        sel = self._mw_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        del self._mw_list[idx]
+        self._mw_refresh_list()
+
+    def _test_digest(self):
+        try:
+            app = self.master
+            if hasattr(app, "_send_digest_email"):
+                threading.Thread(target=app._send_digest_email, daemon=True).start()
+                messagebox.showinfo("Digest", "Digest enviado em segundo plano (verifique a caixa de entrada).")
+            else:
+                messagebox.showwarning("Digest", "App não disponível.")
+        except Exception as e:
+            messagebox.showerror("Digest", f"Falha:\n{e}")
+
     def cleanup_logs_now(self):
         """Executa limpeza de logs imediatamente."""
         try:
@@ -2109,6 +3154,26 @@ class SettingsDialog(tk.Toplevel):
             cleanup_day = int(self.var_cleanup_day.get().split(" ")[0])
         except Exception:
             cleanup_day = 6
+        # v2025.10.11.8 — coleta URLs do widget Text de webhooks
+        try:
+            wh_text = self._wh_text.get("1.0", "end").strip()
+        except Exception:
+            wh_text = self.var_wh_urls.get()
+        wh_urls = [u.strip() for u in re.split(r"[,\n]+", wh_text or "") if u.strip()]
+
+        try:
+            rb_thr = int(self.var_rb_thr.get())
+        except Exception:
+            rb_thr = 3
+        try:
+            api_port = int(self.var_api_port.get())
+        except Exception:
+            api_port = 17654
+
+        # Senhas: criptografa no save (DPAPI no Windows; passthrough fora)
+        encrypted_pwd = dpapi_encrypt(self.var_pass.get()) if self.var_pass.get() else ""
+        encrypted_api_token = dpapi_encrypt(self.var_api_token.get()) if self.var_api_token.get() else ""
+
         return {
             "pdi_home": self.var_pdi.get().strip(),
             "email": {
@@ -2116,7 +3181,7 @@ class SettingsDialog(tk.Toplevel):
                 "smtp_host": self.var_host.get().strip(),
                 "smtp_port": port,
                 "username": self.var_user.get().strip(),
-                "password": self.var_pass.get(),
+                "password": encrypted_pwd,
                 "from_email": self.var_from.get().strip(),
                 "to_emails": [e.strip() for e in self.var_to.get().split(",") if e.strip()],
             },
@@ -2134,6 +3199,32 @@ class SettingsDialog(tk.Toplevel):
                 "schedule_day": cleanup_day,
                 "schedule_time": self.var_cleanup_time.get().strip()
             },
+            "webhooks": {
+                "enabled": self.var_wh_on.get(),
+                "urls": wh_urls,
+                "notify_success": self.var_wh_success.get(),
+                "notify_failure": self.var_wh_failure.get(),
+            },
+            "maintenance_windows": list(self._mw_list),
+            "digest_email": {
+                "enabled": self.var_dg_on.get(),
+                "time": self.var_dg_time.get().strip() or "08:00",
+                "days": [v.get() for v in self.var_dg_days],
+                "include_success": self.var_dg_success.get(),
+                "include_failures": self.var_dg_failures.get(),
+                "include_top_slow": self.var_dg_top_slow.get(),
+            },
+            "rest_api": {
+                "enabled": self.var_api_on.get(),
+                "port": api_port,
+                "bind_host": self.var_api_host.get().strip() or "127.0.0.1",
+                "token": encrypted_api_token,
+            },
+            "rollback": {
+                "enabled": self.var_rb_on.get(),
+                "crash_threshold": rb_thr,
+            },
+            "secrets_encrypted": True,
         }
 
     def on_save(self):
@@ -2592,9 +3683,12 @@ class App(tk.Tk):
             self.tree.set(item, 'Status', self.tree.set(item, 'Status'))
         
         # Ajusta o alinhamento das outras colunas
-        for col in ["Nome", "Horário", "Tipo", "Dias", "Arquivo"]:
-            self.tree.column(col, anchor="w")
-            self.tree.heading(col, text=col, anchor="w")
+        for col in ["Nome", "Horário", "Tipo", "Dias", "Tags", "Arquivo"]:
+            try:
+                self.tree.column(col, anchor="w")
+                self.tree.heading(col, text=col, anchor="w")
+            except Exception:
+                pass
 
      # ===== Conectividade / Fila de updates =====
     def on_net_status_change(self, online: bool):
@@ -2881,52 +3975,77 @@ class App(tk.Tk):
         ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton").pack(side="left", padx=3)
         ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton").pack(side="left", padx=3)
 
+        # v2025.10.11.8 — Backup/Restore + YAML
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(bar, text="💾 Backup", command=self.action_backup, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="↩ Restaurar", command=self.action_restore, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="📤 Export YAML", command=self.action_export_yaml, style="Modern.TButton").pack(side="left", padx=3)
+        ttk.Button(bar, text="📥 Import YAML", command=self.action_import_yaml, style="Modern.TButton").pack(side="left", padx=3)
+
 
         # --------- Layout principal ---------- Row 3 (principal, expansível)
         paned = ttk.Panedwindow(self, orient="horizontal")
         paned.grid(row=3, column=0, sticky="nsew", padx=10, pady=8)
 
         left = ttk.Frame(paned)
-        left.rowconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)   # row 1 = tree (row 0 = search bar)
         left.columnconfigure(0, weight=1)
 
-        # Definindo as colunas da tabela
-        cols = ("Status", "Nome", "Horário", "Tipo", "Dias", "Arquivo")
+        # v2025.10.11.8 — Barra de busca/filtro
+        search_frame = ttk.Frame(left, padding=(0, 0, 0, 4))
+        search_frame.grid(row=0, column=0, sticky="ew", columnspan=2)
+        search_frame.columnconfigure(1, weight=1)
+        ttk.Label(search_frame, text="🔎").grid(row=0, column=0, padx=(0, 4))
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        self.search_entry.grid(row=0, column=1, sticky="ew")
+        ToolTip(self.search_entry, "Filtra por nome, tipo, tag ou arquivo. Tecle texto para filtrar em tempo real.")
+        self.tag_filter_var = tk.StringVar(value="(todas as tags)")
+        self.tag_filter = ttk.Combobox(search_frame, textvariable=self.tag_filter_var,
+                                       state="readonly", width=22)
+        self.tag_filter.grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(search_frame, text="✕", width=3,
+                   command=lambda: (self.search_var.set(""),
+                                    self.tag_filter_var.set("(todas as tags)"),
+                                    self.refresh_table())).grid(row=0, column=3, padx=(4, 0))
+        # liga atualização em tempo real
+        self.search_var.trace_add("write", lambda *_: self.refresh_table())
+        self.tag_filter.bind("<<ComboboxSelected>>", lambda *_: self.refresh_table())
+
+        # Definindo as colunas da tabela (Tags inserida antes de Arquivo)
+        cols = ("Status", "Nome", "Horário", "Tipo", "Dias", "Tags", "Arquivo")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="extended")
-        
+
         # Configurando os cabeçalhos
-        self.tree.heading("Status", text="Status")
-        self.tree.heading("Nome", text="Nome")
-        self.tree.heading("Horário", text="Horário")
-        self.tree.heading("Tipo", text="Tipo")
-        self.tree.heading("Dias", text="Dias")
-        self.tree.heading("Arquivo", text="Arquivo")
-        
+        for col_name in cols:
+            self.tree.heading(col_name, text=col_name)
+
         self._style_table()
-        
+
         # Configuração responsiva das colunas
         col_configs = {
             "Status": {"width": 100, "minwidth": 90, "stretch": False},
-            "Nome": {"width": 220, "minwidth": 180, "stretch": True},
-            "Horário": {"width": 160, "minwidth": 120, "stretch": False},
-            "Tipo": {"width": 110, "minwidth": 90, "stretch": False},
-            "Dias": {"width": 180, "minwidth": 150, "stretch": False},
-            "Arquivo": {"width": 350, "minwidth": 250, "stretch": True}
+            "Nome": {"width": 200, "minwidth": 160, "stretch": True},
+            "Horário": {"width": 150, "minwidth": 110, "stretch": False},
+            "Tipo": {"width": 100, "minwidth": 90, "stretch": False},
+            "Dias": {"width": 170, "minwidth": 140, "stretch": False},
+            "Tags": {"width": 160, "minwidth": 90, "stretch": False},
+            "Arquivo": {"width": 320, "minwidth": 240, "stretch": True}
         }
-        
+
         for c in cols:
             self.tree.heading(c, text=c)
             config = col_configs[c]
-            self.tree.column(c, 
-                           width=config["width"], 
-                           minwidth=config["minwidth"], 
+            self.tree.column(c,
+                           width=config["width"],
+                           minwidth=config["minwidth"],
                            stretch=config["stretch"])
         vbar = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         hbar = ttk.Scrollbar(left, orient="horizontal", command=self.tree.xview)
         self.tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vbar.grid(row=0, column=1, sticky="ns")
-        hbar.grid(row=1, column=0, sticky="ew")
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        vbar.grid(row=1, column=1, sticky="ns")
+        hbar.grid(row=2, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Configure>", self._on_tree_resize)
 
@@ -3022,6 +4141,27 @@ class App(tk.Tk):
 
     def _deferred_startup(self):
         """Trabalho pesado executado após a janela aparecer, para abertura mais rápida."""
+        # v2025.10.11.8 — UI apareceu = startup OK, zera contador de crash
+        try:
+            startup_mark_success()
+        except Exception:
+            pass
+
+        # v2025.10.11.8 — Migração silenciosa de segredos para DPAPI (primeira vez)
+        try:
+            if migrate_secrets_to_dpapi(self.data):
+                save_data(self.data)
+                print("[secrets] credenciais migradas para DPAPI")
+        except Exception as e:
+            print(f"[secrets] migração falhou: {e}")
+
+        # v2025.10.11.8 — Inicia REST API local (se habilitada)
+        try:
+            self._rest_server = start_rest_api(self)
+        except Exception as e:
+            print(f"[rest] falha ao iniciar: {e}")
+            self._rest_server = None
+
         # Agenda tarefas (cria scheduler + jobs)
         try:
             self.reschedule_all()
@@ -3796,9 +4936,235 @@ class App(tk.Tk):
         # Agenda limpeza automática de logs (se habilitada)
         self._schedule_log_cleanup()
 
+        # v2025.10.11.8 — Agenda digest diário (se habilitado)
+        try:
+            self._schedule_digest_email()
+        except Exception as _e:
+            print(f"[digest] falha ao agendar: {_e}")
+
         # garante scheduler rodando
         if not self.scheduler.running:
             self.scheduler.start()
+
+    def _schedule_digest_email(self):
+        """v2025.10.11.8 — Agenda envio diário de digest por e-mail."""
+        cfg = self.data.get("settings", {}).get("digest_email", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        try:
+            hh, mm = map(int, (cfg.get("time", "08:00") or "08:00").split(":"))
+        except Exception:
+            hh, mm = 8, 0
+        days = cfg.get("days") or [True]*5 + [False, False]
+        dows = ["mon","tue","wed","thu","fri","sat","sun"]
+        use_days = [dows[i] for i, v in enumerate(days[:7]) if v]
+        if not use_days:
+            return
+        trig = CronTrigger(day_of_week=",".join(use_days), hour=hh, minute=mm)
+        self.scheduler.add_job(
+            self._send_digest_email,
+            trigger=trig,
+            id="__digest_email__",
+            name="Digest diário",
+            replace_existing=True,
+        )
+
+    def _send_digest_email(self):
+        """v2025.10.11.8 — Constrói e envia o digest das últimas 24h."""
+        cfg = self.data.get("settings", {}).get("digest_email", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        try:
+            now = datetime.now()
+            since = now - timedelta(hours=24)
+            ok_count = 0
+            fail_items = []
+            success_items = []
+            duration_items = []
+            for task_name, hist in (self.data.get("history", {}) or {}).items():
+                for e in hist:
+                    try:
+                        dt = datetime.strptime(e.get("ts", ""), "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        continue
+                    if dt < since:
+                        continue
+                    rc = int(e.get("rc", -1))
+                    dur = float(e.get("dur", 0))
+                    if rc == 0:
+                        ok_count += 1
+                        success_items.append((task_name, dt, dur))
+                        duration_items.append((task_name, dur))
+                    elif rc == -999:
+                        # interrompido — ignora
+                        pass
+                    else:
+                        fail_items.append((task_name, dt, rc))
+
+            total = ok_count + len(fail_items)
+            taxa = (ok_count / total * 100.0) if total else 0.0
+
+            lines = [
+                f"Agendador-Bravo — Digest diário",
+                f"Período: {since.strftime('%d/%m %H:%M')} → {now.strftime('%d/%m %H:%M')}",
+                "",
+                f"📊 Resumo das últimas 24h",
+                f"  • Execuções:   {total}",
+                f"  • Sucessos:    {ok_count}",
+                f"  • Falhas:      {len(fail_items)}",
+                f"  • Taxa sucesso: {taxa:.1f}%",
+                "",
+            ]
+            if cfg.get("include_failures", True) and fail_items:
+                lines.append(f"❌ Falhas ({len(fail_items)})")
+                for n, dt, rc in fail_items[-20:]:
+                    lines.append(f"  • {dt.strftime('%H:%M')} — {n} (RC={rc})")
+                lines.append("")
+            if cfg.get("include_success", True) and success_items:
+                lines.append(f"✅ Sucessos ({len(success_items)})")
+                for n, dt, dur in success_items[-20:]:
+                    lines.append(f"  • {dt.strftime('%H:%M')} — {n} ({dur:.1f}s)")
+                lines.append("")
+            if cfg.get("include_top_slow", True) and duration_items:
+                top_slow = sorted(duration_items, key=lambda x: x[1], reverse=True)[:5]
+                lines.append("🐢 Top 5 mais lentas")
+                for n, dur in top_slow:
+                    lines.append(f"  • {n} — {dur:.1f}s")
+
+            body = "\n".join(lines)
+            subject = f"[Agendador-Bravo] Digest diário — {ok_count} OK / {len(fail_items)} falhas"
+
+            settings = self.data["settings"]
+            try:
+                send_email(settings, subject, body)
+            except Exception as e:
+                print(f"[digest] erro e-mail: {e}")
+            try:
+                send_webhook(settings, subject, body, ok=(len(fail_items) == 0))
+            except Exception as e:
+                print(f"[digest] erro webhook: {e}")
+        except Exception as e:
+            print(f"[digest] falha geral: {e}")
+
+    # =====================================================================
+    # v2025.10.11.8 — Backup / Restore / YAML
+    # =====================================================================
+    def action_backup(self):
+        """Gera backup ZIP em pasta escolhida pelo usuário."""
+        try:
+            default_name = f"AgendadorBravo_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            dest = filedialog.asksaveasfilename(
+                parent=self,
+                title="Salvar backup",
+                defaultextension=".zip",
+                initialfile=default_name,
+                filetypes=[("Arquivo ZIP", "*.zip")],
+            )
+            if not dest:
+                return
+            out = backup_to_zip(Path(dest))
+            messagebox.showinfo("Backup", f"Backup criado em:\n{out}")
+        except Exception as e:
+            messagebox.showerror("Backup", f"Falha ao criar backup:\n{e}")
+
+    def action_restore(self):
+        """Restaura backup ZIP."""
+        try:
+            src = filedialog.askopenfilename(
+                parent=self,
+                title="Selecionar backup",
+                filetypes=[("Arquivo ZIP", "*.zip")],
+            )
+            if not src:
+                return
+            if not messagebox.askyesno(
+                "Restaurar backup",
+                "Isso irá sobrescrever o config.json atual.\n"
+                "Recomendado: fazer um Backup antes.\n\n"
+                "Deseja continuar?",
+                parent=self):
+                return
+            ok, msg = restore_from_zip(Path(src))
+            if ok:
+                messagebox.showinfo("Restaurar", msg)
+                # recarrega data e UI
+                self.data = load_data()
+                self.refresh_table()
+                self.draw_chart()
+                try:
+                    self.reschedule_all()
+                except Exception:
+                    pass
+            else:
+                messagebox.showerror("Restaurar", msg)
+        except Exception as e:
+            messagebox.showerror("Restaurar", f"Falha:\n{e}")
+
+    def action_export_yaml(self):
+        try:
+            default_name = f"jobs_{datetime.now().strftime('%Y%m%d')}.yaml"
+            dest = filedialog.asksaveasfilename(
+                parent=self,
+                title="Exportar jobs em YAML",
+                defaultextension=".yaml",
+                initialfile=default_name,
+                filetypes=[("YAML", "*.yaml *.yml"), ("JSON", "*.json")],
+            )
+            if not dest:
+                return
+            ok, msg = export_tasks_yaml(Path(dest), self.data.get("tasks", []))
+            if ok:
+                messagebox.showinfo("Export YAML", f"{msg}\n{dest}")
+            else:
+                messagebox.showerror("Export YAML", msg)
+        except Exception as e:
+            messagebox.showerror("Export YAML", f"Falha:\n{e}")
+
+    def action_import_yaml(self):
+        try:
+            src = filedialog.askopenfilename(
+                parent=self,
+                title="Importar jobs (YAML/JSON)",
+                filetypes=[("YAML/JSON", "*.yaml *.yml *.json"), ("Todos", "*.*")],
+            )
+            if not src:
+                return
+            ok, tasks, msg = import_tasks_yaml(Path(src))
+            if not ok:
+                messagebox.showerror("Import YAML", msg)
+                return
+            # diálogo de merge: substituir tudo, ou só adicionar ausentes
+            choice = messagebox.askyesnocancel(
+                "Importar jobs",
+                f"{msg}\n\n"
+                "Sim = MESCLAR (adiciona/substitui pelo nome)\n"
+                "Não = SUBSTITUIR todos os jobs atuais\n"
+                "Cancelar = não fazer nada",
+                parent=self)
+            if choice is None:
+                return
+            if choice is True:
+                existing = {t["name"]: i for i, t in enumerate(self.data.get("tasks", []))}
+                for nt in tasks:
+                    if not isinstance(nt, dict) or "name" not in nt:
+                        continue
+                    if nt["name"] in existing:
+                        self.data["tasks"][existing[nt["name"]]] = nt
+                    else:
+                        self.data["tasks"].append(nt)
+            else:
+                self.data["tasks"] = [t for t in tasks if isinstance(t, dict) and "name" in t]
+            # garante defaults do schema
+            self.data = _migrate_data_schema(self.data)
+            save_data(self.data)
+            self.refresh_table()
+            try:
+                self.reschedule_all()
+            except Exception:
+                pass
+            messagebox.showinfo("Import YAML", f"Importação concluída: {len(self.data['tasks'])} jobs ativos.")
+        except Exception as e:
+            messagebox.showerror("Import YAML", f"Falha:\n{e}")
 
     def _schedule_log_cleanup(self):
         """Agenda a limpeza automática de logs baseada nas configurações."""
@@ -3858,55 +5224,91 @@ class App(tk.Tk):
         except Exception as e:
             print(f"[SCHEDULER] Falha ao logar evento: {e}")
 
-    def _job_wrapper(self, task):
+    def _job_wrapper(self, task, attempt: int = 1):
+        """Executa um job aplicando: janelas de manutenção, dependências e retry.
+
+        attempt: número da tentativa atual (1 = primeira). Usado por _schedule_retry.
+        """
         def progress(_):
             pass
-            
+
         task_name = task["name"]
-        
+        settings = self.data.get("settings", {})
+
+        # ---- 1) Maintenance windows ---------------------------------------
+        if task.get("respect_maintenance", True):
+            inside, win_name = in_maintenance_window(settings)
+            if inside:
+                try:
+                    sched_log = LOG_DIR / "_scheduler.log"
+                    with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                        f.write(f"[{now_str()}] SKIP_MAINTENANCE job={task_name} window={win_name}\n")
+                except Exception:
+                    pass
+                if self.winfo_exists():
+                    self.after(0, lambda: self.set_status_line(
+                        f"'{task_name}' pulado: janela de manutenção '{win_name}'"))
+                return
+
+        # ---- 2) Dependências (depends_on) ---------------------------------
+        depends_on = task.get("depends_on", []) or []
+        if depends_on:
+            history = self.data.get("history", {})
+            missing = []
+            for dep_name in depends_on:
+                dep_hist = history.get(dep_name, [])
+                if not dep_hist:
+                    missing.append(f"{dep_name}(sem histórico)")
+                    continue
+                last = dep_hist[-1]
+                if int(last.get("rc", -1)) != 0:
+                    missing.append(f"{dep_name}(última falhou)")
+            if missing:
+                try:
+                    sched_log = LOG_DIR / "_scheduler.log"
+                    with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                        f.write(f"[{now_str()}] SKIP_DEPENDS job={task_name} faltando={missing}\n")
+                except Exception:
+                    pass
+                if self.winfo_exists():
+                    self.after(0, lambda m=missing: self.set_status_line(
+                        f"'{task_name}' pulado: dependências não satisfeitas ({', '.join(m)})"))
+                return
+
+        # ---- callbacks de UI ---------------------------------------------
         def on_task_start():
             if self.winfo_exists():
                 self._on_job_start(task)  # Já chama _set_task_running internamente
-        
+
         def on_task_end(rc, dur, log_path):
             def update_ui():
                 if not self.winfo_exists():
                     return
-                
-                # Verifica se foi interrompido manualmente
                 was_interrupted = False
                 with self.running_lock:
                     if task_name not in self.running_processes:
                         was_interrupted = True
                     else:
-                        # Remove o processo da lista de processos em execução
                         del self.running_processes[task_name]
-                    
-                    # Atualiza o estado do botão de parada
                     if not self.running_processes:
                         self.btn_stop.config(state="disabled")
-                
-                # Atualiza a interface
-                # Só atualiza o status se NÃO foi interrompido (pois _set_task_interrupted já foi chamado)
                 if not was_interrupted:
                     self._set_task_running(task_name, False)
-                
                 self.draw_chart()
                 self._on_job_end(task, rc, dur, log_path)
-            
             if self.winfo_exists():
                 self.after(0, update_ui)
-        
+
         # Inicia a tarefa
         try:
             if self.winfo_exists():
                 self.after(0, on_task_start)
         except Exception as e:
             print(f"Erro ao iniciar tarefa {task_name}: {e}")
-        
+
         # Executa a tarefa
         try:
-            rc, dur, log_path = run_task(task, self.data["settings"], 
+            rc, dur, log_path = run_task(task, settings,
                                       progress_cb=progress,
                                       process_callback=self._register_process)
             append_history(self.data, task_name, rc, dur)
@@ -3914,9 +5316,43 @@ class App(tk.Tk):
         except Exception as e:
             print(f"Erro ao executar tarefa {task_name}: {e}")
             rc, dur, log_path = 1, 0, None
-        
+
         # Atualiza a interface após o término
         on_task_end(rc, dur, log_path)
+
+        # ---- 3) Retry com backoff -----------------------------------------
+        if rc != 0:
+            retry_cfg = task.get("retry", {}) or {}
+            if retry_cfg.get("enabled"):
+                max_attempts = int(retry_cfg.get("max_attempts", 3) or 3)
+                backoff = retry_cfg.get("backoff_seconds", [60, 300, 900]) or [60, 300, 900]
+                if attempt < max_attempts and attempt - 1 < len(backoff):
+                    delay = int(backoff[attempt - 1])
+                    self._schedule_retry(task, attempt + 1, delay)
+
+    def _schedule_retry(self, task, next_attempt: int, delay_seconds: int):
+        """Agenda uma re-execução do job daqui a delay_seconds, contando como tentativa next_attempt."""
+        try:
+            from apscheduler.triggers.date import DateTrigger
+            run_at = datetime.now() + timedelta(seconds=delay_seconds)
+            jid = f"{task['name']}::retry::{next_attempt}::{int(time.time())}"
+            self.scheduler.add_job(
+                lambda t=task, n=next_attempt: self._job_wrapper(t, attempt=n),
+                trigger=DateTrigger(run_date=run_at),
+                id=jid, name=f"{task['name']} (retry {next_attempt})",
+                misfire_grace_time=600, replace_existing=True,
+            )
+            try:
+                sched_log = LOG_DIR / "_scheduler.log"
+                with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"[{now_str()}] RETRY_SCHEDULED job={task['name']} attempt={next_attempt} in={delay_seconds}s at={run_at.strftime('%H:%M:%S')}\n")
+            except Exception:
+                pass
+            if self.winfo_exists():
+                self.after(0, lambda: self.set_status_line(
+                    f"'{task['name']}' falhou. Retry {next_attempt} em {delay_seconds}s."))
+        except Exception as e:
+            print(f"[retry] falha ao agendar: {e}")
 
     def _maybe_notify(self, task, rc, log_path):
         # Verifica se a tarefa foi interrompida manualmente
@@ -3924,19 +5360,33 @@ class App(tk.Tk):
         with self.running_lock:
             if task['name'] not in self.running_processes:
                 was_stopped_manually = True
-                
-        # Não envia notificação se foi interrompida manualmente
-        if rc != 0 and task.get("notify_fail", True) and not was_stopped_manually:
+        if was_stopped_manually:
+            return
+
+        ok = (rc == 0)
+        settings = self.data["settings"]
+
+        # E-mail e WhatsApp: só em falha (comportamento existente)
+        if (not ok) and task.get("notify_fail", True):
             subject = f"[{task['name']}] FALHA (RC={rc})"
             body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}"
             try:
-                send_email(self.data["settings"], subject, body)
+                send_email(settings, subject, body)
             except Exception as e:
                 print("Erro e-mail:", e)
             try:
-                send_whatsapp(self.data["settings"], subject, body)
+                send_whatsapp(settings, subject, body)
             except Exception as e:
                 print("Erro WhatsApp:", e)
+
+        # Webhooks (Discord/Slack/Teams): sucesso e/ou falha conforme settings
+        try:
+            tag = "OK" if ok else f"FALHA (RC={rc})"
+            subj = f"[{task['name']}] {tag}"
+            body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}"
+            send_webhook(settings, subj, body, ok)
+        except Exception as e:
+            print("Erro webhook:", e)
 
     def _update_task_status_color(self, name):
         """Atualiza a cor do status de uma tarefa baseado no seu estado atual"""
@@ -4195,43 +5645,79 @@ class App(tk.Tk):
         """Atualiza a tabela. full_refresh=False apenas atualiza status."""
         # Salva a seleção atual
         current_selection = self.tree.selection()
-        
+
         # Se não for refresh completo, apenas atualiza status
         if not full_refresh:
             for task in self.data.get("tasks", []):
                 self._update_task_status_color(task["name"])
             return
-        
+
+        # v2025.10.11.8 — atualiza universo de tags no combobox de filtro
+        try:
+            self._refresh_tag_filter_options()
+        except Exception:
+            pass
+
+        # filtros ativos
+        search_term = ""
+        try:
+            search_term = (self.search_var.get() or "").strip().lower()
+        except Exception:
+            pass
+        tag_filter = ""
+        try:
+            tf = (self.tag_filter_var.get() or "").strip()
+            if tf and tf != "(todas as tags)":
+                tag_filter = tf
+        except Exception:
+            pass
+
         # Limpa a tabela
         for i in self.tree.get_children():
             self.tree.delete(i)
-        
-        # Preenche com as tarefas
+
+        # Preenche com as tarefas (aplicando filtros)
         for i, task in enumerate(self.data.get("tasks", [])):
             task_name = task["name"]
+            task_tags = task.get("tags", []) or []
+
+            # filtro por tag
+            if tag_filter and tag_filter not in task_tags:
+                continue
+            # filtro por termo livre (nome, tipo, tags, arquivo)
+            if search_term:
+                hay = " ".join([
+                    task_name.lower(),
+                    (task.get("path", "") or "").lower(),
+                    (task.get("schedule_type", "") or "").lower(),
+                    " ".join(task_tags).lower(),
+                ])
+                if search_term not in hay:
+                    continue
+
             is_selected = task_name in current_selection
-            
-            # Define as tags do item
+
+            # Define as tags visuais do item
             tags = ["evenrow" if i % 2 == 0 else "oddrow"]
             if not task.get("enabled", True):
                 tags.append("disabled")
             if is_selected:
                 tags.append("selected")
-            
+
             # Texto de status - verifica se está rodando
             with self.running_lock:
                 is_running = task_name in self.running_processes
-            
+
             if is_running:
                 status_text = "Rodando"
             elif task.get("enabled", True):
                 status_text = "Ativo"
             else:
                 status_text = "Parado"
-            
+
             # Obtém o tipo de agendamento
             schedule_type = task.get("schedule_type", "cron")
-            
+
             # Formata os horários de acordo com o tipo de agendamento
             if schedule_type == "cron":
                 times = ", ".join(task.get("times", [task.get("time", "06:00")]))
@@ -4246,19 +5732,22 @@ class App(tk.Tk):
                 times = f"{start} + {every_val}{every_unit[0]}"
             else:
                 times = "Desconhecido"
-            
+
+            tags_text = " · ".join(task_tags) if task_tags else "—"
+
             # Adiciona a tarefa à tabela
-            item_id = self.tree.insert("", "end", iid=task_name,
+            self.tree.insert("", "end", iid=task_name,
                            values=(
-                               status_text,  # Texto de status
+                               status_text,
                                task_name,
                                times,
                                schedule_type.capitalize(),
                                self._format_days(task.get("days", [True]*7)),
+                               tags_text,
                                task.get("path", "")
                            ),
                            tags=tags)
-        
+
         # Aplica as cores de status após inserir todos os itens
         for task in self.data.get("tasks", []):
             self._update_task_status_color(task["name"])
@@ -4288,24 +5777,48 @@ class App(tk.Tk):
                 
         return ", ".join(ativos) if ativos else "Nunca"
         
+    def _refresh_tag_filter_options(self):
+        """Atualiza opções do combobox de tags com o universo atual."""
+        try:
+            universe = set()
+            for t in self.data.get("tasks", []) or []:
+                for tg in (t.get("tags") or []):
+                    if tg:
+                        universe.add(tg)
+            # também inclui tags definidas em data["tags"]
+            for tg in self.data.get("tags", []) or []:
+                if tg:
+                    universe.add(tg)
+            opts = ["(todas as tags)"] + sorted(universe)
+            cur = self.tag_filter_var.get()
+            self.tag_filter["values"] = opts
+            if cur not in opts:
+                self.tag_filter_var.set("(todas as tags)")
+        except Exception:
+            pass
+
     def _resize_columns(self):
         """Ajusta automaticamente o tamanho das colunas da tabela."""
         # Configuração de largura fixa para a coluna Status
         self.tree.column("#0", width=0, stretch=tk.NO)
         self.tree.column("Status", width=90, minwidth=90, stretch=tk.NO, anchor="center")
-        
+
         # Configuração de largura para as outras colunas
         col_widths = {
             "Nome": 180,
             "Horário": 130,
             "Tipo": 100,
             "Dias": 150,
+            "Tags": 160,
             "Arquivo": 300
         }
-        
+
         # Ajusta o tamanho das colunas baseado no conteúdo
         for col, width in col_widths.items():
-            self.tree.column(col, width=width, minwidth=width, stretch=tk.YES, anchor="w")
+            try:
+                self.tree.column(col, width=width, minwidth=width, stretch=tk.YES, anchor="w")
+            except Exception:
+                pass
         
         # Ajusta o cabeçalho para manter o alinhamento
         for col in self.tree["columns"]:
@@ -4388,21 +5901,10 @@ class App(tk.Tk):
 
         sel = self.tree.selection()
         if not sel:
-            # Mensagem estilizada quando nenhuma tarefa está selecionada
-            w = int(self.canvas.winfo_width() or 400)
-            h = int(self.canvas.winfo_height() or 300)
-            
-            self.canvas.create_text(
-                w//2, h//2 - 20, anchor="center",
-                fill=subtext_color,
-                font=("Segoe UI", 12),
-                text="📊 Histórico de Execuções"
-            )
-            self.canvas.create_text(
-                w//2, h//2 + 10, anchor="center",
-                fill=subtext_color,
-                font=("Segoe UI", 10),
-                text="Selecione uma tarefa para visualizar o histórico"
+            # v2025.10.11.8 — Dashboard global dos últimos 7 dias
+            self._draw_global_dashboard(
+                bg_color, grid_color, text_color, subtext_color,
+                success_color, error_color, accent_color
             )
             return
 
@@ -4567,6 +6069,172 @@ class App(tk.Tk):
         self.canvas.create_text(legend_x_start + 14, legend_y + 5, text="✗ Falha", 
                                anchor="w", fill=text_color, font=("Segoe UI", 8))
     
+    def _draw_global_dashboard(self, bg_color, grid_color, text_color, subtext_color,
+                               success_color, error_color, accent_color):
+        """v2025.10.11.8 — Dashboard com agregados dos últimos 7 dias."""
+        w = int(self.canvas.winfo_width() or 600)
+        h = int(self.canvas.winfo_height() or 400)
+        pad = 28
+
+        # Agrega histórico dos últimos 7 dias para todos os jobs
+        today = date.today()
+        days = [today - timedelta(days=i) for i in range(6, -1, -1)]  # 7 dias, do mais antigo ao mais recente
+        ok_per_day = [0]*7
+        fail_per_day = [0]*7
+        interrupted_per_day = [0]*7
+        all_durations = []
+        per_task_avg_dur = {}
+        per_task_runs = {}
+        total_ok = 0
+        total_fail = 0
+        total_interrupted = 0
+        total_today = 0
+
+        history = self.data.get("history", {}) or {}
+        for task_name, hist in history.items():
+            for e in hist:
+                try:
+                    ts_str = e.get("ts", "")
+                    dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                    d = dt.date()
+                except Exception:
+                    continue
+                rc = int(e.get("rc", -1))
+                dur = float(e.get("dur", 0))
+                if d == today:
+                    total_today += 1
+                # bucket por dia
+                for idx, dd in enumerate(days):
+                    if d == dd:
+                        if rc == 0:
+                            ok_per_day[idx] += 1
+                            total_ok += 1
+                        elif rc == -999:
+                            interrupted_per_day[idx] += 1
+                            total_interrupted += 1
+                        else:
+                            fail_per_day[idx] += 1
+                            total_fail += 1
+                        # média e contagem para top slow
+                        if rc == 0 and dur > 0:
+                            per_task_avg_dur[task_name] = (per_task_avg_dur.get(task_name, 0) * per_task_runs.get(task_name, 0) + dur) / (per_task_runs.get(task_name, 0) + 1)
+                            per_task_runs[task_name] = per_task_runs.get(task_name, 0) + 1
+                            all_durations.append(dur)
+                        break
+
+        # Title
+        self.canvas.create_text(
+            pad, 12, anchor="nw",
+            text="📊 Dashboard — últimos 7 dias",
+            fill=text_color, font=("Segoe UI", 11, "bold"),
+        )
+
+        # Stat tiles (4 colunas)
+        tiles_y = 36
+        tiles_h = 56
+        gap = 8
+        tile_w = max(80, (w - 2*pad - 3*gap) // 4)
+        total_exec = total_ok + total_fail + total_interrupted
+        success_rate = (total_ok / total_exec * 100.0) if total_exec else 0.0
+        tiles = [
+            ("Execuções (7d)", str(total_exec), accent_color),
+            ("Hoje", str(total_today), accent_color),
+            ("Taxa sucesso", f"{success_rate:.0f}%", success_color if success_rate >= 80 else error_color),
+            ("Falhas (7d)", str(total_fail), error_color if total_fail else success_color),
+        ]
+        for i, (label, value, color) in enumerate(tiles):
+            x0 = pad + i * (tile_w + gap)
+            x1 = x0 + tile_w
+            self.canvas.create_rectangle(x0, tiles_y, x1, tiles_y + tiles_h,
+                                         fill=grid_color, outline="")
+            self.canvas.create_text(x0 + 10, tiles_y + 10, anchor="nw",
+                                    text=label, fill=subtext_color,
+                                    font=("Segoe UI", 9))
+            self.canvas.create_text(x0 + 10, tiles_y + 28, anchor="nw",
+                                    text=value, fill=color,
+                                    font=("Segoe UI", 16, "bold"))
+
+        # Barras empilhadas por dia
+        chart_top = tiles_y + tiles_h + 24
+        chart_bottom = h - 60
+        chart_h = max(60, chart_bottom - chart_top)
+        chart_w = w - 2 * pad
+        self.canvas.create_text(pad, chart_top - 18, anchor="nw",
+                                text="Execuções por dia (verde=OK · amarelo=interrompido · vermelho=falha)",
+                                fill=subtext_color, font=("Segoe UI", 9))
+
+        # eixo
+        self.canvas.create_line(pad, chart_bottom, w - pad, chart_bottom,
+                                fill=grid_color, width=2)
+
+        max_y = max(1, max(ok_per_day[i] + fail_per_day[i] + interrupted_per_day[i] for i in range(7)))
+        # gridlines a cada 25%
+        for k in (0.25, 0.5, 0.75, 1.0):
+            y = chart_bottom - k * chart_h
+            self.canvas.create_line(pad, y, w - pad, y,
+                                    fill=grid_color, width=1, dash=(2, 4))
+            self.canvas.create_text(pad - 4, y, anchor="e",
+                                    text=str(int(max_y * k)),
+                                    fill=subtext_color, font=("Segoe UI", 8))
+
+        col_w = chart_w / 7
+        bar_w = max(8, col_w * 0.6)
+        interrupted_color = "#fbbf24"
+        for idx in range(7):
+            x_center = pad + (idx + 0.5) * col_w
+            ok_n = ok_per_day[idx]
+            int_n = interrupted_per_day[idx]
+            fail_n = fail_per_day[idx]
+            total_n = ok_n + int_n + fail_n
+            if total_n == 0:
+                # marker vazio
+                self.canvas.create_oval(x_center - 2, chart_bottom - 2,
+                                        x_center + 2, chart_bottom + 2,
+                                        fill=grid_color, outline="")
+            else:
+                # empilhado: ok no fundo, depois interrupted, falha no topo
+                cum = 0.0
+                for n, c in [(ok_n, success_color),
+                             (int_n, interrupted_color),
+                             (fail_n, error_color)]:
+                    if n == 0:
+                        continue
+                    seg_h = (n / max_y) * chart_h
+                    y_top = chart_bottom - cum - seg_h
+                    y_bot = chart_bottom - cum
+                    self.canvas.create_rectangle(
+                        x_center - bar_w/2, y_top,
+                        x_center + bar_w/2, y_bot,
+                        fill=c, outline="")
+                    cum += seg_h
+                # número total acima da barra
+                self.canvas.create_text(x_center, chart_bottom - cum - 8,
+                                        text=str(total_n), anchor="s",
+                                        fill=text_color, font=("Segoe UI", 8, "bold"))
+            # rótulo do dia
+            dia = days[idx]
+            label = dia.strftime("%a %d/%m").capitalize()
+            if dia == today:
+                label = "HOJE"
+            self.canvas.create_text(x_center, chart_bottom + 6,
+                                    text=label, anchor="n",
+                                    fill=subtext_color, font=("Segoe UI", 8))
+
+        # Top 3 jobs lentos
+        if per_task_avg_dur:
+            slow = sorted(per_task_avg_dur.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            y_slow = h - 30
+            text = "⏱ Top 3 lentos (7d): " + " · ".join(
+                f"{n} ({d:.1f}s)" for n, d in slow
+            )
+            self.canvas.create_text(pad, y_slow, anchor="nw",
+                                    text=text, fill=subtext_color,
+                                    font=("Segoe UI", 9))
+        else:
+            self.canvas.create_text(pad, h - 30, anchor="nw",
+                                    text="Selecione uma tarefa para ver detalhes individuais.",
+                                    fill=subtext_color, font=("Segoe UI", 9, "italic"))
+
     def _lighten_color(self, color, factor):
         """Clareia ou escurece uma cor hexadecimal por um fator (-1.0 a 1.0)"""
         try:
@@ -4593,8 +6261,21 @@ class App(tk.Tk):
             return color  # Retorna a cor original se houver erro
 
     # ===== ações =====
+    def _existing_job_names(self):
+        return [t["name"] for t in self.data.get("tasks", [])]
+
+    def _all_known_tags(self):
+        tags = set()
+        for t in self.data.get("tasks", []):
+            for tg in t.get("tags", []) or []:
+                tags.add(tg)
+        return sorted(tags)
+
     def add_task(self):
-        dlg = TaskDialog(self); self.wait_window(dlg)
+        dlg = TaskDialog(self,
+                         existing_jobs=self._existing_job_names(),
+                         all_tags=self._all_known_tags())
+        self.wait_window(dlg)
         if dlg.result:
             if any(t["name"] == dlg.result["name"] for t in self.data["tasks"]):
                 messagebox.showerror("Erro", "Já existe uma tarefa com esse nome."); return
@@ -4606,7 +6287,10 @@ class App(tk.Tk):
     def open_assistant(self):
         dlg = AssistantDialog(self); self.wait_window(dlg)
         if not dlg.result: return
-        td = TaskDialog(self, dlg.result); self.wait_window(td)
+        td = TaskDialog(self, dlg.result,
+                        existing_jobs=self._existing_job_names(),
+                        all_tags=self._all_known_tags())
+        self.wait_window(td)
         if td.result:
             if any(t["name"] == td.result["name"] for t in self.data["tasks"]):
                 messagebox.showerror("Erro", "Já existe uma tarefa com esse nome."); return
@@ -4621,7 +6305,10 @@ class App(tk.Tk):
         name = sel[0]
         task = next((t for t in self.data["tasks"] if t["name"]==name), None)
         if not task: return
-        dlg = TaskDialog(self, task); self.wait_window(dlg)
+        dlg = TaskDialog(self, task,
+                         existing_jobs=self._existing_job_names(),
+                         all_tags=self._all_known_tags())
+        self.wait_window(dlg)
         if dlg.result:
             idx = self.data["tasks"].index(task)
             self.data["tasks"][idx] = dlg.result
@@ -5050,6 +6737,32 @@ if __name__ == "__main__":
         _t.sleep(8)   # 8 s ≥ tempo médio de scan do Windows Defender
         sys.exit(0)
     # ─────────────────────────────────────────────────────────────────────────
+
+    # v2025.10.11.8 — Rollback automático em crash 3x consecutivo
+    # Incrementamos o contador AGORA; se exceder o threshold, fazemos rollback
+    # antes de tentar instanciar o App() de novo.
+    try:
+        _count, _should_rollback = startup_increment_and_check()
+        if _should_rollback and _is_frozen():
+            try:
+                ok, msg = try_rollback_exe()
+                # log do que aconteceu
+                try:
+                    crash_log = APP_DIR / "logs" / f"rollback_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                    crash_log.parent.mkdir(parents=True, exist_ok=True)
+                    crash_log.write_text(
+                        f"[{now_str()}] crash_counter={_count} -> rollback={ok}\n{msg}\n",
+                        encoding="utf-8")
+                except Exception:
+                    pass
+                # zera para evitar loop
+                _write_crash_counter(0)
+                if ok:
+                    sys.exit(0)
+            except Exception as _e:
+                print(f"[rollback] falhou: {_e}")
+    except Exception:
+        pass
 
     app = App()
     try:
