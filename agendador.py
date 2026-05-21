@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.14"   # << aumente em cada build
+APP_VERSION = "2025.10.11.15"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -835,6 +835,105 @@ try:
  import psutil  # pip install psutil
 except Exception:
     psutil = None
+
+# ======================================================================================
+#  v2025.10.11.15 — Sistema de Tema Unificado MDW Bravo TI
+# ======================================================================================
+def _bravo_theme(dark: bool = False) -> dict:
+    """Paleta Bravo TI completa (light/dark). Centraliza todas as cores
+    para que SettingsDialog, HelpPanel, TaskDialog e a janela principal
+    fiquem consistentes em ambos os modos.
+    """
+    if dark:
+        return {
+            # backgrounds
+            'bg_app':       '#0f1419',  # fundo da janela principal
+            'bg_surface':   '#1a1f2e',  # cards, painéis, conteúdo
+            'bg_sidebar':   '#0d121a',  # sidebar mais escura que o app
+            'bg_hover':     '#252b3b',  # hover state
+            'bg_selected':  '#1e3a8a',  # seleção (azul Bravo escuro)
+            'bg_code':      '#0b0f17',  # blocos de código no Help
+            'bg_input':     '#1a1f2e',  # campos de entrada
+            # borders
+            'border':       '#2d3748',
+            'border_strong':'#475569',
+            # text
+            'text':         '#e2e8f0',  # texto primário
+            'text_strong':  '#f8fafc',  # títulos
+            'subtext':      '#94a3b8',  # texto secundário
+            'text_muted':   '#64748b',  # placeholders, labels desabilitados
+            # accent (azul Bravo — variante mais clara para contraste)
+            'accent':       '#3b82f6',
+            'accent_dark':  '#1d4ed8',
+            'accent_light': '#60a5fa',
+            'accent_bg':    '#1e3a8a',  # bg para destaque sutil
+            # status
+            'success':      '#10b981',
+            'success_bg':   '#064e3b',
+            'warning':      '#fbbf24',
+            'warning_bg':   '#78350f',
+            'error':        '#ef4444',
+            'error_bg':     '#7f1d1d',
+            'info':         '#06b6d4',
+            'info_bg':      '#164e63',
+            # outras
+            'shadow':       '#000000',
+        }
+    else:
+        return {
+            # backgrounds
+            'bg_app':       '#f1f3f5',  # fundo um pouco mais leve que o BravoForm
+            'bg_surface':   '#ffffff',
+            'bg_sidebar':   '#e9ecef',
+            'bg_hover':     '#e9ecef',
+            'bg_selected':  '#cfe2ff',  # bg azul claro pra seleção
+            'bg_code':      '#f5f7fa',
+            'bg_input':     '#ffffff',
+            # borders
+            'border':       '#dee2e6',
+            'border_strong':'#adb5bd',
+            # text
+            'text':         '#212529',
+            'text_strong':  '#0d1117',
+            'subtext':      '#6c757d',
+            'text_muted':   '#adb5bd',
+            # accent (Bravo blue oficial)
+            'accent':       '#007bff',
+            'accent_dark':  '#0056b3',
+            'accent_light': '#66b3ff',
+            'accent_bg':    '#e7f1ff',
+            # status
+            'success':      '#198754',
+            'success_bg':   '#d1e7dd',
+            'warning':      '#ffc107',
+            'warning_bg':   '#fff3cd',
+            'error':        '#dc3545',
+            'error_bg':     '#f8d7da',
+            'info':         '#0dcaf0',
+            'info_bg':      '#cff4fc',
+            # outras
+            'shadow':       '#00000020',
+        }
+
+def _is_dark_mode(master) -> bool:
+    """Detecta se o tema escuro está ativo no app principal."""
+    try:
+        return bool(master.var_dark.get())
+    except Exception:
+        return False
+
+def _resolve_fonts():
+    """Detecta as fontes Bravo (Montserrat / Roboto). Fallback Segoe UI."""
+    try:
+        import tkinter.font as _tkf
+        avail = set(_tkf.families())
+    except Exception:
+        avail = set()
+    title = "Montserrat" if "Montserrat" in avail else \
+            "Segoe UI Variable" if "Segoe UI Variable" in avail else "Segoe UI"
+    body = "Roboto" if "Roboto" in avail else \
+           "Segoe UI Variable" if "Segoe UI Variable" in avail else "Segoe UI"
+    return title, body
 
 # ======================================================================================
 #  Caminhos / Pastas (resistente a Program Files)
@@ -2817,87 +2916,144 @@ class HelpPanel(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.title("Ajuda — Agendador-Bravo")
-        self.geometry("960x640")
-        self.minsize(820, 520)
+        self.geometry("980x660")
+        self.minsize(840, 540)
         try:
-            self.transient(master)   # mantém junto da janela principal
+            self.transient(master)
         except Exception:
             pass
 
-        # ícone
+        # v2025.10.11.15 — Detecta tema do app pai
+        self._dark = _is_dark_mode(master)
+        self._theme = _bravo_theme(self._dark)
+        self._font_title, self._font_body = _resolve_fonts()
+        try:
+            _avail = set(tkfont.families())
+        except Exception:
+            _avail = set()
+        if "Cascadia Mono" in _avail:
+            self._font_code = "Cascadia Mono"
+        elif "Consolas" in _avail:
+            self._font_code = "Consolas"
+        else:
+            self._font_code = "Courier New"
+
+        # ícone + fundo geral
         try:
             ico = find_logo_ico()
             if ico:
                 self.iconbitmap(default=str(ico))
         except Exception:
             pass
+        self.configure(bg=self._theme['bg_app'])
 
-        # Layout: header + paned (lista esquerda + conteúdo direita) + footer
-        header = ttk.Frame(self, padding=(12, 10))
+        T = self._theme
+
+        # Header com cor de fundo Bravo
+        header = tk.Frame(self, bg=T['bg_surface'])
         header.pack(side="top", fill="x")
-        ttk.Label(header, text="📚  Central de Ajuda",
-                  font=("Segoe UI", 14, "bold")).pack(side="left")
-        ttk.Label(header,
-                  text=f"v{APP_VERSION}  ·  pressione F1 para reabrir",
-                  foreground="#888", font=("Segoe UI", 9))\
-            .pack(side="right")
+        header_inner = tk.Frame(header, bg=T['bg_surface'])
+        header_inner.pack(fill="x", padx=18, pady=14)
+        tk.Label(header_inner, text="📚  Central de Ajuda",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(self._font_title, 15, "bold")).pack(side="left")
+        tk.Label(header_inner,
+                 text=f"v{APP_VERSION}  ·  pressione F1 para reabrir",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(self._font_body, 9)).pack(side="right")
 
-        ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
+        # separador
+        tk.Frame(self, bg=T['border'], height=1).pack(side="top", fill="x")
 
-        paned = ttk.Panedwindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=10, pady=10)
+        # Conteúdo principal: paned com sidebar à esquerda + Text à direita
+        main = tk.Frame(self, bg=T['bg_app'])
+        main.pack(fill="both", expand=True)
 
-        # ── Lista de tópicos (esquerda) ─────────────────────────────────
-        left = ttk.Frame(paned, padding=(0, 0, 6, 0))
-        left.rowconfigure(0, weight=1)
-        left.columnconfigure(0, weight=1)
-        self.listbox = tk.Listbox(left, height=22, font=("Segoe UI", 10),
-                                  borderwidth=0, highlightthickness=0,
-                                  selectmode="single", exportselection=False)
+        # ── Sidebar (listbox de tópicos) ─────────────────────────────────
+        sidebar = tk.Frame(main, bg=T['bg_sidebar'], width=240)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        self.listbox = tk.Listbox(
+            sidebar,
+            font=(self._font_body, 10),
+            bg=T['bg_sidebar'], fg=T['text'],
+            selectbackground=T['accent'], selectforeground='#ffffff',
+            activestyle='none',
+            borderwidth=0, highlightthickness=0,
+            relief="flat",
+            selectmode="single", exportselection=False,
+        )
         for title, _key in self.TOPICS:
-            self.listbox.insert("end", title)
-        self.listbox.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(left, orient="vertical", command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=sb.set)
-        sb.grid(row=0, column=1, sticky="ns")
+            self.listbox.insert("end", f"  {title}")
+        self.listbox.pack(fill="both", expand=True, padx=(8, 0), pady=12)
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
 
-        # ── Conteúdo (direita) ──────────────────────────────────────────
-        right = ttk.Frame(paned, padding=(8, 0, 0, 0))
-        right.rowconfigure(0, weight=1)
-        right.columnconfigure(0, weight=1)
+        # separador vertical
+        tk.Frame(main, bg=T['border'], width=1).pack(side="left", fill="y")
 
-        self._text = tk.Text(right, wrap="word", padx=14, pady=12,
-                             font=("Segoe UI", 10), relief="flat", borderwidth=0)
-        self._text.grid(row=0, column=0, sticky="nsew")
+        # ── Conteúdo (Text widget) ──────────────────────────────────────
+        right = tk.Frame(main, bg=T['bg_surface'])
+        right.pack(side="left", fill="both", expand=True)
+
+        self._text = tk.Text(
+            right, wrap="word",
+            padx=24, pady=20,
+            font=(self._font_body, 10),
+            bg=T['bg_surface'], fg=T['text'],
+            insertbackground=T['text'],
+            relief="flat", borderwidth=0,
+            highlightthickness=0,
+        )
+        self._text.pack(side="left", fill="both", expand=True)
         tsb = ttk.Scrollbar(right, orient="vertical", command=self._text.yview)
         self._text.configure(yscrollcommand=tsb.set)
-        tsb.grid(row=0, column=1, sticky="ns")
+        tsb.pack(side="right", fill="y")
 
-        # Tags de estilo
-        self._text.tag_configure("h1", font=("Segoe UI", 14, "bold"), spacing3=8)
-        self._text.tag_configure("h2", font=("Segoe UI", 11, "bold"), spacing1=10, spacing3=6)
-        self._text.tag_configure("p", spacing3=6)
-        self._text.tag_configure("code", font=("Cascadia Mono", 9), background="#f5f5f5",
-                                 lmargin1=12, lmargin2=12, rmargin=12,
-                                 spacing1=4, spacing3=4)
-        self._text.tag_configure("step", font=("Segoe UI", 10, "bold"), foreground="#2563eb",
-                                 spacing1=8)
-        self._text.tag_configure("tip", foreground="#16a34a", font=("Segoe UI", 10, "italic"))
-        self._text.tag_configure("warn", foreground="#dc2626", font=("Segoe UI", 10, "bold"))
-
-        paned.add(left, weight=1)
-        paned.add(right, weight=3)
+        # Tags de estilo — TODAS respeitam o tema agora
+        self._text.tag_configure("h1",
+                                 font=(self._font_title, 18, "bold"),
+                                 foreground=T['text_strong'],
+                                 spacing1=4, spacing3=12)
+        self._text.tag_configure("h2",
+                                 font=(self._font_title, 13, "bold"),
+                                 foreground=T['accent'],
+                                 spacing1=14, spacing3=8)
+        self._text.tag_configure("p",
+                                 foreground=T['text'],
+                                 spacing3=8, lmargin1=0, lmargin2=0)
+        self._text.tag_configure("code",
+                                 font=(self._font_code, 9),
+                                 background=T['bg_code'],
+                                 foreground=T['text_strong'],
+                                 lmargin1=16, lmargin2=16, rmargin=16,
+                                 spacing1=6, spacing3=6,
+                                 borderwidth=0)
+        self._text.tag_configure("step",
+                                 font=(self._font_body, 10, "bold"),
+                                 foreground=T['accent'],
+                                 spacing1=12, spacing3=4)
+        self._text.tag_configure("tip",
+                                 foreground=T['success'],
+                                 font=(self._font_body, 10, "italic"))
+        self._text.tag_configure("warn",
+                                 foreground=T['error'],
+                                 font=(self._font_body, 10, "bold"))
+        self._text.tag_configure("muted",
+                                 foreground=T['subtext'])
 
         # Footer
-        ttk.Separator(self, orient="horizontal").pack(side="top", fill="x")
-        footer = ttk.Frame(self, padding=(10, 6))
+        tk.Frame(self, bg=T['border'], height=1).pack(side="top", fill="x")
+        footer = tk.Frame(self, bg=T['bg_surface'])
         footer.pack(side="bottom", fill="x")
-        ttk.Label(footer,
-                  text="Dica: este painel é não-modal — você pode deixar aberto enquanto configura.",
-                  foreground="#6b7280", font=("Segoe UI", 9))\
-            .pack(side="left")
-        ttk.Button(footer, text="Fechar", command=self.destroy).pack(side="right")
+        footer_inner = tk.Frame(footer, bg=T['bg_surface'])
+        footer_inner.pack(fill="x", padx=18, pady=10)
+        tk.Label(footer_inner,
+                 text="💡  Dica: este painel é não-modal — pode deixar aberto enquanto configura.",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(self._font_body, 9)).pack(side="left")
+        ttk.Button(footer_inner, text="Fechar",
+                   command=self.destroy).pack(side="right")
 
         # Seleciona o primeiro tópico
         self.listbox.selection_set(0)
@@ -3270,44 +3426,62 @@ class SettingsDialog(tk.Toplevel):
         self.minsize(960, 620)
         self.result = None
 
-        # v2025.10.11.13 — Sidebar com cores MDW Bravo TI
+        # v2025.10.11.15 — Sidebar com cores Bravo TI DINÂMICAS (light + dark)
+        self._dark = _is_dark_mode(master)
+        T = _bravo_theme(self._dark)
+        self._theme = T
         try:
             style = ttk.Style(self)
-            # Cores Bravo TI (do BravoForm globals.css)
-            BR_BG_SIDEBAR  = "#dce0e4"  # primary-bg
-            BR_BG_CONTENT  = "#ffffff"
-            BR_TEXT        = "#343a40"  # text-primary
-            BR_SUBTEXT     = "#6c757d"
-            BR_ACCENT      = "#007bff"  # Bravo blue
-            BR_BORDER      = "#dee2e6"
             style.configure("Sidebar.TNotebook",
                             tabposition="wn",
-                            background=BR_BG_SIDEBAR,
+                            background=T['bg_sidebar'],
                             borderwidth=0,
                             padding=0)
             style.configure("Sidebar.TNotebook.Tab",
                             padding=[20, 14],
                             font=("Segoe UI", 10),
                             width=20,
-                            background=BR_BG_SIDEBAR,
-                            foreground=BR_SUBTEXT,
-                            focuscolor="")
+                            background=T['bg_sidebar'],
+                            foreground=T['text'],
+                            focuscolor="",
+                            borderwidth=0)
             style.map("Sidebar.TNotebook.Tab",
-                      background=[("selected", BR_BG_CONTENT),
-                                  ("active", "#e9ecef"),
-                                  ("!selected", BR_BG_SIDEBAR)],
-                      foreground=[("selected", BR_ACCENT),
-                                  ("!selected", BR_TEXT)],
+                      background=[("selected", T['bg_surface']),
+                                  ("active", T['bg_hover']),
+                                  ("!selected", T['bg_sidebar'])],
+                      foreground=[("selected", T['accent']),
+                                  ("active", T['text_strong']),
+                                  ("!selected", T['text'])],
                       font=[("selected", ("Segoe UI", 10, "bold")),
                             ("!selected", ("Segoe UI", 10))])
-            style.configure("TLabelframe", padding=12, background=BR_BG_CONTENT,
-                            relief="solid", bordercolor=BR_BORDER, borderwidth=1)
+            # LabelFrame com bg dinâmico
+            style.configure("TLabelframe",
+                            padding=12,
+                            background=T['bg_surface'],
+                            relief="solid", bordercolor=T['border'], borderwidth=1)
             style.configure("TLabelframe.Label",
                             font=("Segoe UI", 10, "bold"),
-                            foreground=BR_ACCENT,
-                            background=BR_BG_CONTENT)
+                            foreground=T['accent'],
+                            background=T['bg_surface'])
+            # Frames padrão
+            style.configure("TFrame", background=T['bg_surface'])
+            style.configure("TLabel", background=T['bg_surface'], foreground=T['text'])
+            style.configure("TCheckbutton", background=T['bg_surface'],
+                            foreground=T['text'])
+            style.configure("TRadiobutton", background=T['bg_surface'],
+                            foreground=T['text'])
+            # Entry / Combobox (precisam de fieldbackground)
+            style.configure("TEntry",
+                            fieldbackground=T['bg_input'],
+                            foreground=T['text'],
+                            insertcolor=T['text'])
+            style.configure("TCombobox",
+                            fieldbackground=T['bg_input'],
+                            foreground=T['text'])
         except Exception:
             pass
+        # Janela com bg dinâmico
+        self.configure(bg=T['bg_app'])
 
         # ----- PDI (Pentaho) -----
         self.var_pdi = tk.StringVar(value=settings.get("pdi_home", r"C:\Pentaho\data-integration"))
@@ -3510,14 +3684,16 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=0, sticky="w", pady=(8, 0))
         row += 1
 
-        # v2025.10.11.12 — Painel de status: o que existe HOJE
-        status_frame = ttk.LabelFrame(tab_logs, text="📊 Status atual da pasta de logs", padding=12)
+        # v2025.10.11.15 — Painel de status com tema
+        T = getattr(self, '_theme', _bravo_theme(False))
+        status_frame = ttk.LabelFrame(tab_logs, text="📊 Status atual da pasta de logs",
+                                       padding=14)
         status_frame.grid(row=row, column=0, columnspan=3, sticky="we", pady=(20, 0))
         status_frame.columnconfigure(1, weight=1)
         self._logs_status_lbl = ttk.Label(status_frame,
                                           text="Calculando…",
                                           font=("Segoe UI", 10),
-                                          foreground="#374151",
+                                          foreground=T['text'],
                                           justify="left")
         self._logs_status_lbl.grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Button(status_frame, text="🔄 Atualizar",
@@ -3829,20 +4005,25 @@ class SettingsDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Falha", f"Não foi possível abrir o teste do WhatsApp:\n{e}")
 
-    # v2025.10.11.9 — header descritivo no topo de cada aba -----------------
+    # v2025.10.11.15 — header dinâmico (light/dark) -------------------------
     def _add_tab_header(self, tab, title, description):
-        """Cria um header com título + descrição no topo da aba (row 0)."""
+        """Cria header com título grande em azul Bravo + descrição em cinza."""
+        T = getattr(self, '_theme', _bravo_theme(False))
         header = ttk.Frame(tab)
-        header.grid(row=0, column=0, columnspan=4, sticky="we", pady=(0, 12))
+        header.grid(row=0, column=0, columnspan=4, sticky="we", pady=(0, 16))
         header.columnconfigure(0, weight=1)
+        # Título em azul Bravo, grande
         ttk.Label(header, text=title,
-                  font=("Segoe UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+                  font=("Segoe UI", 13, "bold"),
+                  foreground=T['accent']).grid(row=0, column=0, sticky="w")
+        # Descrição em subtext
         ttk.Label(header, text=description,
-                  font=("Segoe UI", 9), foreground="#6b7280",
+                  font=("Segoe UI", 9), foreground=T['subtext'],
                   wraplength=900, justify="left")\
-            .grid(row=1, column=0, sticky="we", pady=(2, 0))
-        ttk.Separator(header, orient="horizontal")\
-            .grid(row=2, column=0, sticky="we", pady=(8, 0))
+            .grid(row=1, column=0, sticky="we", pady=(4, 0))
+        # Linha divisória
+        sep = tk.Frame(header, bg=T['border'], height=1)
+        sep.grid(row=2, column=0, sticky="we", pady=(10, 0))
 
     # v2025.10.11.8 — helpers das novas abas ---------------------------------
     def test_webhooks(self):
@@ -4796,24 +4977,22 @@ class App(tk.Tk):
         ttk.Button(btns_up, text="Mais tarde", command=lambda: self._update_banner.grid_remove())\
        .pack(side="left", padx=4)
 
-        # v2025.10.11.13 — Welcome banner com cores Bravo TI
-        # Fundo branco-azulado, texto Bravo blue
-        WB_BG = "#e7f1ff"   # Light blue tint (derivado do Bravo blue)
-        WB_FG = "#0056b3"   # Bravo blue dark (--primary-accent-dark)
-        self._welcome_banner = tk.Frame(self, bg=WB_BG, padx=16, pady=12,
-                                         highlightthickness=1,
-                                         highlightbackground="#b3d9ff")
-        wb_left = tk.Frame(self._welcome_banner, bg=WB_BG)
-        wb_left.pack(side="left", fill="x", expand=True)
-        tk.Label(wb_left, text="👋  Bem-vindo ao Agendador-Bravo",
-                 bg=WB_BG, fg=WB_FG,
-                 font=("Segoe UI", 12, "bold")).pack(anchor="w")
-        tk.Label(wb_left,
-                 text="Comece criando seu primeiro job e configurando notificações.",
-                 bg=WB_BG, fg="#374151",
-                 font=("Segoe UI", 10)).pack(anchor="w", pady=(3, 0))
-        wb_right = tk.Frame(self._welcome_banner, bg=WB_BG)
+        # v2025.10.11.15 — Welcome banner com tema dinâmico
+        # Bg/fg vem do tema (light/dark); _refresh_welcome_banner_theme()
+        # é chamado quando o tema muda.
+        self._welcome_banner = tk.Frame(self, padx=18, pady=14)
+        self._wb_left = tk.Frame(self._welcome_banner)
+        self._wb_left.pack(side="left", fill="x", expand=True)
+        self._wb_title = tk.Label(self._wb_left, text="👋  Bem-vindo ao Agendador-Bravo",
+                                   font=("Segoe UI", 12, "bold"))
+        self._wb_title.pack(anchor="w")
+        self._wb_sub = tk.Label(self._wb_left,
+                                 text="Comece criando seu primeiro job e configurando notificações.",
+                                 font=("Segoe UI", 10))
+        self._wb_sub.pack(anchor="w", pady=(3, 0))
+        wb_right = tk.Frame(self._welcome_banner)
         wb_right.pack(side="right")
+        self._wb_right = wb_right
         ttk.Button(wb_right, text="📚  Começar tutorial",
                    command=self.open_help_panel,
                    style="Accent.TButton").pack(side="left", padx=4)
@@ -5201,44 +5380,27 @@ class App(tk.Tk):
 
     # ===== Tema / animações modernas =====
     def _apply_theme(self, dark: bool):
-        """v2025.10.11.13 — Identidade visual MDW Bravo TI.
+        """v2025.10.11.15 — Identidade visual MDW Bravo TI unificada.
 
-        Paleta direta do globals.css do BravoForm (mesma da mdwbravo.com.br):
-        - Light: #007bff (azul Bravo) sobre #dce0e4/#ffffff
-        - Dark: variante escura preservando o azul como acento
-        Fonts: Montserrat (títulos) + Roboto (corpo), fallback Segoe UI.
+        Usa _bravo_theme(dark) como fonte única de verdade. Cores ficam
+        consistentes entre App, SettingsDialog, HelpPanel e TaskDialog.
         """
-        if dark:
-            colors = {
-                'bg':          '#0f1419',  # fundo principal escuro
-                'surface':     '#1a1f2e',  # cards/painéis
-                'overlay':     '#2d3748',  # bordas e separadores
-                'text':        '#e2e8f0',  # texto primário
-                'subtext':     '#94a3b8',  # texto secundário
-                'accent':      '#3b82f6',  # Bravo blue (variante clara)
-                'accent_dark': '#1d4ed8',
-                'success':     '#10b981',
-                'warning':     '#fbbf24',
-                'error':       '#ef4444',
-                'teal':        '#06b6d4',
-                'purple':      '#a78bfa',
-            }
-        else:
-            # Bravo TI Light — extraído de BRAVOFORM/app/globals.css
-            colors = {
-                'bg':          '#dce0e4',  # --primary-bg
-                'surface':     '#ffffff',  # --secondary-bg
-                'overlay':     '#dee2e6',  # --border-color
-                'text':        '#343a40',  # --text-primary
-                'subtext':     '#6c757d',  # --text-secondary
-                'accent':      '#007bff',  # --primary-accent (Bravo blue)
-                'accent_dark': '#0056b3',  # --primary-accent-dark
-                'success':     '#28a745',  # --success-green
-                'warning':     '#ffc107',
-                'error':       '#dc3545',  # --error-red
-                'teal':        '#17a2b8',
-                'purple':      '#6f42c1',
-            }
+        T = _bravo_theme(dark)
+        # Aliases para o código legado de baixo
+        colors = {
+            'bg':          T['bg_app'],
+            'surface':     T['bg_surface'],
+            'overlay':     T['border'],
+            'text':        T['text'],
+            'subtext':     T['subtext'],
+            'accent':      T['accent'],
+            'accent_dark': T['accent_dark'],
+            'success':     T['success'],
+            'warning':     T['warning'],
+            'error':       T['error'],
+            'teal':        T['info'],
+            'purple':      T['accent_light'],
+        }
 
         # Tipografia oficial Bravo: Montserrat (display) + Roboto (sans).
         # Fallback inteligente baseado no que está instalado.
@@ -5352,6 +5514,13 @@ class App(tk.Tk):
                 self._title_label.configure(
                     font=(font_title, 16, "bold"),
                     foreground=colors['accent'])  # azul Bravo
+        except Exception:
+            pass
+
+        # v2025.10.11.15 — refresca welcome banner conforme tema
+        try:
+            if hasattr(self, '_welcome_banner'):
+                self._refresh_welcome_banner_theme()
         except Exception:
             pass
 
@@ -6143,6 +6312,25 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export YAML", f"Falha:\n{e}")
 
+    # v2025.10.11.15 — Refresca welcome banner conforme o tema ativo
+    def _refresh_welcome_banner_theme(self):
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+        bg = T['accent_bg']
+        fg = T['accent_dark'] if not dark else T['accent_light']
+        try:
+            self._welcome_banner.configure(bg=bg, highlightthickness=1,
+                                            highlightbackground=T['accent_light'])
+            self._wb_left.configure(bg=bg)
+            self._wb_right.configure(bg=bg)
+            self._wb_title.configure(bg=bg, fg=fg)
+            self._wb_sub.configure(bg=bg, fg=T['text'])
+        except Exception:
+            pass
+
     # v2025.10.11.9 — Welcome banner + empty state ------------------------
     def _dismiss_welcome(self):
         try:
@@ -6171,40 +6359,52 @@ class App(tk.Tk):
             pass
 
     def _update_empty_state(self):
-        """Mostra label sobrepondo a tabela quando 0 jobs."""
+        """v2025.10.11.15 — Empty state com tema dinâmico."""
         try:
             has_tasks = bool(self.data.get("tasks"))
             if has_tasks:
-                # esconde
                 if getattr(self, "_empty_state_lbl", None):
                     try:
                         self._empty_state_lbl.place_forget()
                     except Exception:
                         pass
                 return
-            # mostra (cria se não existir)
-            if not getattr(self, "_empty_state_lbl", None):
-                parent = self.tree.master  # left frame
-                lbl = tk.Frame(parent, bg="#f9fafb")
-                tk.Label(lbl, text="📋",
-                         bg="#f9fafb", fg="#9ca3af",
-                         font=("Segoe UI Emoji", 48)).pack(pady=(40, 8))
-                tk.Label(lbl, text="Nenhum job ainda",
-                         bg="#f9fafb", fg="#374151",
-                         font=("Segoe UI", 14, "bold")).pack()
-                tk.Label(lbl, text="Crie seu primeiro job para começar.",
-                         bg="#f9fafb", fg="#6b7280",
-                         font=("Segoe UI", 10)).pack(pady=(4, 16))
-                btns = tk.Frame(lbl, bg="#f9fafb")
-                btns.pack()
-                ttk.Button(btns, text="🧙 Abrir Assistente",
-                           command=self.open_assistant).pack(side="left", padx=4)
-                ttk.Button(btns, text="➕ Criar do zero",
-                           command=self.add_task).pack(side="left", padx=4)
-                ttk.Button(btns, text="📚 Ver tutorial",
-                           command=self.open_help_panel).pack(side="left", padx=4)
-                self._empty_state_lbl = lbl
-            self._empty_state_lbl.place(relx=0.5, rely=0.5, anchor="center")
+            # recria sempre pra pegar tema atual (light vs dark)
+            if getattr(self, "_empty_state_lbl", None):
+                try:
+                    self._empty_state_lbl.destroy()
+                except Exception:
+                    pass
+                self._empty_state_lbl = None
+
+            try:
+                dark = bool(self.var_dark.get())
+            except Exception:
+                dark = False
+            T = _bravo_theme(dark)
+
+            parent = self.tree.master
+            lbl = tk.Frame(parent, bg=T['bg_surface'])
+            tk.Label(lbl, text="📋",
+                     bg=T['bg_surface'], fg=T['text_muted'],
+                     font=("Segoe UI Emoji", 48)).pack(pady=(40, 8))
+            tk.Label(lbl, text="Nenhum job ainda",
+                     bg=T['bg_surface'], fg=T['text_strong'],
+                     font=("Segoe UI", 14, "bold")).pack()
+            tk.Label(lbl, text="Crie seu primeiro job para começar.",
+                     bg=T['bg_surface'], fg=T['subtext'],
+                     font=("Segoe UI", 10)).pack(pady=(4, 16))
+            btns = tk.Frame(lbl, bg=T['bg_surface'])
+            btns.pack()
+            ttk.Button(btns, text="🧙 Abrir Assistente",
+                       command=self.open_assistant,
+                       style="Accent.TButton").pack(side="left", padx=4)
+            ttk.Button(btns, text="➕ Criar do zero",
+                       command=self.add_task).pack(side="left", padx=4)
+            ttk.Button(btns, text="📚 Ver tutorial",
+                       command=self.open_help_panel).pack(side="left", padx=4)
+            self._empty_state_lbl = lbl
+            lbl.place(relx=0.5, rely=0.5, anchor="center")
         except Exception as e:
             print(f"[empty_state] {e}")
 

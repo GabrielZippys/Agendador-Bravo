@@ -1,6 +1,6 @@
 {
-  "version": "2025.10.11.14",
-  "zip_url": "https://github.com/GabrielZippys/Agendador-Bravo/releases/download/v2025.10.11.14/AgendadorBravo-2025.10.11.14.zip",
-  "sha256": "4cd475be874e0c2f66341e94485d8dbd1150666ccef5116b455ce7d4e7dd36a2",
-  "note": "v.14+ usa modo onedir (pasta com DLLs no disco, sem extracao runtime). Resolve o erro 'Failed to load python313.dll'. Clientes v.13 ou anteriores nao auto-atualizam — precisam baixar o Setup manualmente uma vez."
+  "version": "2025.10.11.15",
+  "zip_url": "https://github.com/GabrielZippys/Agendador-Bravo/releases/download/v2025.10.11.15/AgendadorBravo-2025.10.11.15.zip",
+  "sha256": "6f5585b1dd6396b71231f89d34a0978955ad2916b89d7a90421c7fbb71bf842e",
+  "note": "v.14+ usa modo onedir. Clientes v.13 ou anteriores precisam baixar o Setup manualmente uma vez."
 }
