@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.10"   # << aumente em cada build
+APP_VERSION = "2025.10.11.11"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -3136,9 +3136,18 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Configurações")
         self.resizable(True, True)
-        self.geometry("980x680")  # v2025.10.11.9 — bem maior para tabs não truncarem
-        self.minsize(820, 560)
+        self.geometry("1120x720")  # v2025.10.11.11 — mais largo + mais respiro
+        self.minsize(900, 600)
         self.result = None
+
+        # v2025.10.11.11 — reduz padding dos tabs para caberem sem truncar
+        try:
+            style = ttk.Style(self)
+            style.configure("TNotebook.Tab", padding=[10, 6])
+            style.configure("TNotebook", tabmargins=[4, 6, 4, 0])
+            style.configure("TLabelframe", padding=10)
+        except Exception:
+            pass
 
         # ----- PDI (Pentaho) -----
         self.var_pdi = tk.StringVar(value=settings.get("pdi_home", r"C:\Pentaho\data-integration"))
@@ -4544,13 +4553,11 @@ class App(tk.Tk):
                  text="Comece criando seu primeiro job e configurando notificações.",
                  bg="#dbeafe", fg="#1e40af",
                  font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
-        # Botões de ação
+        # Botões de ação (v.11: removida duplicidade "Configurar agora")
         wb_right = tk.Frame(self._welcome_banner, bg="#dbeafe")
         wb_right.pack(side="right")
-        ttk.Button(wb_right, text="📚 Abrir Ajuda",
+        ttk.Button(wb_right, text="📚 Começar tutorial",
                    command=self.open_help_panel).pack(side="left", padx=4)
-        ttk.Button(wb_right, text="⚙️ Configurar agora",
-                   command=self.open_settings).pack(side="left", padx=4)
         ttk.Button(wb_right, text="✕", width=3,
                    command=self._dismiss_welcome).pack(side="left", padx=(8, 0))
         # Inicialmente ocultado; mostrado em _maybe_show_welcome após startup
@@ -4621,88 +4628,53 @@ class App(tk.Tk):
         
         bar = self._toolbar_inner
 
-        # v2025.10.11.9 — tooltips em todos os botões; helper local
+        # v2025.10.11.11 — Toolbar MINIMALISTA
+        # Antes: 15 botões enfileirados.
+        # Agora: 6 essenciais + menu "⋯ Mais" pro resto.
         def _tip(widget, text):
             ToolTip(widget, text)
             return widget
 
-        # ── Grupo 1: Criar/Editar jobs ─────────────────────────────────────
-        b = ttk.Button(bar, text="➕ Nova", command=self.add_task, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Criar um novo job manualmente (Ctrl+N).\nVocê define nome, arquivo, horário, tags e opções avançadas.")
+        # ── Primários (texto + ícone) ──────────────────────────────────────
+        b = ttk.Button(bar, text="➕  Nova", command=self.add_task, style="Accent.TButton")
+        b.pack(side="left", padx=(0, 6))
+        _tip(b, "Criar novo job (Ctrl+N)")
 
-        b = ttk.Button(bar, text="🧙 Assistente", command=self.open_assistant, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Assistente guiado: escolha um arquivo (.ktr, .py, .bat, .exe) e o app sugere\nnome e comando automaticamente. Bom para começar rápido.")
+        self.btn_run = ttk.Button(bar, text="▶  Executar",
+                                 command=self.run_now, style="Accent.TButton")
+        self.btn_run.pack(side="left", padx=(0, 6))
+        _tip(self.btn_run, "Roda o job selecionado agora (Ctrl+R).\nCtrl+Click pra rodar vários em paralelo.")
 
-        b = ttk.Button(bar, text="✏️ Editar", command=self.edit_task, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Editar o job selecionado (Ctrl+E).\nSelecione uma linha na tabela antes.")
-
-        b = ttk.Button(bar, text="🗑️ Remover", command=self.remove_task, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Excluir o job selecionado (Del).\nO histórico de execuções é preservado.")
-
-        # ── Grupo 2: Estado ────────────────────────────────────────────────
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-
-        self.btn_toggle = ttk.Button(bar, text="⏸️ Desativar", command=self.toggle_task_status, style="Toggle.TButton")
-        self.btn_toggle.pack(side="left", padx=3)
-        _tip(self.btn_toggle, "Pausa/retoma o job selecionado.\nJob pausado fica salvo mas não é disparado pelo scheduler.")
-
-        # ── Grupo 3: Execução ──────────────────────────────────────────────
-        self.btn_run = ttk.Button(bar, text="▶ Executar agora",
-                                 command=self.run_now,
-                                 style="Accent.TButton")
-        self.btn_run.pack(side="left", padx=(10, 3))
-        _tip(self.btn_run, "Roda o(s) job(s) selecionado(s) agora, ignorando o agendamento (Ctrl+R).\nSelecione múltiplos com Ctrl+Click para rodar em paralelo.")
-
-        self.btn_stop = ttk.Button(bar, text="⏹️ Interromper",
-                                 command=self.stop_running_tasks,
-                                 style="Danger.TButton")
-        self.btn_stop.pack(side="left", padx=3)
+        self.btn_stop = ttk.Button(bar, text="⏹  Parar",
+                                 command=self.stop_running_tasks, style="Danger.TButton")
+        self.btn_stop.pack(side="left", padx=(0, 6))
         self.btn_stop.config(state="disabled")
-        _tip(self.btn_stop, "Mata o processo do(s) job(s) que está(ão) rodando agora (Esc).\nFica habilitado só quando há algo executando.")
+        _tip(self.btn_stop, "Interromper job em execução (Esc)")
 
-        # ── Grupo 4: Configuração/Logs/Ajuda ───────────────────────────────
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
+        # Toggle (estado dinâmico baseado em seleção) — fica visível
+        self.btn_toggle = ttk.Button(bar, text="⏸  Pausar",
+                                     command=self.toggle_task_status, style="Modern.TButton")
+        self.btn_toggle.pack(side="left", padx=(12, 6))
+        _tip(self.btn_toggle, "Pausa/retoma o job selecionado")
 
-        b = ttk.Button(bar, text="⚙️ Configurações", command=self.open_settings, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Abre o painel de configurações (Ctrl+,).\nE-mail, WhatsApp, webhooks, janelas de manutenção, API REST, etc.")
+        # Spacer flexível
+        ttk.Frame(bar).pack(side="left", padx=12)
 
-        b = ttk.Button(bar, text="❓ Ajuda", command=self.open_help_panel, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Abre o painel de ajuda com tutoriais passo-a-passo (F1).\nComo criar jobs, configurar notificações, usar variáveis dinâmicas, etc.")
+        # ── Secundários (só ícones, à direita) ─────────────────────────────
+        b = ttk.Button(bar, text="⚙", command=self.open_settings, width=4)
+        b.pack(side="left", padx=2)
+        _tip(b, "Configurações (Ctrl+,)\nE-mail, WhatsApp, webhooks, janelas, API REST")
 
-        b = ttk.Button(bar, text="📂 Logs", command=lambda: os.startfile(LOG_DIR), style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Abre a pasta de logs no Explorer.\nUm arquivo .log por execução, com saída completa do job.")
+        b = ttk.Button(bar, text="❓", command=self.open_help_panel, width=4)
+        b.pack(side="left", padx=2)
+        _tip(b, "Central de Ajuda (F1)\nTutoriais passo-a-passo de cada feature")
 
-        b = ttk.Button(bar, text="📄 Último log", command=self.open_last_log, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Abre o último log do job selecionado no editor de texto padrão.\nSelecione uma linha primeiro.")
+        # Menu "⋯" com tudo que não é uso diário
+        b = ttk.Button(bar, text="⋯  Mais", command=self._show_more_menu, width=10)
+        b.pack(side="left", padx=(8, 0))
+        _tip(b, "Mais ações: Assistente, Editar, Remover, Logs, Backup, YAML")
 
-        # ── Grupo 5: Backup/Portabilidade (v.8) ────────────────────────────
-        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10)
-
-        b = ttk.Button(bar, text="💾 Backup", command=self.action_backup, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Gera um .zip com config.json + logs + pids.\nÓtimo antes de fazer mudanças grandes ou migrar de máquina.")
-
-        b = ttk.Button(bar, text="↩ Restaurar", command=self.action_restore, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Restaura um backup .zip criado anteriormente.\nSobrescreve o config.json atual — faça backup antes!")
-
-        b = ttk.Button(bar, text="📤 Export YAML", command=self.action_export_yaml, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Exporta apenas os jobs em formato YAML.\nÚtil para versionar no Git ou copiar jobs entre máquinas.")
-
-        b = ttk.Button(bar, text="📥 Import YAML", command=self.action_import_yaml, style="Modern.TButton")
-        b.pack(side="left", padx=3)
-        _tip(b, "Importa jobs de um arquivo YAML/JSON.\nVocê escolhe entre mesclar (adicionar/substituir por nome) ou substituir tudo.")
-
-        # ── Atalhos de teclado (v2025.10.11.9) ────────────────────────────
+        # ── Atalhos de teclado ────────────────────────────────────────────
         self.bind("<Control-n>", lambda e: self.add_task())
         self.bind("<Control-N>", lambda e: self.add_task())
         self.bind("<Control-e>", lambda e: self.edit_task())
@@ -4781,6 +4753,10 @@ class App(tk.Tk):
         hbar.grid(row=2, column=0, sticky="ew")
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Configure>", self._on_tree_resize)
+        # v2025.10.11.11 — context menu (right-click)
+        self.tree.bind("<Button-3>", self._show_tree_context_menu)
+        # v2025.10.11.11 — duplo-clique edita o job
+        self.tree.bind("<Double-1>", lambda e: self.edit_task())
 
         right = ttk.Frame(paned)
         right.rowconfigure(0, weight=1)
@@ -5921,6 +5897,82 @@ class App(tk.Tk):
             self._empty_state_lbl.place(relx=0.5, rely=0.5, anchor="center")
         except Exception as e:
             print(f"[empty_state] {e}")
+
+    # v2025.10.11.11 — Menu "Mais" + context menu --------------------------
+    def _show_more_menu(self):
+        """Menu dropdown com tudo que tirei da toolbar pra ficar minimalista."""
+        try:
+            m = tk.Menu(self, tearoff=0)
+            m.add_command(label="🧙  Assistente de criação...",
+                          command=self.open_assistant)
+            m.add_command(label="✏️  Editar job selecionado",
+                          accelerator="Ctrl+E",
+                          command=self.edit_task)
+            m.add_command(label="🗑️  Remover job selecionado",
+                          accelerator="Del",
+                          command=self.remove_task)
+            m.add_separator()
+            m.add_command(label="📂  Abrir pasta de logs",
+                          command=lambda: os.startfile(LOG_DIR))
+            m.add_command(label="📄  Abrir último log do job",
+                          command=self.open_last_log)
+            m.add_separator()
+            m.add_command(label="💾  Fazer backup (.zip)",
+                          command=self.action_backup)
+            m.add_command(label="↩  Restaurar backup...",
+                          command=self.action_restore)
+            m.add_separator()
+            m.add_command(label="📤  Exportar jobs (YAML)",
+                          command=self.action_export_yaml)
+            m.add_command(label="📥  Importar jobs (YAML)",
+                          command=self.action_import_yaml)
+            m.add_separator()
+            m.add_command(label="🧪  Simular erro (teste de notificação)",
+                          command=self.simulate_error)
+            m.add_command(label="🔄  Verificar atualizações",
+                          command=self.check_updates_now)
+            # Posiciona o menu logo abaixo do widget que disparou
+            # Usa coordenadas do mouse
+            x = self.winfo_pointerx()
+            y = self.winfo_pointery()
+            m.tk_popup(x, y)
+        except Exception as e:
+            print(f"[more menu] {e}")
+
+    def _show_tree_context_menu(self, event):
+        """v2025.10.11.11 — Menu de contexto ao clicar direito num job."""
+        try:
+            # seleciona o item sob o cursor
+            iid = self.tree.identify_row(event.y)
+            if iid:
+                if iid not in self.tree.selection():
+                    self.tree.selection_set(iid)
+            sel = self.tree.selection()
+            if not sel:
+                return
+            task = next((t for t in self.data.get("tasks", []) if t.get("name") == sel[0]), None)
+            if not task:
+                return
+            m = tk.Menu(self, tearoff=0)
+            m.add_command(label="▶  Executar agora",
+                          accelerator="Ctrl+R",
+                          command=self.run_now)
+            enabled = task.get("enabled", True)
+            label = "▶️  Ativar" if not enabled else "⏸️  Pausar"
+            m.add_command(label=label, command=self.toggle_task_status)
+            m.add_separator()
+            m.add_command(label="✏️  Editar...",
+                          accelerator="Ctrl+E",
+                          command=self.edit_task)
+            m.add_command(label="🗑️  Remover...",
+                          accelerator="Del",
+                          command=self.remove_task)
+            m.add_separator()
+            m.add_command(label="📄  Abrir último log",
+                          command=self.open_last_log)
+            m.tk_popup(event.x_root, event.y_root)
+        except Exception as e:
+            print(f"[context menu] {e}")
 
     # v2025.10.11.9 — Painel de Ajuda --------------------------------------
     def open_help_panel(self):
