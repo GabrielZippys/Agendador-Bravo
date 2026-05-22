@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.21"   # << aumente em cada build
+APP_VERSION = "2025.10.11.22"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1145,6 +1145,13 @@ def _migrate_data_schema(data: dict) -> dict:
         t.setdefault("respect_maintenance", True)
         t.setdefault("dynamic_params", True)
         t.setdefault("variables", {})  # {"VAR_NAME": "valor"} usado em ${VAR_NAME}
+        # v2025.10.11.22 — cascade + watcher
+        t.setdefault("cascade_on_success", [])
+        t.setdefault("watcher", {"enabled": False, "folder": "", "pattern": "*"})
+    # v2025.10.11.22 — webhook tokens + integracoes adicionais
+    settings.setdefault("webhook_inbound", {"enabled": False, "tokens": []})
+    settings.setdefault("slack", {"enabled": False, "signing_secret": ""})
+    settings.setdefault("notion_sync", {"enabled": False, "token": "", "database_id": ""})
     return data
 
 def load_data():
@@ -1816,9 +1823,109 @@ def start_rest_api(app_ref):
             return self._send(404, {"error": "not_found"})
 
         def do_POST(self):
+            path = self.path.split("?", 1)[0].rstrip("/")
+
+            # v2025.10.11.22 — Webhook inbound (sem token global; usa secret do path)
+            if path.startswith("/webhook/"):
+                parts = path[len("/webhook/"):].split("/", 1)
+                if len(parts) == 2:
+                    secret, job_name = parts
+                    secret = urllib.parse.unquote(secret)
+                    job_name = urllib.parse.unquote(job_name)
+                    # Verifica secret contra lista em settings.webhook_inbound.tokens
+                    wcfg = app_ref.data.get("settings", {}).get("webhook_inbound", {}) or {}
+                    if not wcfg.get("enabled"):
+                        return self._send(403, {"error": "webhook_inbound disabled"})
+                    tokens = wcfg.get("tokens", []) or []
+                    # tokens é lista de {"secret": "...", "allowed_job": "..."} ou só strings
+                    allowed = False
+                    for tok in tokens:
+                        if isinstance(tok, dict):
+                            if tok.get("secret") == secret:
+                                aj = tok.get("allowed_job", "")
+                                if not aj or aj == job_name:
+                                    allowed = True
+                                    break
+                        elif isinstance(tok, str):
+                            if tok == secret:
+                                allowed = True
+                                break
+                    if not allowed:
+                        return self._send(401, {"error": "invalid_secret"})
+                    t = next((x for x in app_ref.data.get("tasks", []) if x.get("name") == job_name), None)
+                    if not t:
+                        return self._send(404, {"error": "job_not_found"})
+                    try:
+                        threading.Thread(target=lambda: app_ref._job_wrapper(t), daemon=True).start()
+                        # Log
+                        try:
+                            sched_log = LOG_DIR / "_scheduler.log"
+                            with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                                f.write(f"[{now_str()}] WEBHOOK_INBOUND job={job_name}\n")
+                        except Exception:
+                            pass
+                        return self._send(202, {"queued": job_name})
+                    except Exception as e:
+                        return self._send(500, {"error": str(e)})
+
+            # v2025.10.11.22 — Slack slash command "/bravo run JobName"
+            if path == "/slack":
+                # Slack envia application/x-www-form-urlencoded
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b""
+                # Validação básica de signing secret (opcional)
+                slack_cfg = app_ref.data.get("settings", {}).get("slack", {}) or {}
+                if not slack_cfg.get("enabled"):
+                    return self._send(403, {"text": "Slack disabled"})
+                signing_secret = dpapi_decrypt(slack_cfg.get("signing_secret", "")) if slack_cfg.get("signing_secret") else ""
+                if signing_secret:
+                    # Verifica X-Slack-Signature (v0)
+                    ts = self.headers.get("X-Slack-Request-Timestamp", "")
+                    sig = self.headers.get("X-Slack-Signature", "")
+                    if ts and sig:
+                        try:
+                            import hmac as _hmac
+                            base = f"v0:{ts}:{raw.decode('utf-8')}"
+                            expected = "v0=" + _hmac.new(
+                                signing_secret.encode(), base.encode(), hashlib.sha256
+                            ).hexdigest()
+                            if not _hmac.compare_digest(expected, sig):
+                                return self._send(401, {"text": "Invalid signature"})
+                        except Exception as e:
+                            print(f"[slack] sig check failed: {e}")
+                # Parse form
+                form = urllib.parse.parse_qs(raw.decode("utf-8"))
+                text = (form.get("text", [""])[0] or "").strip()
+                # Formato esperado: "run JobName" ou "run JobName arg1 arg2"
+                parts = text.split(None, 1)
+                if not parts:
+                    return self._send(200, {"text": "Uso: /bravo run <NomeDoJob>"})
+                cmd = parts[0].lower()
+                if cmd != "run":
+                    return self._send(200, {"text": f"Comando '{cmd}' não suportado. Use 'run <JobName>'."})
+                if len(parts) < 2:
+                    return self._send(200, {"text": "Uso: /bravo run <NomeDoJob>"})
+                job_name = parts[1].strip()
+                t = next((x for x in app_ref.data.get("tasks", []) if x.get("name") == job_name), None)
+                if not t:
+                    return self._send(200, {"text": f"❌ Job '{job_name}' não encontrado."})
+                if not t.get("enabled", True):
+                    return self._send(200, {"text": f"⏸ Job '{job_name}' está pausado."})
+                try:
+                    threading.Thread(target=lambda: app_ref._job_wrapper(t), daemon=True).start()
+                    try:
+                        sched_log = LOG_DIR / "_scheduler.log"
+                        with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                            f.write(f"[{now_str()}] SLACK_TRIGGER job={job_name}\n")
+                    except Exception:
+                        pass
+                    return self._send(200, {"text": f"🚀 Disparei `{job_name}`. Confira no painel."})
+                except Exception as e:
+                    return self._send(200, {"text": f"❌ Erro: {e}"})
+
+            # Endpoint protegido — exige token de auth (rota /jobs/{nome}/run)
             if not self._auth():
                 return self._send(401, {"error": "unauthorized"})
-            path = self.path.split("?", 1)[0].rstrip("/")
             if path.startswith("/jobs/") and path.endswith("/run"):
                 name = urllib.parse.unquote(path[len("/jobs/"):-len("/run")])
                 t = next((x for x in app_ref.data.get("tasks", []) if x.get("name") == name), None)
@@ -1843,6 +1950,114 @@ def start_rest_api(app_ref):
     return server
 
 import urllib.parse  # usado na REST API
+
+
+# ======================================================================================
+#  v2025.10.11.22 — File Watcher (watchdog) + Notion sync (lazy)
+# ======================================================================================
+
+def _lazy_watchdog():
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler, PatternMatchingEventHandler
+        return Observer, FileSystemEventHandler, PatternMatchingEventHandler
+    except Exception:
+        return None, None, None
+
+
+class WatcherManager:
+    """v2025.10.11.22 — Gerencia watchers de arquivo via watchdog.
+
+    Cada task com `watcher.enabled=True` recebe um observer separado.
+    Quando o arquivo aparece (created OR modified), dispara o job.
+    Cooldown de 5s pra evitar disparo duplo em modificações em rajada.
+    """
+
+    def __init__(self, app_ref):
+        self.app = app_ref
+        self.observers = []
+        self._cooldown = {}  # task_name → last_trigger_timestamp
+
+    def stop_all(self):
+        for o in self.observers:
+            try:
+                o.stop()
+                o.join(timeout=1)
+            except Exception:
+                pass
+        self.observers = []
+        self._cooldown.clear()
+
+    def restart_for_tasks(self, tasks):
+        """Para todos e re-inicia pros tasks atuais com watcher habilitado."""
+        self.stop_all()
+        Observer, _FSE, PME = _lazy_watchdog()
+        if not Observer:
+            return
+        from pathlib import Path as _P
+        for task in tasks:
+            if not task.get("enabled", True):
+                continue
+            wcfg = task.get("watcher") or {}
+            if not wcfg.get("enabled"):
+                continue
+            folder = wcfg.get("folder", "").strip()
+            if not folder or not _P(folder).exists():
+                continue
+            pattern = wcfg.get("pattern", "*").strip() or "*"
+            task_name = task["name"]
+
+            class Handler(PME):
+                def __init__(h, mgr, tname):
+                    super().__init__(patterns=[pattern], ignore_directories=True)
+                    h.mgr = mgr
+                    h.tname = tname
+
+                def _trigger(h, ev):
+                    import time as _t
+                    now = _t.time()
+                    last = h.mgr._cooldown.get(h.tname, 0)
+                    if now - last < 5:
+                        return
+                    h.mgr._cooldown[h.tname] = now
+                    # Loga
+                    try:
+                        sched_log = LOG_DIR / "_scheduler.log"
+                        with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                            f.write(f"[{now_str()}] WATCHER_TRIGGER task={h.tname} "
+                                    f"file={getattr(ev,'src_path','?')}\n")
+                    except Exception:
+                        pass
+                    # Dispara job
+                    tk_task = next((t for t in h.mgr.app.data.get("tasks", [])
+                                    if t.get("name") == h.tname), None)
+                    if tk_task:
+                        threading.Thread(
+                            target=lambda t=tk_task: h.mgr.app._job_wrapper(t),
+                            daemon=True
+                        ).start()
+
+                def on_created(h, ev): h._trigger(ev)
+                def on_modified(h, ev): h._trigger(ev)
+
+            obs = Observer()
+            try:
+                obs.schedule(Handler(self, task_name), folder, recursive=False)
+                obs.start()
+                self.observers.append(obs)
+                print(f"[watcher] {task_name} → {folder} ({pattern})")
+            except Exception as e:
+                print(f"[watcher] falha em {task_name}: {e}")
+
+
+def _lazy_notion():
+    """Lazy import do Notion SDK pra sync de jobs."""
+    try:
+        from notion_client import Client
+        return Client
+    except Exception:
+        return None
+
 
 # ======================================================================================
 #  Notificações
@@ -2352,6 +2567,13 @@ class TaskDialog(tk.Toplevel):
         self.var_retry_backoff = tk.StringVar(value=",".join(str(x) for x in backoff_list))
         self._depends_on = list((task or {}).get("depends_on", []) or [])
         self._variables = dict((task or {}).get("variables", {}) or {})
+        # v2025.10.11.22 — cascade
+        self._cascade_on_success = list((task or {}).get("cascade_on_success", []) or [])
+        # v2025.10.11.22 — watcher
+        _w = (task or {}).get("watcher", {}) or {}
+        self.var_watcher_on = tk.BooleanVar(value=_w.get("enabled", False))
+        self.var_watcher_folder = tk.StringVar(value=_w.get("folder", ""))
+        self.var_watcher_pattern = tk.StringVar(value=_w.get("pattern", "*"))
         # ---- "Início + repetição" (start_repeat) ----
         self.var_sr_start      = tk.StringVar(value=(task or {}).get("sr_start", (task or {}).get("time", "06:00")))
         self.var_sr_every_val  = tk.StringVar(value=str((task or {}).get("sr_every_value", (task or {}).get("every_value", 5))))
@@ -2527,6 +2749,31 @@ class TaskDialog(tk.Toplevel):
         ttk.Button(dep_frame, text="Editar…", width=10,
                    command=self._edit_depends).grid(row=0, column=2, sticky="e")
 
+        # v2025.10.11.22 — Cascade (jobs que disparam quando este termina OK)
+        ttk.Label(adv, text="Em sucesso, dispara:").grid(row=7, column=0, sticky="w", pady=(6, 0))
+        self._lbl_cascade = ttk.Label(adv, text=self._fmt_cascade_label())
+        self._lbl_cascade.grid(row=7, column=1, sticky="we", padx=(4, 4), pady=(6, 0))
+        ttk.Button(adv, text="Editar…", width=10,
+                   command=self._edit_cascade).grid(row=7, column=2, sticky="e", pady=(6, 0))
+
+        # v2025.10.11.22 — Watcher (dispara ao detectar arquivo)
+        watch_lf = ttk.LabelFrame(adv, text="📂 Watcher (disparar ao detectar arquivo)",
+                                    padding=8)
+        watch_lf.grid(row=8, column=0, columnspan=4, sticky="we", pady=(10, 0))
+        watch_lf.columnconfigure(1, weight=1)
+        ttk.Checkbutton(watch_lf, text="Ativar watcher (job também dispara quando arquivo aparece)",
+                        variable=self.var_watcher_on).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(watch_lf, text="Pasta:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(watch_lf, textvariable=self.var_watcher_folder, width=40)\
+            .grid(row=1, column=1, sticky="we", padx=(4, 4), pady=(6, 0))
+        ttk.Button(watch_lf, text="...", width=3,
+                   command=self._pick_watcher_folder).grid(row=1, column=2, sticky="e", pady=(6, 0))
+        ttk.Label(watch_lf, text="Padrão:").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(watch_lf, textvariable=self.var_watcher_pattern, width=20)\
+            .grid(row=2, column=1, sticky="w", padx=(4, 0), pady=(4, 0))
+        ttk.Label(watch_lf, text="Ex.: *.csv, relatorio_*.xlsx, *.kjb",
+                  foreground="#888").grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
         # Variáveis customizadas + Pentaho detector
         var_frame = ttk.Frame(adv)
         var_frame.grid(row=4, column=0, columnspan=4, sticky="we", pady=(6, 0))
@@ -2567,6 +2814,45 @@ class TaskDialog(tk.Toplevel):
         if not self._depends_on:
             return "— nenhum —"
         return ", ".join(self._depends_on[:3]) + (f" (+{len(self._depends_on)-3})" if len(self._depends_on) > 3 else "")
+
+    def _fmt_cascade_label(self):
+        if not self._cascade_on_success:
+            return "— nenhum —"
+        return ", ".join(self._cascade_on_success[:3]) + (
+            f" (+{len(self._cascade_on_success)-3})"
+            if len(self._cascade_on_success) > 3 else ""
+        )
+
+    def _edit_cascade(self):
+        """v2025.10.11.22 — Multi-select de jobs pra cascade on success."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Cascade em sucesso")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        frm = ttk.Frame(dlg, padding=10); frm.grid(sticky="nsew")
+        ttk.Label(frm, text="Marque os jobs que devem rodar APÓS este terminar com sucesso:").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        lb = tk.Listbox(frm, selectmode="multiple", height=10, width=42, exportselection=False)
+        lb.grid(row=1, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        my_name = self.var_name.get().strip()
+        for n in self._existing_jobs:
+            if n == my_name:
+                continue
+            lb.insert("end", n)
+        for i in range(lb.size()):
+            if lb.get(i) in self._cascade_on_success:
+                lb.selection_set(i)
+        def _save():
+            self._cascade_on_success = [lb.get(i) for i in lb.curselection()]
+            self._lbl_cascade.config(text=self._fmt_cascade_label())
+            dlg.destroy()
+        ttk.Button(frm, text="OK", command=_save).grid(row=2, column=0, pady=(8, 0), sticky="e", padx=4)
+        ttk.Button(frm, text="Cancelar", command=dlg.destroy).grid(row=2, column=1, pady=(8, 0), sticky="w", padx=4)
+
+    def _pick_watcher_folder(self):
+        d = filedialog.askdirectory(title="Pasta a observar")
+        if d:
+            self.var_watcher_folder.set(d)
 
     def _fmt_vars_label(self):
         if not self._variables:
@@ -2780,6 +3066,13 @@ class TaskDialog(tk.Toplevel):
             "respect_maintenance": self.var_resp_mw.get(),
             "dynamic_params": self.var_dyn.get(),
             "variables": dict(self._variables),
+            # v2025.10.11.22 — cascade + watcher
+            "cascade_on_success": list(self._cascade_on_success),
+            "watcher": {
+                "enabled": self.var_watcher_on.get(),
+                "folder": self.var_watcher_folder.get().strip(),
+                "pattern": self.var_watcher_pattern.get().strip() or "*",
+            },
         }
         self.destroy()
 
@@ -6821,6 +7114,14 @@ class App(_AppBase):
         except Exception as _e:
             print(f"[morning auto] falha ao agendar: {_e}")
 
+        # v2025.10.11.22 — Re-inicializa file watchers
+        try:
+            if not hasattr(self, "_watcher_mgr"):
+                self._watcher_mgr = WatcherManager(self)
+            self._watcher_mgr.restart_for_tasks(self.data.get("tasks", []))
+        except Exception as _e:
+            print(f"[watcher] falha ao iniciar: {_e}")
+
         # garante scheduler rodando
         if not self.scheduler.running:
             self.scheduler.start()
@@ -8422,6 +8723,26 @@ class App(_AppBase):
                 if attempt < max_attempts and attempt - 1 < len(backoff):
                     delay = int(backoff[attempt - 1])
                     self._schedule_retry(task, attempt + 1, delay)
+
+        # ---- 4) Cascade em sucesso (v2025.10.11.22) -----------------------
+        if rc == 0:
+            cascade_names = task.get("cascade_on_success", []) or []
+            for next_name in cascade_names:
+                next_task = next((t for t in self.data.get("tasks", [])
+                                  if t.get("name") == next_name
+                                  and t.get("enabled", True)), None)
+                if next_task:
+                    # Audit log
+                    try:
+                        sched_log = LOG_DIR / "_scheduler.log"
+                        with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                            f.write(f"[{now_str()}] CASCADE from={task['name']} -> {next_name}\n")
+                    except Exception:
+                        pass
+                    threading.Thread(
+                        target=lambda t=next_task: self._job_wrapper(t),
+                        daemon=True
+                    ).start()
 
     def _schedule_retry(self, task, next_attempt: int, delay_seconds: int):
         """Agenda uma re-execução do job daqui a delay_seconds, contando como tentativa next_attempt."""

@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # ── versão sincronizada com agendador.py ─────────────────────────────────────
-APP_VERSION = "2025.10.11.21"
+APP_VERSION = "2025.10.11.22"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -90,6 +90,9 @@ def create_executable():
         # v2025.10.11.20 — drag-and-drop
         "--hidden-import=tkinterdnd2",
         "--collect-all=tkinterdnd2",
+        # v2025.10.11.22 — file watcher
+        "--hidden-import=watchdog",
+        "--collect-all=watchdog",
         str(main_script),
     ]
 

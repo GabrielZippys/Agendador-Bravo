@@ -11,7 +11,7 @@
 ; =============================================================================
 
 #define MyAppName      "AgendadorBravo"
-#define MyAppVersion   "2025.10.11.21"
+#define MyAppVersion   "2025.10.11.22"
 #define MyAppPublisher "Bravo Logística"
 #define MyAppExeName   "AgendadorBravo.exe"
 #define MyAppURL       "https://github.com/GabrielZippys/Agendador-Bravo"
