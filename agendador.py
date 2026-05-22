@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.17"   # << aumente em cada build
+APP_VERSION = "2025.10.11.18"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1013,6 +1013,14 @@ def _migrate_data_schema(data: dict) -> dict:
     settings.setdefault("rest_api", {
         "enabled": False, "port": 17654, "token": "", "bind_host": "127.0.0.1",
     })
+    # v2025.10.11.18 — Modo Manhã (auto-disparo da tag em horário-limite)
+    settings.setdefault("morning_mode", {
+        "enabled": False,
+        "tag": "",                  # qual tag disparar
+        "auto_trigger_time": "08:00",  # horário do auto-disparo se ninguém rodou
+        "auto_trigger_days": [True]*5 + [False, False],  # seg-sex
+        "notify_when_auto": True,    # avisa quando dispara automaticamente
+    })
     # rollback
     settings.setdefault("rollback", {"enabled": True, "crash_threshold": 3})
     # secrets_encrypted flag
@@ -1097,6 +1105,14 @@ def load_data():
                 "port": 17654,
                 "token": "",              # vazio = sem auth (só localhost)
                 "bind_host": "127.0.0.1",
+            },
+            # v2025.10.11.18 — Modo Manhã (auto-disparo)
+            "morning_mode": {
+                "enabled": False,
+                "tag": "",
+                "auto_trigger_time": "08:00",
+                "auto_trigger_days": [True]*5 + [False, False],
+                "notify_when_auto": True,
             },
             # v2025.10.11.8 — rollback automático após N crashes seguidos
             "rollback": {
@@ -3545,6 +3561,15 @@ class SettingsDialog(tk.Toplevel):
         self.var_rb_on = tk.BooleanVar(value=rb.get("enabled", True))
         self.var_rb_thr = tk.StringVar(value=str(rb.get("crash_threshold", 3)))
 
+        # ----- v2025.10.11.18 — Modo Manhã -----
+        mm = settings.get("morning_mode", {}) or {}
+        self.var_mm_on = tk.BooleanVar(value=mm.get("enabled", False))
+        self.var_mm_tag = tk.StringVar(value=mm.get("tag", ""))
+        self.var_mm_time = tk.StringVar(value=mm.get("auto_trigger_time", "08:00"))
+        mm_days = mm.get("auto_trigger_days") or [True]*5 + [False, False]
+        self.var_mm_days = [tk.BooleanVar(value=bool(mm_days[i])) for i in range(7)]
+        self.var_mm_notify = tk.BooleanVar(value=mm.get("notify_when_auto", True))
+
         # ---------- LAYOUT COM ABAS ----------
         main_frame = ttk.Frame(self, padding=10)
         main_frame.grid(sticky="nsew")
@@ -3646,6 +3671,57 @@ class SettingsDialog(tk.Toplevel):
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)); row += 1
         ttk.Button(tab_wh, text="Testar webhooks", command=self.test_webhooks)\
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
+
+        # === ABA: MODO MANHÃ (v2025.10.11.18) ===
+        tab_mm = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_mm, text="  Modo Manhã  ")
+        self._add_tab_header(tab_mm, "🌅  Modo Manhã (auto-disparo)",
+                             "Dispara em 1 clique todos os jobs de uma tag específica. "
+                             "Útil quando o time chega de manhã e precisa subir bases ASAP. "
+                             "O app também pode disparar AUTOMATICAMENTE se ninguém rodou até X horas.")
+        row = 1
+        ttk.Checkbutton(tab_mm, text="Habilitar Modo Manhã (botão 🌅 fica funcional)",
+                        variable=self.var_mm_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        ttk.Label(tab_mm, text="Tag de Manhã:").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        tag_combo = ttk.Combobox(tab_mm, textvariable=self.var_mm_tag,
+                                  values=self._all_known_tags_from_master(),
+                                  width=24)
+        tag_combo.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(12, 0)); row += 1
+        ttk.Label(tab_mm, text="↑ Selecione uma tag existente ou digite nova. Marque seus jobs prioritários com ela em Editar → Avançado → Tags.",
+                  foreground="#888", wraplength=900).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
+
+        # Separador
+        ttk.Separator(tab_mm, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(16, 12)); row += 1
+
+        ttk.Label(tab_mm, text="⏰  Auto-disparo (caso ninguém rode no horário)",
+                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        ttk.Label(tab_mm, text="Horário-limite:").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(tab_mm, textvariable=self.var_mm_time, width=10).grid(
+            row=row, column=1, sticky="w", padx=(8, 0), pady=(8, 0)); row += 1
+        ttk.Label(tab_mm, text="↑ Se até esse horário nenhum job da tag rodou, o app dispara sozinho. Ex.: 08:00",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
+
+        ttk.Label(tab_mm, text="Dias:").grid(row=row, column=0, sticky="w", pady=(10, 0))
+        mm_days_frame = ttk.Frame(tab_mm)
+        mm_days_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
+        for i, lab in enumerate(["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]):
+            ttk.Checkbutton(mm_days_frame, text=lab, variable=self.var_mm_days[i]).pack(side="left", padx=2)
+        row += 1
+
+        ttk.Checkbutton(tab_mm, text="Notificar (e-mail/webhook) quando auto-disparar",
+                        variable=self.var_mm_notify).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0)); row += 1
+
+        ttk.Label(tab_mm,
+                  text=("💡  Como funciona o auto-disparo:\n"
+                        "  1. Você marca seus jobs críticos com a tag (ex.: 'Manhã').\n"
+                        "  2. O app checa todo dia no horário-limite.\n"
+                        "  3. Se nenhum job da tag rodou hoje ainda, dispara sozinho e avisa o time.\n"
+                        "  4. Modo Manhã ignora janelas de manutenção (é emergência)."),
+                  foreground="#666", justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(16, 0))
 
         # === ABA 4: LIMPEZA DE LOGS ===
         tab_logs = ttk.Frame(notebook, padding=24)
@@ -4005,6 +4081,19 @@ class SettingsDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Falha", f"Não foi possível abrir o teste do WhatsApp:\n{e}")
 
+    # v2025.10.11.18 — coleta tags do app principal para combobox do Modo Manhã
+    def _all_known_tags_from_master(self):
+        try:
+            tasks = self.master.data.get("tasks", []) or []
+            tags = set()
+            for t in tasks:
+                for tg in (t.get("tags") or []):
+                    if tg:
+                        tags.add(tg)
+            return sorted(tags)
+        except Exception:
+            return []
+
     # v2025.10.11.15 — header dinâmico (light/dark) -------------------------
     def _add_tab_header(self, tab, title, description):
         """Cria header com título grande em azul Bravo + descrição em cinza."""
@@ -4329,6 +4418,13 @@ class SettingsDialog(tk.Toplevel):
             "rollback": {
                 "enabled": self.var_rb_on.get(),
                 "crash_threshold": rb_thr,
+            },
+            "morning_mode": {
+                "enabled": self.var_mm_on.get(),
+                "tag": self.var_mm_tag.get().strip(),
+                "auto_trigger_time": self.var_mm_time.get().strip() or "08:00",
+                "auto_trigger_days": [v.get() for v in self.var_mm_days],
+                "notify_when_auto": self.var_mm_notify.get(),
             },
             "secrets_encrypted": True,
         }
@@ -5099,6 +5195,18 @@ class App(tk.Tk):
         self.btn_toggle.pack(side="left", padx=(12, 6))
         _tip(self.btn_toggle, "Pausa/retoma o job selecionado")
 
+        # v2025.10.11.18 — Botão Modo Manhã (laranja/sol — destaque diferente do azul)
+        self.btn_morning = tk.Button(bar, text="🌅  Modo Manhã",
+                                      command=self.run_morning_mode,
+                                      relief="flat", borderwidth=0,
+                                      cursor="hand2",
+                                      padx=14, pady=8,
+                                      font=("Segoe UI", 10, "bold"))
+        self.btn_morning.pack(side="left", padx=(12, 0))
+        _tip(self.btn_morning,
+             "Dispara em 1 clique todos os jobs da tag configurada como 'Manhã' (Ctrl+M).\n"
+             "Configure a tag em ⚙ → Modo Manhã.")
+
         # Spacer flexível
         ttk.Frame(bar).pack(side="left", padx=12)
 
@@ -5120,6 +5228,9 @@ class App(tk.Tk):
         # v2025.10.11.16 — Ctrl+Shift+T = Executar tag
         self.bind("<Control-Shift-T>", lambda e: self.run_tag())
         self.bind("<Control-Shift-t>", lambda e: self.run_tag())
+        # v2025.10.11.18 — Ctrl+M = Modo Manhã
+        self.bind("<Control-m>", lambda e: self.run_morning_mode())
+        self.bind("<Control-M>", lambda e: self.run_morning_mode())
         self.bind("<Control-n>", lambda e: self.add_task())
         self.bind("<Control-N>", lambda e: self.add_task())
         self.bind("<Control-e>", lambda e: self.edit_task())
@@ -5566,6 +5677,13 @@ class App(tk.Tk):
         # v2025.10.11.17 — refresca search bar (botões customizados tk.Button)
         try:
             self._refresh_search_bar_theme()
+        except Exception:
+            pass
+
+        # v2025.10.11.18 — refresca botão Modo Manhã (laranja sol)
+        try:
+            if hasattr(self, 'btn_morning'):
+                self._refresh_morning_button_theme()
         except Exception:
             pass
 
@@ -6179,9 +6297,38 @@ class App(tk.Tk):
         except Exception as _e:
             print(f"[digest] falha ao agendar: {_e}")
 
+        # v2025.10.11.18 — Agenda Modo Manhã auto-trigger (se habilitado)
+        try:
+            self._schedule_morning_auto()
+        except Exception as _e:
+            print(f"[morning auto] falha ao agendar: {_e}")
+
         # garante scheduler rodando
         if not self.scheduler.running:
             self.scheduler.start()
+
+    def _schedule_morning_auto(self):
+        """v2025.10.11.18 — Agenda verificação do Modo Manhã auto-trigger."""
+        cfg = self.data.get("settings", {}).get("morning_mode", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        try:
+            hh, mm = map(int, (cfg.get("auto_trigger_time", "08:00") or "08:00").split(":"))
+        except Exception:
+            hh, mm = 8, 0
+        days = cfg.get("auto_trigger_days") or [True]*5 + [False, False]
+        dows = ["mon","tue","wed","thu","fri","sat","sun"]
+        use_days = [dows[i] for i, v in enumerate(days[:7]) if v]
+        if not use_days:
+            return
+        trig = CronTrigger(day_of_week=",".join(use_days), hour=hh, minute=mm)
+        self.scheduler.add_job(
+            self._morning_auto_check,
+            trigger=trig,
+            id="__morning_auto__",
+            name="Modo Manhã (auto-check)",
+            replace_existing=True,
+        )
 
     def _schedule_digest_email(self):
         """v2025.10.11.8 — Agenda envio diário de digest por e-mail."""
@@ -6357,6 +6504,32 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Export YAML", f"Falha:\n{e}")
 
+    # v2025.10.11.18 — Refresca cor do botão Modo Manhã (laranja sol)
+    def _refresh_morning_button_theme(self):
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        # Cor laranja-sol pra destacar do azul Bravo
+        MORNING_BG = "#f59e0b" if dark else "#f59e0b"     # amber-500
+        MORNING_FG = "#ffffff"
+        MORNING_HOVER = "#d97706"  # amber-600
+        try:
+            self.btn_morning.configure(
+                bg=MORNING_BG, fg=MORNING_FG,
+                activebackground=MORNING_HOVER,
+                activeforeground=MORNING_FG,
+                highlightthickness=0,
+            )
+            def _enter(_e):
+                self.btn_morning.configure(bg=MORNING_HOVER)
+            def _leave(_e):
+                self.btn_morning.configure(bg=MORNING_BG)
+            self.btn_morning.bind("<Enter>", _enter)
+            self.btn_morning.bind("<Leave>", _leave)
+        except Exception as e:
+            print(f"[morning button theme] {e}")
+
     # v2025.10.11.17 — Refresca cores da search bar conforme tema ativo
     def _refresh_search_bar_theme(self):
         try:
@@ -6495,6 +6668,150 @@ class App(tk.Tk):
             lbl.place(relx=0.5, rely=0.5, anchor="center")
         except Exception as e:
             print(f"[empty_state] {e}")
+
+    # v2025.10.11.18 — Modo Manhã: 1-clique pra disparar todos os jobs da tag
+    def run_morning_mode(self, automatic: bool = False):
+        """Dispara em 1 clique todos os jobs com a tag configurada como Manhã.
+
+        automatic=True: chamado pelo schedule automático às Xh.
+                       Pula notificação manual e usa flag de auditoria.
+        """
+        cfg = self.data.get("settings", {}).get("morning_mode", {}) or {}
+        tag = (cfg.get("tag") or "").strip()
+
+        # Sem tag configurada → pede configuração
+        if not tag:
+            if automatic:
+                return  # silencioso no auto-disparo
+            messagebox.showinfo(
+                "Modo Manhã",
+                "Você ainda não configurou a tag do Modo Manhã.\n\n"
+                "Vá em ⚙ Configurações → Modo Manhã → defina qual tag será disparada.\n\n"
+                "Sugestão: marque seus jobs prioritários com a tag 'Manhã' "
+                "(Editar job → Avançado → Tags) e configure aqui pra disparar todos em 1 clique.",
+                parent=self)
+            return
+
+        # Coleta jobs ativos com a tag
+        jobs = [t for t in self.data.get("tasks", [])
+                if tag in (t.get("tags") or []) and t.get("enabled", True)]
+        if not jobs:
+            if automatic:
+                # Log silencioso
+                try:
+                    sched_log = LOG_DIR / "_scheduler.log"
+                    with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                        f.write(f"[{now_str()}] MORNING_AUTO_SKIP tag={tag} (nenhum job ativo)\n")
+                except Exception:
+                    pass
+                return
+            messagebox.showinfo(
+                "Modo Manhã",
+                f"Nenhum job ATIVO com a tag '{tag}'.\n\n"
+                "Verifique se os jobs estão ativos e marcados com a tag.",
+                parent=self)
+            return
+
+        # Dispara TODOS em paralelo (sem confirmação — é a graça do 1-clique)
+        launched = 0
+        skipped = 0
+        for task in jobs:
+            with self.running_lock:
+                if task["name"] in self.running_processes:
+                    skipped += 1
+                    continue
+            t_run = dict(task)
+            # Modo Manhã ignora janelas de manutenção (modo emergência)
+            t_run["respect_maintenance"] = False
+            threading.Thread(
+                target=lambda t=t_run: self._job_wrapper(t),
+                daemon=True
+            ).start()
+            launched += 1
+
+        # Audit log
+        try:
+            sched_log = LOG_DIR / "_scheduler.log"
+            kind = "MORNING_AUTO" if automatic else "MORNING_MANUAL"
+            with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(f"[{now_str()}] {kind} tag={tag} launched={launched} skipped={skipped}\n")
+        except Exception:
+            pass
+
+        # Notificação
+        prefix = "⏰ AUTO" if automatic else "🌅 MANUAL"
+        msg = f"{prefix}  Modo Manhã: {launched} job(s) da tag '{tag}'"
+        if skipped:
+            msg += f"  ·  {skipped} já estavam rodando"
+        self.set_status_line(msg)
+
+        # Se auto-trigger, manda webhook avisando o time
+        if automatic and cfg.get("notify_when_auto", True):
+            try:
+                subj = f"[Agendador-Bravo] Modo Manhã disparado automaticamente"
+                body = (f"O Agendador detectou que nenhum job da tag '{tag}' rodou hoje "
+                        f"até o horário-limite ({cfg.get('auto_trigger_time','08:00')})."
+                        f"\n\nDisparado automaticamente: {launched} job(s)."
+                        f"\nIgnorados (já rodando): {skipped}.")
+                settings = self.data["settings"]
+                try:
+                    send_email(settings, subj, body)
+                except Exception as e:
+                    print(f"[morning auto-notify] email: {e}")
+                try:
+                    send_webhook(settings, subj, body, ok=True)
+                except Exception as e:
+                    print(f"[morning auto-notify] webhook: {e}")
+            except Exception as e:
+                print(f"[morning auto-notify] {e}")
+
+    def _morning_auto_check(self):
+        """v2025.10.11.18 — Job interno que verifica se precisa disparar Modo Manhã automaticamente.
+
+        Lógica: se o horário-limite chegou e nenhum job da tag foi executado HOJE,
+        dispara automaticamente.
+        """
+        cfg = self.data.get("settings", {}).get("morning_mode", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        tag = (cfg.get("tag") or "").strip()
+        if not tag:
+            return
+
+        # Verifica se hoje é dia configurado
+        weekday = datetime.now().weekday()  # 0=seg, 6=dom
+        days = cfg.get("auto_trigger_days") or [True]*5 + [False, False]
+        if not (0 <= weekday < len(days) and days[weekday]):
+            return
+
+        # Pega histórico do dia
+        today = date.today()
+        jobs_with_tag = [t["name"] for t in self.data.get("tasks", [])
+                          if tag in (t.get("tags") or []) and t.get("enabled", True)]
+        if not jobs_with_tag:
+            return
+
+        # Algum job da tag rodou hoje (com sucesso ou não — interessa que TENTOU)?
+        history = self.data.get("history", {}) or {}
+        rodou_hoje = False
+        for name in jobs_with_tag:
+            for entry in history.get(name, []):
+                try:
+                    dt = datetime.strptime(entry.get("ts", ""), "%Y-%m-%d %H:%M:%S")
+                    if dt.date() == today:
+                        rodou_hoje = True
+                        break
+                except Exception:
+                    pass
+            if rodou_hoje:
+                break
+
+        if rodou_hoje:
+            # Time já rodou os jobs hoje, não precisa intervir
+            return
+
+        # Dispara automaticamente
+        self.run_morning_mode(automatic=True)
 
     # v2025.10.11.16 — Executar todos jobs de uma tag --------------------
     def run_tag(self):
