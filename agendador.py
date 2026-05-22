@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.26"   # << aumente em cada build
+APP_VERSION = "2025.10.11.27"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -4773,45 +4773,8 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA: 🎸 SHOWTIME (v2025.10.11.25) — substitui Modo Manhã ===
-        # v2025.10.11.26 — tab com bastante conteúdo: embrulhamos numa Canvas
-        # com scrollbar vertical para evitar conteúdo cortado quando a janela
-        # de Configurações não está maximizada.
-        tab_st_outer = ttk.Frame(notebook)
-        notebook.add(tab_st_outer, text="  🎸 Showtime  ")
-
-        _st_canvas = tk.Canvas(tab_st_outer, highlightthickness=0, borderwidth=0,
-                                background=getattr(self, '_theme',
-                                                   _bravo_theme(False))['bg'])
-        _st_vbar = ttk.Scrollbar(tab_st_outer, orient="vertical",
-                                  command=_st_canvas.yview)
-        _st_canvas.configure(yscrollcommand=_st_vbar.set)
-        _st_vbar.pack(side="right", fill="y")
-        _st_canvas.pack(side="left", fill="both", expand=True)
-
-        tab_st = ttk.Frame(_st_canvas, padding=24)
-        _st_window = _st_canvas.create_window((0, 0), window=tab_st, anchor="nw")
-
-        def _st_on_frame_configure(_e=None):
-            _st_canvas.configure(scrollregion=_st_canvas.bbox("all"))
-        def _st_on_canvas_configure(e):
-            # mantém o conteúdo do mesmo tamanho horizontal da canvas
-            _st_canvas.itemconfig(_st_window, width=e.width)
-        tab_st.bind("<Configure>", _st_on_frame_configure)
-        _st_canvas.bind("<Configure>", _st_on_canvas_configure)
-
-        # scroll com roda do mouse só quando o cursor está sobre a aba
-        def _st_on_mousewheel(e):
-            try:
-                _st_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            except Exception:
-                pass
-        def _st_bind_wheel(_e=None):
-            _st_canvas.bind_all("<MouseWheel>", _st_on_mousewheel)
-        def _st_unbind_wheel(_e=None):
-            _st_canvas.unbind_all("<MouseWheel>")
-        tab_st_outer.bind("<Enter>", _st_bind_wheel)
-        tab_st_outer.bind("<Leave>", _st_unbind_wheel)
-
+        tab_st = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_st, text="  🎸 Showtime  ")
         self._add_tab_header(tab_st, "🎸  Showtime — automação quando os arquivos chegam",
                              "O app monitora as pastas dos arquivos esperados. Quando TODOS chegam, "
                              "aguarda alguns segundos (debounce) e dispara os jobs da tag automaticamente. "
@@ -4845,7 +4808,7 @@ class SettingsDialog(tk.Toplevel):
                        "Quando TODOS estiverem presentes, o Showtime dispara automaticamente.",
                   foreground="#888", justify="left").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 6)); row += 1
 
-        self._st_files_listbox = tk.Listbox(tab_st, height=6, width=70, exportselection=False,
+        self._st_files_listbox = tk.Listbox(tab_st, height=4, width=70, exportselection=False,
                                               font=("Segoe UI", 9))
         self._st_files_listbox.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
         for p in self._st_required_files:
@@ -4876,21 +4839,19 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(tab_st, text="↑ Após todos os arquivos chegarem, espera X segundos antes de disparar (default 30s).",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
 
-        ttk.Checkbutton(tab_st, text="🚫 Disparar apenas 1x por dia (recomendado)",
-                        variable=self.var_st_once).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)); row += 1
-        ttk.Checkbutton(tab_st, text="📧 Notificar (e-mail/webhook) quando disparar",
-                        variable=self.var_st_notify).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        # v2025.10.11.27 — checkbuttons lado a lado pra economizar altura
+        st_flags_frame = ttk.Frame(tab_st)
+        st_flags_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(st_flags_frame, text="🚫 Disparar apenas 1x por dia",
+                        variable=self.var_st_once).pack(side="left", padx=(0, 24))
+        ttk.Checkbutton(st_flags_frame, text="📧 Notificar quando disparar",
+                        variable=self.var_st_notify).pack(side="left")
+        row += 1
 
         ttk.Label(tab_st,
-                  text=("💡  Como funciona o Showtime:\n"
-                        "  1. Você marca seus jobs com uma tag (ex.: 'Manhã' ou 'Showtime').\n"
-                        "  2. Lista aqui os arquivos que precisam chegar na pasta.\n"
-                        "  3. O app fica monitorando essas pastas em background.\n"
-                        "  4. Quando TODOS chegam, espera o debounce e dispara automaticamente.\n"
-                        "  5. Notifica: '🎸 Showtime: N jobs disparados'.\n"
-                        "  6. Não precisa clicar nada. Sem horário-limite. É 100% reativo."),
-                  foreground="#666", justify="left").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(16, 0))
+                  text="💡  Resumo: marque jobs com a tag, liste os arquivos, e o app dispara sozinho quando tudo chega. Sem clique, sem horário.",
+                  foreground="#888", justify="left", wraplength=900).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
         # === ABA 4: LIMPEZA DE LOGS ===
         tab_logs = ttk.Frame(notebook, padding=24)
