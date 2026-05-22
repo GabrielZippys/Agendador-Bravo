@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.16"   # << aumente em cada build
+APP_VERSION = "2025.10.11.17"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -5141,33 +5141,59 @@ class App(tk.Tk):
         left.rowconfigure(1, weight=1)   # row 1 = tree (row 0 = search bar)
         left.columnconfigure(0, weight=1)
 
-        # v2025.10.11.8 — Barra de busca/filtro
-        search_frame = ttk.Frame(left, padding=(0, 0, 0, 4))
-        search_frame.grid(row=0, column=0, sticky="ew", columnspan=2)
+        # v2025.10.11.17 — Search bar polida com bg do tema (light + dark)
+        # Usa tk.Frame ao invés de ttk.Frame pra termos controle total sobre o bg.
+        search_frame = tk.Frame(left)
+        search_frame.grid(row=0, column=0, sticky="ew", columnspan=2, pady=(0, 8))
         search_frame.columnconfigure(1, weight=1)
-        ttk.Label(search_frame, text="🔎").grid(row=0, column=0, padx=(0, 4))
+        self._search_frame = search_frame  # pra atualizar tema depois
+
+        # Ícone de busca
+        self._search_icon_lbl = tk.Label(search_frame, text="🔎",
+                                          font=("Segoe UI Emoji", 11))
+        self._search_icon_lbl.grid(row=0, column=0, padx=(0, 6))
+
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
-        self.search_entry.grid(row=0, column=1, sticky="ew")
-        ToolTip(self.search_entry, "Filtra por nome, tipo, tag ou arquivo. Tecle texto para filtrar em tempo real.")
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var,
+                                       font=("Segoe UI", 10))
+        self.search_entry.grid(row=0, column=1, sticky="ew", ipady=4)
+        ToolTip(self.search_entry,
+                "Filtra por nome, tipo, tag ou arquivo. Tecle texto para filtrar em tempo real.")
+
+        # Combobox de tag
         self.tag_filter_var = tk.StringVar(value="(todas as tags)")
         self.tag_filter = ttk.Combobox(search_frame, textvariable=self.tag_filter_var,
-                                       state="readonly", width=22)
-        self.tag_filter.grid(row=0, column=2, padx=(6, 0))
-        # v2025.10.11.16 — Botão "Rodar tag": dispara TODOS os jobs da tag
-        # selecionada de uma vez. Caso de uso típico: modo "manhã emergencial"
-        # quando o time de TI precisa rodar 4-5 jobs em paralelo rapidamente.
-        self.btn_run_tag = ttk.Button(search_frame, text="▶ Rodar tag",
-                                       command=self.run_tag,
-                                       style="Accent.TButton")
-        self.btn_run_tag.grid(row=0, column=3, padx=(6, 0))
+                                       state="readonly", width=22,
+                                       font=("Segoe UI", 10))
+        self.tag_filter.grid(row=0, column=2, padx=(8, 0), ipady=2)
+
+        # v2025.10.11.17 — Botão Rodar tag usando tk.Button com cores
+        # explícitas do tema. Isso garante que respeita light/dark sem
+        # interferência do sv_ttk ou do estilo padrão.
+        self.btn_run_tag = tk.Button(search_frame,
+                                      text="▶  Rodar tag",
+                                      command=self.run_tag,
+                                      relief="flat", borderwidth=0,
+                                      cursor="hand2",
+                                      padx=14, pady=6,
+                                      font=("Segoe UI", 10, "bold"))
+        self.btn_run_tag.grid(row=0, column=3, padx=(8, 0))
         ToolTip(self.btn_run_tag,
                 "Executa AGORA todos os jobs marcados com a tag selecionada (Ctrl+Shift+T).\n"
-                "Útil para 'modo emergência': dispara 5 jobs em 1 clique em vez de 5.")
-        ttk.Button(search_frame, text="✕", width=3,
-                   command=lambda: (self.search_var.set(""),
-                                    self.tag_filter_var.set("(todas as tags)"),
-                                    self.refresh_table())).grid(row=0, column=4, padx=(4, 0))
+                "Útil para 'modo emergência': dispara N jobs em 1 clique em vez de N.")
+
+        # Botão ✕ também como tk.Button pra harmonizar
+        self.btn_clear_filters = tk.Button(search_frame, text="✕",
+                                            relief="flat", borderwidth=0,
+                                            cursor="hand2",
+                                            padx=8, pady=4,
+                                            font=("Segoe UI", 10),
+                                            command=lambda: (
+                                                self.search_var.set(""),
+                                                self.tag_filter_var.set("(todas as tags)"),
+                                                self.refresh_table()))
+        self.btn_clear_filters.grid(row=0, column=4, padx=(6, 0))
+        ToolTip(self.btn_clear_filters, "Limpar busca e filtros")
         # liga atualização em tempo real
         self.search_var.trace_add("write", lambda *_: self.refresh_table())
         self.tag_filter.bind("<<ComboboxSelected>>", lambda *_: self.refresh_table())
@@ -5534,6 +5560,12 @@ class App(tk.Tk):
         try:
             if hasattr(self, '_welcome_banner'):
                 self._refresh_welcome_banner_theme()
+        except Exception:
+            pass
+
+        # v2025.10.11.17 — refresca search bar (botões customizados tk.Button)
+        try:
+            self._refresh_search_bar_theme()
         except Exception:
             pass
 
@@ -6324,6 +6356,49 @@ class App(tk.Tk):
                 messagebox.showerror("Export YAML", msg)
         except Exception as e:
             messagebox.showerror("Export YAML", f"Falha:\n{e}")
+
+    # v2025.10.11.17 — Refresca cores da search bar conforme tema ativo
+    def _refresh_search_bar_theme(self):
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+        try:
+            # Frame da search bar acompanha o bg do app
+            self._search_frame.configure(bg=T['bg_app'])
+            self._search_icon_lbl.configure(bg=T['bg_app'], fg=T['subtext'])
+            # Botão Rodar tag em azul Bravo
+            self.btn_run_tag.configure(
+                bg=T['accent'], fg="#ffffff",
+                activebackground=T['accent_dark'],
+                activeforeground="#ffffff",
+                disabledforeground=T['text_muted'],
+                highlightbackground=T['accent'],
+                highlightthickness=0,
+            )
+            # Hover effect (simulado via bind)
+            def _on_enter(_e, btn=self.btn_run_tag, T=T):
+                btn.configure(bg=T['accent_dark'])
+            def _on_leave(_e, btn=self.btn_run_tag, T=T):
+                btn.configure(bg=T['accent'])
+            self.btn_run_tag.bind("<Enter>", _on_enter)
+            self.btn_run_tag.bind("<Leave>", _on_leave)
+            # Botão limpar (mais sutil)
+            self.btn_clear_filters.configure(
+                bg=T['bg_app'], fg=T['subtext'],
+                activebackground=T['bg_hover'],
+                activeforeground=T['text'],
+                highlightthickness=0,
+            )
+            def _ce_enter(_e, btn=self.btn_clear_filters, T=T):
+                btn.configure(bg=T['bg_hover'], fg=T['text'])
+            def _ce_leave(_e, btn=self.btn_clear_filters, T=T):
+                btn.configure(bg=T['bg_app'], fg=T['subtext'])
+            self.btn_clear_filters.bind("<Enter>", _ce_enter)
+            self.btn_clear_filters.bind("<Leave>", _ce_leave)
+        except Exception as e:
+            print(f"[refresh_search_bar] {e}")
 
     # v2025.10.11.15 — Refresca welcome banner conforme o tema ativo
     def _refresh_welcome_banner_theme(self):
