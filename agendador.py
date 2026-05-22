@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.22"   # << aumente em cada build
+APP_VERSION = "2025.10.11.23"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -930,6 +930,208 @@ def _is_dark_mode(master) -> bool:
         return bool(master.var_dark.get())
     except Exception:
         return False
+
+# ======================================================================================
+#  v2025.10.11.23 — Diagnóstico (regex causa raiz, validador, path corrigido)
+# ======================================================================================
+
+# Padrões de erro conhecidos com causa provável + ação sugerida
+_ERROR_PATTERNS = [
+    # Pentaho / Kettle
+    (re.compile(r"can.?t open file|file not found|cannot find the file|n.?o foi poss.?vel encontrar", re.I),
+     "Arquivo de origem não encontrado",
+     "Verifique o caminho do .ktr/.kjb/.csv. Pode ter sido movido ou a rede está fora."),
+    (re.compile(r"access (is )?denied|permission denied|access to the path .* is denied", re.I),
+     "Sem permissão de leitura/escrita",
+     "Rode o Agendador como o mesmo usuário que tem acesso à pasta. Ou ajuste as permissões NTFS."),
+    (re.compile(r"connection (refused|timed out|reset)|network is unreachable|host unreachable", re.I),
+     "Conexão recusada/timeout com servidor remoto",
+     "Verifique se o servidor (banco, API) está no ar. Pode ser VPN derrubada ou firewall."),
+    (re.compile(r"sql.*error|ora-\d+|mysqld?: |postgres:", re.I),
+     "Erro de SQL/banco",
+     "Verifique a query no .ktr. Pode ser sintaxe incompatível, tabela inexistente ou conexão expirada."),
+    (re.compile(r"java\b.*not (recognized|found)|java: command not found", re.I),
+     "Java não encontrado",
+     "Instale JRE 8+ e adicione no PATH. Pentaho/Kettle precisam de Java."),
+    (re.compile(r"out of memory|java\.lang\.OutOfMemoryError", re.I),
+     "Java estourou memória",
+     "Aumente PENTAHO_DI_JAVA_OPTIONS (-Xmx4096m, p.ex.) nas variáveis de ambiente."),
+    (re.compile(r"python.*not (recognized|found)", re.I),
+     "Python não encontrado",
+     "Instale Python e adicione no PATH, ou use caminho completo (C:/Python313/python.exe)."),
+    (re.compile(r"modulenotfounderror|no module named", re.I),
+     "Módulo Python ausente",
+     "Rode 'pip install <pacote>' no ambiente certo. Confira se é o venv correto."),
+    (re.compile(r"the network path was not found|n.?o foi poss.?vel encontrar a rede", re.I),
+     "Caminho de rede indisponível",
+     "Drive de rede (H:/, Z:/) caiu. Verifique se está conectado e reconecte se necessário."),
+    (re.compile(r"is locked|sharing violation|being used by another process", re.I),
+     "Arquivo em uso por outro processo",
+     "Outro processo (Excel aberto? job paralelo?) tem lock no arquivo. Feche e retente."),
+    (re.compile(r"disk space|n.?o h.? espa.?o", re.I),
+     "Sem espaço em disco",
+     "Limpe a partição. Logs antigos podem ser apagados com 'Limpar logs agora' nas Configurações."),
+    (re.compile(r"timeout|atingido.*tempo", re.I),
+     "Timeout do job",
+     "Aumente o timeout em Editar job → Timeout, ou otimize o job pra rodar mais rápido."),
+]
+
+
+def diagnose_error(log_path: str, lines_to_scan: int = 200) -> dict:
+    """v2025.10.11.23 — Analisa últimas N linhas do log e identifica padrão.
+
+    Retorna dict:
+      matched: bool
+      cause: str (causa provável)
+      action: str (ação sugerida)
+      excerpt: str (linhas relevantes)
+    """
+    if not log_path or not os.path.exists(log_path):
+        return {"matched": False, "cause": "", "action": "", "excerpt": ""}
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        tail = "".join(lines[-lines_to_scan:])
+        for pattern, cause, action in _ERROR_PATTERNS:
+            m = pattern.search(tail)
+            if m:
+                # Pega 3 linhas em volta do match
+                idx = tail[:m.end()].count("\n")
+                tail_lines = tail.splitlines()
+                start = max(0, idx - 2)
+                end = min(len(tail_lines), idx + 3)
+                excerpt = "\n".join(tail_lines[start:end])
+                return {
+                    "matched": True,
+                    "cause": cause,
+                    "action": action,
+                    "excerpt": excerpt,
+                }
+    except Exception as e:
+        return {"matched": False, "cause": "", "action": "", "excerpt": f"Erro ao ler log: {e}"}
+    return {"matched": False, "cause": "", "action": "", "excerpt": ""}
+
+
+def validate_task(task: dict) -> list:
+    """v2025.10.11.23 — Pre-flight check.
+
+    Retorna lista de issues: [{level, field, msg, suggestion?}]
+    level: 'error' (bloqueia) | 'warning' (informa)
+    """
+    issues = []
+    path = (task.get("path") or "").strip()
+    if not path:
+        issues.append({"level": "error", "field": "path",
+                       "msg": "Caminho do arquivo está vazio."})
+        return issues
+    # Resolver vars dinâmicas pra validação
+    resolved = resolve_dynamic(path) if task.get("dynamic_params", True) else path
+    if not os.path.exists(resolved):
+        # Tenta sugerir
+        suggested = suggest_path_fix(resolved)
+        issue = {"level": "error", "field": "path",
+                 "msg": f"Arquivo não existe: {resolved}"}
+        if suggested:
+            issue["suggestion"] = suggested
+        issues.append(issue)
+    else:
+        # Confere se é arquivo
+        if os.path.isdir(resolved):
+            issues.append({"level": "error", "field": "path",
+                           "msg": "Caminho aponta para uma pasta, não um arquivo."})
+        # Confere extensão (warning se desconhecida)
+        ext = Path(resolved).suffix.lower()
+        if ext not in (".ktr", ".kjb", ".py", ".bat", ".cmd", ".exe", ".ps1"):
+            issues.append({"level": "warning", "field": "path",
+                           "msg": f"Extensão '{ext}' não é comum. Funcionará se for executável."})
+    # Working dir
+    wd = (task.get("working_dir") or "").strip()
+    if wd:
+        wd_resolved = resolve_dynamic(wd) if task.get("dynamic_params", True) else wd
+        if not os.path.isdir(wd_resolved):
+            issues.append({"level": "warning", "field": "working_dir",
+                           "msg": f"Working dir não existe: {wd_resolved}"})
+    # Pentaho specific
+    if path.lower().endswith((".ktr", ".kjb")):
+        # Não verificamos PDI_HOME aqui (settings level); só warning genérico
+        pass
+    return issues
+
+
+def suggest_path_fix(broken_path: str) -> str:
+    """v2025.10.11.23 — Tenta variantes comuns de um path quebrado.
+
+    Substitui letras de drive comuns (H: ↔ C:/Users/X/OneDrive) etc.
+    Retorna primeiro path válido encontrado ou string vazia.
+    """
+    if not broken_path:
+        return ""
+    candidates = []
+    # Variante 1: troca drive
+    if broken_path[1:3] == ":/":
+        for drive in "CDEFGHIJ":
+            if drive + ":" == broken_path[:2]:
+                continue
+            candidates.append(drive + broken_path[1:])
+    # Variante 2: H:/OneDrive → C:/Users/X/OneDrive
+    import os.path as _osp
+    home = os.path.expanduser("~")
+    lp = broken_path.replace("\\", "/")
+    if lp.lower().startswith(("h:/onedrive", "g:/onedrive", "e:/onedrive")):
+        rest = lp.split("/", 1)[1] if "/" in lp else ""
+        candidates.append(_osp.join(home, rest).replace("\\", "/"))
+    # Variante 3: case-insensitive scan na pasta pai
+    try:
+        parent = _osp.dirname(broken_path)
+        target = _osp.basename(broken_path).lower()
+        if _osp.isdir(parent):
+            for entry in os.listdir(parent):
+                if entry.lower() == target:
+                    candidates.append(_osp.join(parent, entry))
+                    break
+    except Exception:
+        pass
+    # Retorna primeiro que existe
+    for c in candidates:
+        try:
+            if os.path.exists(c):
+                return c
+        except Exception:
+            pass
+    return ""
+
+
+def detect_failure_burst(history_dict: dict, window_minutes: int = 60, threshold_pct: int = 30) -> dict:
+    """v2025.10.11.23 — Detecta surto de falhas em janela recente.
+
+    Retorna {detected, fail_pct, total, fails, threshold}.
+    """
+    cutoff = datetime.now() - timedelta(minutes=window_minutes)
+    total = 0
+    fails = 0
+    for job_name, entries in (history_dict or {}).items():
+        for e in entries:
+            try:
+                ts = datetime.strptime(e.get("ts", ""), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            total += 1
+            rc = int(e.get("rc", -1))
+            if rc not in (0, -999):
+                fails += 1
+    if total < 5:
+        return {"detected": False, "fail_pct": 0, "total": total, "fails": fails, "threshold": threshold_pct}
+    fail_pct = (fails / total * 100.0)
+    return {
+        "detected": fail_pct >= threshold_pct,
+        "fail_pct": fail_pct,
+        "total": total,
+        "fails": fails,
+        "threshold": threshold_pct,
+    }
+
 
 def compute_health_score(history_entries: list, sample_size: int = 20) -> dict:
     """v2025.10.11.21 — Calcula health score (0-100) de um job baseado no histórico.
@@ -3074,6 +3276,19 @@ class TaskDialog(tk.Toplevel):
                 "pattern": self.var_watcher_pattern.get().strip() or "*",
             },
         }
+        # v2025.10.11.23 — Pre-flight check
+        issues = validate_task(self.result)
+        errors = [i for i in issues if i.get("level") == "error"]
+        if errors:
+            msg = "Encontrei problemas no job:\n\n"
+            for i in errors:
+                msg += f"• [{i['field']}] {i['msg']}\n"
+                if "suggestion" in i:
+                    msg += f"     → Sugestão: {i['suggestion']}\n"
+            msg += "\nSalvar mesmo assim?"
+            if not messagebox.askyesno("Pre-flight check", msg, parent=self):
+                self.result = None
+                return
         self.destroy()
 
 
@@ -8392,6 +8607,8 @@ class App(_AppBase):
             m.add_command(label="📥  Importar jobs (YAML)",
                           command=self.action_import_yaml)
             m.add_separator()
+            m.add_command(label="🔍  Validar todos os jobs (paths)",
+                          command=self.validate_all_jobs)
             m.add_command(label="🧪  Simular erro (teste de notificação)",
                           command=self.simulate_error)
             m.add_command(label="🔄  Verificar atualizações",
@@ -8486,6 +8703,78 @@ class App(_AppBase):
             self.refresh_table()
             self.reschedule_all()
             self.set_status_line(f"📋 Job '{name}' duplicado como '{dlg.result['name']}'")
+
+    # v2025.10.11.23 — Validar todos os jobs (pre-flight em lote) -----------
+    def validate_all_jobs(self):
+        """Roda validate_task em todos os jobs e mostra relatório."""
+        tasks = self.data.get("tasks", []) or []
+        if not tasks:
+            messagebox.showinfo("Validar jobs", "Não há jobs cadastrados.", parent=self)
+            return
+        results = []
+        for t in tasks:
+            issues = validate_task(t)
+            errs = [i for i in issues if i.get("level") == "error"]
+            warns = [i for i in issues if i.get("level") == "warning"]
+            if errs or warns:
+                results.append((t["name"], errs, warns))
+        # Modal
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+        font_title, font_body = _resolve_fonts()
+        dlg = tk.Toplevel(self)
+        dlg.title("Validação de jobs")
+        dlg.geometry("780x560")
+        dlg.minsize(620, 440)
+        dlg.transient(self)
+        dlg.configure(bg=T['bg_app'])
+        # Header
+        h = tk.Frame(dlg, bg=T['bg_surface']); h.pack(fill="x")
+        hi = tk.Frame(h, bg=T['bg_surface']); hi.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(hi, text="🔍  Validação de jobs",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(font_title, 14, "bold")).pack(side="left")
+        tk.Label(hi, text=f"{len(tasks)} jobs · {len(results)} com problemas",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(font_body, 9)).pack(side="right")
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+        # Body
+        body = tk.Frame(dlg, bg=T['bg_app'])
+        body.pack(fill="both", expand=True, padx=20, pady=14)
+        if not results:
+            tk.Label(body, text="✅  Todos os jobs estão OK!",
+                     bg=T['bg_app'], fg=T['success'],
+                     font=(font_title, 13, "bold")).pack(pady=40)
+        else:
+            txt = tk.Text(body, wrap="word", padx=12, pady=10,
+                          font=(font_body, 10),
+                          bg=T['bg_surface'], fg=T['text'],
+                          relief="flat", borderwidth=0, highlightthickness=0)
+            sb = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+            txt.configure(yscrollcommand=sb.set)
+            sb.pack(side="right", fill="y")
+            txt.pack(side="left", fill="both", expand=True)
+            txt.tag_configure("err", foreground=T['error'], font=(font_body, 10, "bold"))
+            txt.tag_configure("warn", foreground=T['warning'], font=(font_body, 10, "bold"))
+            txt.tag_configure("name", foreground=T['accent'], font=(font_title, 11, "bold"))
+            txt.tag_configure("sug", foreground=T['success'], font=(font_body, 9, "italic"))
+            for name, errs, warns in results:
+                txt.insert("end", f"\n📋  {name}\n", "name")
+                for e in errs:
+                    txt.insert("end", f"  ❌ [{e['field']}] {e['msg']}\n", "err")
+                    if "suggestion" in e:
+                        txt.insert("end", f"      💡 Sugestão: {e['suggestion']}\n", "sug")
+                for w in warns:
+                    txt.insert("end", f"  ⚠️  [{w['field']}] {w['msg']}\n", "warn")
+            txt.configure(state="disabled")
+        # Footer
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+        f = tk.Frame(dlg, bg=T['bg_surface']); f.pack(fill="x")
+        fi = tk.Frame(f, bg=T['bg_surface']); fi.pack(fill="x", padx=20, pady=12)
+        ttk.Button(fi, text="Fechar", command=dlg.destroy).pack(side="right")
 
     # v2025.10.11.21 — Calendar / Heatmap -----------------------------------
     def open_calendar_view(self):
@@ -8780,10 +9069,25 @@ class App(_AppBase):
         ok = (rc == 0)
         settings = self.data["settings"]
 
+        # v2025.10.11.23 — Diagnóstico automático de causa raiz
+        diag_section = ""
+        if not ok and log_path:
+            try:
+                diag = diagnose_error(log_path)
+                if diag.get("matched"):
+                    diag_section = (
+                        f"\n\n🔎 Diagnóstico automático:\n"
+                        f"  Causa provável: {diag['cause']}\n"
+                        f"  Ação sugerida: {diag['action']}\n\n"
+                        f"  Trecho do log:\n{diag['excerpt']}\n"
+                    )
+            except Exception as e:
+                print(f"[diagnose] {e}")
+
         # E-mail e WhatsApp: só em falha (comportamento existente)
         if (not ok) and task.get("notify_fail", True):
             subject = f"[{task['name']}] FALHA (RC={rc})"
-            body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}"
+            body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}" + diag_section
             try:
                 send_email(settings, subject, body)
             except Exception as e:
@@ -8797,10 +9101,88 @@ class App(_AppBase):
         try:
             tag = "OK" if ok else f"FALHA (RC={rc})"
             subj = f"[{task['name']}] {tag}"
-            body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}"
+            body = f"Tarefa: {task['name']}\nData: {now_str()}\nRC: {rc}\nLog: {log_path}" + diag_section
             send_webhook(settings, subj, body, ok)
         except Exception as e:
             print("Erro webhook:", e)
+
+        # v2025.10.11.23 — Circuit breaker: N falhas consecutivas → pausa job
+        if not ok:
+            try:
+                self._check_circuit_breaker(task)
+            except Exception as e:
+                print(f"[circuit breaker] {e}")
+
+        # v2025.10.11.23 — Detector de surto de falhas
+        try:
+            burst = detect_failure_burst(self.data.get("history", {}))
+            if burst["detected"]:
+                self._maybe_alert_burst(burst)
+        except Exception as e:
+            print(f"[burst alert] {e}")
+
+    def _check_circuit_breaker(self, task):
+        """v2025.10.11.23 — Pausa job se últimas N execuções falharam em sequência."""
+        name = task.get("name")
+        history = self.data.get("history", {}).get(name, [])
+        if len(history) < 5:
+            return
+        # Últimas 5 execuções (ignorando interrompidas)
+        recent = [e for e in history[-10:] if int(e.get("rc", -1)) != -999][-5:]
+        if len(recent) < 5:
+            return
+        # Todas falharam?
+        if all(int(e.get("rc", -1)) != 0 for e in recent):
+            # Pausa o job e anota
+            task["enabled"] = False
+            task["circuit_breaker_paused"] = True
+            task["circuit_breaker_pause_ts"] = now_str()
+            try:
+                save_data(self.data)
+                self.refresh_table()
+                self.reschedule_all()
+            except Exception:
+                pass
+            # Audit log
+            try:
+                sched_log = LOG_DIR / "_scheduler.log"
+                with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"[{now_str()}] CIRCUIT_BREAKER job={name} (5 falhas consecutivas → pausado)\n")
+            except Exception:
+                pass
+            # Notifica
+            try:
+                subject = f"🔴 Circuit Breaker: '{name}' pausado"
+                body = (f"O job '{name}' foi PAUSADO automaticamente após 5 falhas consecutivas.\n\n"
+                        f"Verifique o problema, corrija, e re-ative manualmente em Ativar (botão da toolbar).")
+                send_email(self.data.get("settings", {}), subject, body)
+                send_webhook(self.data.get("settings", {}), subject, body, ok=False)
+            except Exception:
+                pass
+
+    def _maybe_alert_burst(self, burst):
+        """v2025.10.11.23 — Manda alerta de surto de falhas (no máximo 1x/hora)."""
+        last = getattr(self, "_last_burst_alert", 0)
+        now = time.time()
+        if now - last < 3600:
+            return
+        self._last_burst_alert = now
+        try:
+            subject = "🚨 Alerta: surto de falhas no Agendador"
+            body = (f"Detectado surto de falhas na última hora:\n"
+                    f"  Total de execuções: {burst['total']}\n"
+                    f"  Falhas: {burst['fails']} ({burst['fail_pct']:.1f}%)\n"
+                    f"  Threshold: ≥{burst['threshold']}%\n\n"
+                    f"Pode ser problema sistêmico (rede caiu, banco fora do ar, drive desconectado).")
+            send_email(self.data.get("settings", {}), subject, body)
+            send_webhook(self.data.get("settings", {}), subject, body, ok=False)
+            # Log
+            sched_log = LOG_DIR / "_scheduler.log"
+            with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                f.write(f"[{now_str()}] BURST_ALERT fail_pct={burst['fail_pct']:.1f}% "
+                        f"({burst['fails']}/{burst['total']})\n")
+        except Exception as e:
+            print(f"[burst alert] {e}")
 
     def _update_task_status_color(self, name):
         """Atualiza a cor do status de uma tarefa baseado no seu estado atual"""
