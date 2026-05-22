@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.18"   # << aumente em cada build
+APP_VERSION = "2025.10.11.19"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -5398,6 +5398,7 @@ class App(tk.Tk):
         self.update_net_indicator()
         self.update_toggle_button()  # Inicializa o botão toggle
         self._pulse_status()
+        self._pulse_running_rows()  # v2025.10.11.19 — pulse das linhas de jobs rodando
         self._monitor_stop_button()  # Inicia monitoramento do botão Interromper
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -5806,6 +5807,62 @@ class App(tk.Tk):
             and wa.get("to_targets")
         )
         return em_ok, wa_ok
+
+    def _pulse_running_rows(self):
+        """v2025.10.11.19 — Faz as linhas de jobs rodando PULSAREM.
+
+        Alterna a cor de fundo da tag 'running' entre 2 tons de azul Bravo
+        a cada 600ms, criando efeito visual de breathing/pulse. Também
+        anima o ícone no texto Status (▶ → ▶▶).
+        """
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+
+        # Estado do pulse (alterna a cada chamada)
+        on = getattr(self, "_pulse_running_state", False)
+        self._pulse_running_state = not on
+
+        # Duas cores de fundo: uma forte, uma mais sutil
+        if dark:
+            bg_on = T['accent_bg']    # #1e3a8a — azul Bravo escuro
+            bg_off = T['bg_surface']  # #1a1f2e — surface comum
+            fg = T['accent_light']
+        else:
+            bg_on = "#cfe2ff"   # azul claro Bravo
+            bg_off = "#e7f1ff"  # azul muito claro (tint)
+            fg = T['accent_dark']
+
+        try:
+            self.tree.tag_configure(
+                "running",
+                background=(bg_on if on else bg_off),
+                foreground=fg,
+                font=("Segoe UI", 9, "bold"),
+            )
+        except Exception:
+            pass
+
+        # Anima ícone no Status text dos jobs rodando
+        try:
+            icon = "▶▶" if on else "▶ "
+            with self.running_lock:
+                running_names = list(self.running_processes.keys())
+            for name in running_names:
+                try:
+                    vals = list(self.tree.item(name, "values"))
+                    if vals and vals[0].startswith(("▶", "▶▶")):
+                        vals[0] = f"{icon} Rodando"
+                        self.tree.item(name, values=tuple(vals))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Re-agenda
+        self.after(600, self._pulse_running_rows)
 
     def _pulse_status(self):
         """Animação suave dos indicadores de status"""
@@ -7396,17 +7453,26 @@ class App(tk.Tk):
                 enabled = next((t for t in self.data.get("tasks", []) if t.get("name") == name), {}).get("enabled", True)
             except Exception:
                 pass
-            
-            # Define texto de status
+
+            # Define texto de status com indicador animado quando rodando
             if running:
-                vals[0] = "Rodando"
+                vals[0] = "▶ Rodando"   # _pulse_running_rows alterna o ícone
             elif enabled:
                 vals[0] = "Ativo"
             else:
                 vals[0] = "Parado"
-            
-            # Atualiza os valores
-            self.tree.item(name, values=tuple(vals))
+
+            # v2025.10.11.19 — adiciona/remove tag "running" para pulse animation
+            try:
+                current_tags = list(self.tree.item(name, "tags"))
+                if running:
+                    if "running" not in current_tags:
+                        current_tags.append("running")
+                else:
+                    current_tags = [t for t in current_tags if t != "running"]
+                self.tree.item(name, values=tuple(vals), tags=tuple(current_tags))
+            except Exception:
+                self.tree.item(name, values=tuple(vals))
         except Exception:
             pass
 
@@ -7677,7 +7743,8 @@ class App(tk.Tk):
                 is_running = task_name in self.running_processes
 
             if is_running:
-                status_text = "Rodando"
+                status_text = "▶ Rodando"
+                tags.append("running")   # v2025.10.11.19 — pulse animation
             elif task.get("enabled", True):
                 status_text = "Ativo"
             else:
