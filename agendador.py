@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.19"   # << aumente em cada build
+APP_VERSION = "2025.10.11.20"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -835,6 +835,15 @@ try:
  import psutil  # pip install psutil
 except Exception:
     psutil = None
+
+# v2025.10.11.20 — Drag-and-drop de arquivos do Explorer
+try:
+    from tkinterdnd2 import TkinterDnD as _TkinterDnD, DND_FILES as _DND_FILES
+    _HAS_DND = True
+except Exception:
+    _TkinterDnD = None
+    _DND_FILES = None
+    _HAS_DND = False
 
 # ======================================================================================
 #  v2025.10.11.15 — Sistema de Tema Unificado MDW Bravo TI
@@ -4759,7 +4768,10 @@ class SplashScreen(tk.Toplevel):
 # ======================================================================================
 #  Aplicação principal (GUI)
 
-class App(tk.Tk):
+# v2025.10.11.20 — App herda de TkinterDnD.Tk pra suportar drag-drop nativo
+_AppBase = _TkinterDnD.Tk if _HAS_DND else tk.Tk
+
+class App(_AppBase):
 
 
     def _style_table(self):
@@ -5231,6 +5243,9 @@ class App(tk.Tk):
         # v2025.10.11.18 — Ctrl+M = Modo Manhã
         self.bind("<Control-m>", lambda e: self.run_morning_mode())
         self.bind("<Control-M>", lambda e: self.run_morning_mode())
+        # v2025.10.11.20 — Ctrl+D = Duplicar job
+        self.bind("<Control-d>", lambda e: self.duplicate_task())
+        self.bind("<Control-D>", lambda e: self.duplicate_task())
         self.bind("<Control-n>", lambda e: self.add_task())
         self.bind("<Control-N>", lambda e: self.add_task())
         self.bind("<Control-e>", lambda e: self.edit_task())
@@ -5347,8 +5362,14 @@ class App(tk.Tk):
         self.tree.bind("<Configure>", self._on_tree_resize)
         # v2025.10.11.11 — context menu (right-click)
         self.tree.bind("<Button-3>", self._show_tree_context_menu)
-        # v2025.10.11.11 — duplo-clique edita o job
-        self.tree.bind("<Double-1>", lambda e: self.edit_task())
+        # v2025.10.11.11/20 — duplo-clique: editor inline em Tags, ou abrir Editar
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        # v2025.10.11.20 — drag-drop de arquivos do Explorer
+        if _HAS_DND:
+            try:
+                self._setup_drag_drop()
+            except Exception as _e:
+                print(f"[dnd] setup failed: {_e}")
 
         right = ttk.Frame(paned)
         right.rowconfigure(0, weight=1)
@@ -6726,6 +6747,502 @@ class App(tk.Tk):
         except Exception as e:
             print(f"[empty_state] {e}")
 
+    # v2025.10.11.20 — Bulk edit / Bulk remove --------------------------
+    def bulk_remove_tasks(self):
+        sel = list(self.tree.selection())
+        if len(sel) < 2:
+            return self.remove_task()
+        if not messagebox.askyesno(
+            "Remover múltiplos",
+            f"Confirma remover {len(sel)} job(s)?\n\n"
+            f"({', '.join(sel[:5])}" + (f", +{len(sel)-5}" if len(sel) > 5 else "") + ")",
+            parent=self):
+            return
+        self.data["tasks"] = [t for t in self.data["tasks"] if t["name"] not in sel]
+        for name in sel:
+            for jid in self.jobs.get(name, []):
+                try:
+                    self.scheduler.remove_job(jid)
+                except Exception:
+                    pass
+            self.jobs.pop(name, None)
+        self.save(silent=True)
+        self.refresh_table()
+        self.set_status_line(f"🗑️ {len(sel)} job(s) removidos")
+
+    def bulk_edit_tasks(self):
+        """v2025.10.11.20 — Edita campos em massa nos jobs selecionados."""
+        sel = list(self.tree.selection())
+        if len(sel) < 2:
+            return self.edit_task()
+        # Coleta jobs
+        jobs = [t for t in self.data["tasks"] if t["name"] in sel]
+        if not jobs:
+            return
+
+        dark = bool(getattr(self.var_dark, "get", lambda: False)())
+        T = _bravo_theme(dark)
+        font_title, font_body = _resolve_fonts()
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Editar {len(jobs)} jobs")
+        dlg.geometry("580x600")
+        dlg.minsize(500, 500)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=T['bg_app'])
+
+        # Header
+        header = tk.Frame(dlg, bg=T['bg_surface'])
+        header.pack(fill="x")
+        inner = tk.Frame(header, bg=T['bg_surface'])
+        inner.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(inner, text=f"✏️  Editar selecionados",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(font_title, 14, "bold")).pack(anchor="w")
+        tk.Label(inner,
+                 text=f"Alterações serão aplicadas em {len(jobs)} job(s): "
+                      f"{', '.join(j['name'] for j in jobs[:3])}"
+                      f"{f', +{len(jobs)-3}' if len(jobs) > 3 else ''}",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(font_body, 9), wraplength=520, justify="left").pack(anchor="w", pady=(4, 0))
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+
+        body = tk.Frame(dlg, bg=T['bg_app'])
+        body.pack(fill="both", expand=True, padx=20, pady=14)
+
+        # Helper para criar linhas "marcar + valor"
+        rows_data = {}  # field_key → (enabled_var, value_var, widget)
+
+        def _add_row(field_key, label, value_widget_factory):
+            row = tk.Frame(body, bg=T['bg_app'])
+            row.pack(fill="x", pady=4)
+            en = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(row, text=label, variable=en, width=24)
+            cb.pack(side="left")
+            val_var, widget = value_widget_factory(row)
+            widget.pack(side="left", padx=(8, 0), fill="x", expand=True)
+            # Disabled state quando não marcado
+            def _toggle(*_):
+                try:
+                    widget.configure(state=("normal" if en.get() else "disabled"))
+                except Exception:
+                    pass
+            en.trace_add("write", _toggle)
+            _toggle()
+            rows_data[field_key] = (en, val_var)
+
+        # Tags
+        def _tag_widget(parent):
+            v = tk.StringVar()
+            return v, ttk.Entry(parent, textvariable=v, font=(font_body, 10))
+        _add_row("tags", "Substituir Tags por:", _tag_widget)
+
+        def _tag_append_widget(parent):
+            v = tk.StringVar()
+            return v, ttk.Entry(parent, textvariable=v, font=(font_body, 10))
+        _add_row("tags_append", "Adicionar Tags (sem remover):", _tag_append_widget)
+
+        # Timeout
+        def _timeout_widget(parent):
+            v = tk.StringVar()
+            return v, ttk.Entry(parent, textvariable=v, font=(font_body, 10), width=10)
+        _add_row("timeout", "Timeout (segundos, 0=sem):", _timeout_widget)
+
+        # Enable/disable
+        def _enabled_widget(parent):
+            v = tk.StringVar(value="Ativar")
+            return v, ttk.Combobox(parent, textvariable=v, font=(font_body, 10),
+                                    values=("Ativar", "Pausar"), state="readonly", width=12)
+        _add_row("enabled", "Ativar / Pausar:", _enabled_widget)
+
+        # Notify on fail
+        def _notify_widget(parent):
+            v = tk.StringVar(value="Sim")
+            return v, ttk.Combobox(parent, textvariable=v, font=(font_body, 10),
+                                    values=("Sim", "Não"), state="readonly", width=12)
+        _add_row("notify_fail", "Notificar ao falhar:", _notify_widget)
+
+        # Respect maintenance
+        def _maint_widget(parent):
+            v = tk.StringVar(value="Sim")
+            return v, ttk.Combobox(parent, textvariable=v, font=(font_body, 10),
+                                    values=("Sim", "Não"), state="readonly", width=12)
+        _add_row("respect_maintenance", "Respeitar janelas de manutenção:", _maint_widget)
+
+        # Dynamic params
+        def _dyn_widget(parent):
+            v = tk.StringVar(value="Sim")
+            return v, ttk.Combobox(parent, textvariable=v, font=(font_body, 10),
+                                    values=("Sim", "Não"), state="readonly", width=12)
+        _add_row("dynamic_params", "Resolver ${variáveis}:", _dyn_widget)
+
+        # Footer
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+        footer = tk.Frame(dlg, bg=T['bg_surface'])
+        footer.pack(fill="x")
+        f_inner = tk.Frame(footer, bg=T['bg_surface'])
+        f_inner.pack(fill="x", padx=20, pady=14)
+        ttk.Button(f_inner, text="Cancelar", command=dlg.destroy).pack(side="right", padx=(8, 0))
+
+        def _apply():
+            changes = {}
+            for key, (en, var) in rows_data.items():
+                if not en.get():
+                    continue
+                val = var.get()
+                if key == "tags":
+                    changes[key] = [t.strip() for t in val.split(",") if t.strip()]
+                elif key == "tags_append":
+                    changes[key] = [t.strip() for t in val.split(",") if t.strip()]
+                elif key == "timeout":
+                    changes[key] = val.strip()
+                elif key == "enabled":
+                    changes[key] = (val == "Ativar")
+                elif key == "notify_fail":
+                    changes[key] = (val == "Sim")
+                elif key == "respect_maintenance":
+                    changes[key] = (val == "Sim")
+                elif key == "dynamic_params":
+                    changes[key] = (val == "Sim")
+            if not changes:
+                messagebox.showwarning("Bulk edit", "Nenhum campo marcado para alterar.", parent=dlg)
+                return
+            # Aplica
+            for j in jobs:
+                if "tags" in changes:
+                    j["tags"] = list(changes["tags"])
+                if "tags_append" in changes:
+                    existing = set(j.get("tags", []) or [])
+                    for t in changes["tags_append"]:
+                        existing.add(t)
+                    j["tags"] = sorted(existing)
+                for k in ("timeout", "enabled", "notify_fail",
+                         "respect_maintenance", "dynamic_params"):
+                    if k in changes:
+                        j[k] = changes[k]
+            self.save(silent=True)
+            self.refresh_table()
+            self.reschedule_all()
+            self.set_status_line(f"✏️ {len(jobs)} job(s) atualizados ({len(changes)} campo(s))")
+            dlg.destroy()
+
+        ttk.Button(f_inner, text=f"✏️ Aplicar em {len(jobs)} jobs",
+                   command=_apply, style="Accent.TButton").pack(side="right")
+
+    # v2025.10.11.20 — Templates de job ----------------------------------
+    JOB_TEMPLATES = [
+        {
+            "icon": "🔄", "name": "ETL Pentaho diário",
+            "description": "Roda transformação .ktr todo dia às 06:00. Tag 'ETL'.",
+            "preset": {
+                "name": "Pentaho_Diario",
+                "path": r"H:\OneDrive - Bravo X\Pentaho\Transformacao\arquivo.ktr",
+                "args": "/level:Basic",
+                "schedule_type": "cron",
+                "times": ["06:00"],
+                "days": [True]*5 + [False, False],
+                "timeout": "1800",
+                "notify_fail": True,
+                "tags": ["ETL", "Pentaho"],
+                "retry": {"enabled": True, "max_attempts": 3, "backoff_seconds": [60, 300, 900]},
+                "respect_maintenance": True,
+                "dynamic_params": True,
+            }
+        },
+        {
+            "icon": "💾", "name": "Backup Robocopy semanal",
+            "description": "Roda .bat de backup todo domingo às 02:00. Tag 'Backup'.",
+            "preset": {
+                "name": "Backup_Semanal",
+                "path": r"C:\scripts\backup.bat",
+                "args": "",
+                "schedule_type": "cron",
+                "times": ["02:00"],
+                "days": [False]*6 + [True],  # só domingo
+                "timeout": "3600",
+                "notify_fail": True,
+                "tags": ["Backup"],
+                "respect_maintenance": False,
+                "dynamic_params": False,
+            }
+        },
+        {
+            "icon": "🐍", "name": "Sync Python (a cada 30 min)",
+            "description": "Roda um script .py a cada 30 minutos. Tag 'Sync'.",
+            "preset": {
+                "name": "Python_Sync",
+                "path": r"C:\Python313\pythonw.exe",
+                "args": r"C:\scripts\sync.py",
+                "schedule_type": "interval",
+                "every_value": 30,
+                "every_unit": "minutes",
+                "days": [True]*7,
+                "timeout": "300",
+                "notify_fail": True,
+                "tags": ["Sync"],
+                "respect_maintenance": True,
+                "dynamic_params": True,
+            }
+        },
+        {
+            "icon": "📊", "name": "Relatório semanal (seg 08:00)",
+            "description": "Job de relatório toda segunda 08:00 com retry e notificação.",
+            "preset": {
+                "name": "Relatorio_Semanal",
+                "path": r"H:\OneDrive - Bravo X\Pentaho\Relatorios\relatorio.kjb",
+                "args": "/level:Basic",
+                "schedule_type": "cron",
+                "times": ["08:00"],
+                "days": [True] + [False]*6,  # só segunda
+                "timeout": "1800",
+                "notify_fail": True,
+                "tags": ["Relatorios", "Semanal"],
+                "retry": {"enabled": True, "max_attempts": 3, "backoff_seconds": [120, 600, 1800]},
+                "respect_maintenance": True,
+                "dynamic_params": True,
+            }
+        },
+        {
+            "icon": "🌅", "name": "Job de Manhã (06:30, alta prioridade)",
+            "description": "Roda 06:30 seg-sex, marca tag 'Manhã' (ativa o Modo Manhã 1-clique).",
+            "preset": {
+                "name": "Job_Manha",
+                "path": r"H:\OneDrive - Bravo X\Pentaho\Transformacao\manha.ktr",
+                "args": "/level:Basic",
+                "schedule_type": "cron",
+                "times": ["06:30"],
+                "days": [True]*5 + [False, False],
+                "timeout": "1200",
+                "notify_fail": True,
+                "tags": ["Manhã", "ETL"],
+                "retry": {"enabled": True, "max_attempts": 2, "backoff_seconds": [60, 180]},
+                "respect_maintenance": False,
+                "dynamic_params": True,
+            }
+        },
+    ]
+
+    def open_template_picker(self):
+        """v2025.10.11.20 — Picker de templates pra criar job rápido."""
+        dark = bool(getattr(self.var_dark, "get", lambda: False)())
+        T = _bravo_theme(dark)
+        font_title, font_body = _resolve_fonts()
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Templates de Job")
+        dlg.geometry("620x520")
+        dlg.minsize(540, 440)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=T['bg_app'])
+
+        header = tk.Frame(dlg, bg=T['bg_surface'])
+        header.pack(fill="x")
+        inner = tk.Frame(header, bg=T['bg_surface'])
+        inner.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(inner, text="📋  Criar a partir de template",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(font_title, 14, "bold")).pack(anchor="w")
+        tk.Label(inner, text="Escolha um template — você ajusta nome/caminho/horário antes de salvar.",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(font_body, 9)).pack(anchor="w", pady=(4, 0))
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+
+        body = tk.Frame(dlg, bg=T['bg_app'])
+        body.pack(fill="both", expand=True, padx=20, pady=14)
+
+        for tpl in self.JOB_TEMPLATES:
+            card = tk.Frame(body, bg=T['bg_surface'],
+                             highlightthickness=1, highlightbackground=T['border'],
+                             cursor="hand2")
+            card.pack(fill="x", pady=4)
+            inner_card = tk.Frame(card, bg=T['bg_surface'])
+            inner_card.pack(fill="x", padx=14, pady=10)
+            tk.Label(inner_card, text=f"{tpl['icon']}  {tpl['name']}",
+                     bg=T['bg_surface'], fg=T['text_strong'],
+                     font=(font_body, 11, "bold")).pack(anchor="w")
+            tk.Label(inner_card, text=tpl['description'],
+                     bg=T['bg_surface'], fg=T['subtext'],
+                     font=(font_body, 9), wraplength=540, justify="left").pack(anchor="w", pady=(2, 0))
+
+            def _use(tpl=tpl):
+                dlg.destroy()
+                self._use_template(tpl)
+
+            for w in (card, inner_card, *inner_card.winfo_children()):
+                w.bind("<Button-1>", lambda e, tpl=tpl: _use(tpl))
+                w.bind("<Enter>", lambda e, c=card, T=T: c.configure(bg=T['bg_hover'], highlightbackground=T['accent']))
+                w.bind("<Leave>", lambda e, c=card, T=T: c.configure(bg=T['bg_surface'], highlightbackground=T['border']))
+
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+        footer = tk.Frame(dlg, bg=T['bg_surface'])
+        footer.pack(fill="x")
+        f_inner = tk.Frame(footer, bg=T['bg_surface'])
+        f_inner.pack(fill="x", padx=20, pady=14)
+        ttk.Button(f_inner, text="Cancelar", command=dlg.destroy).pack(side="right")
+
+    def _use_template(self, tpl):
+        """Cria job a partir do template, abrindo TaskDialog pré-preenchido."""
+        preset = dict(tpl["preset"])
+        # Garante nome único
+        existing = {t["name"] for t in self.data.get("tasks", [])}
+        base = preset["name"]
+        idx = 2
+        while preset["name"] in existing:
+            preset["name"] = f"{base}_{idx}"
+            idx += 1
+        dlg = TaskDialog(self, preset,
+                          existing_jobs=self._existing_job_names(),
+                          all_tags=self._all_known_tags())
+        self.wait_window(dlg)
+        if dlg.result:
+            if any(t["name"] == dlg.result["name"] for t in self.data["tasks"]):
+                messagebox.showerror("Erro", "Já existe job com esse nome.")
+                return
+            dlg.result.setdefault("enabled", True)
+            self.data["tasks"].append(dlg.result)
+            self.save(silent=True)
+            self.refresh_table()
+            self.reschedule_all()
+            self.set_status_line(f"📋 Job criado a partir do template '{tpl['name']}'")
+
+    # v2025.10.11.20 — Editor inline na tabela ---------------------------
+    def _on_tree_double_click(self, event):
+        """Duplo-clique: editor inline em Tags. Outras células: abre Editar."""
+        try:
+            region = self.tree.identify("region", event.x, event.y)
+            if region != "cell":
+                return self.edit_task()
+            col = self.tree.identify_column(event.x)
+            row = self.tree.identify_row(event.y)
+            if not row:
+                return
+            # colunas: #1=Status #2=Nome #3=Horário #4=Tipo #5=Dias #6=Tags #7=Arquivo
+            col_name = self.tree.heading(col)["text"]
+            if col_name == "Tags":
+                self._edit_cell_inline(row, col, col_name)
+            else:
+                self.tree.selection_set(row)
+                self.edit_task()
+        except Exception as e:
+            print(f"[double click] {e}")
+
+    def _edit_cell_inline(self, row, col, col_name):
+        """Cria um Entry sobre a célula da Treeview pra edição inline."""
+        try:
+            bbox = self.tree.bbox(row, col)
+            if not bbox:
+                return
+            x, y, w, h = bbox
+            current = self.tree.set(row, col_name)
+            # Tags exibidas como "a · b · c" — converte pra "a, b, c" pra edição
+            if col_name == "Tags":
+                if current == "—":
+                    current = ""
+                current = current.replace(" · ", ", ")
+
+            entry = tk.Entry(self.tree, font=("Segoe UI", 10), borderwidth=1, relief="solid")
+            entry.insert(0, current)
+            entry.select_range(0, "end")
+            entry.focus_set()
+            entry.place(x=x, y=y, width=w, height=h)
+
+            def _commit(_e=None):
+                new_val = entry.get().strip()
+                entry.destroy()
+                if col_name == "Tags":
+                    new_tags = [t.strip() for t in new_val.split(",") if t.strip()]
+                    # acha o task e atualiza
+                    task = next((t for t in self.data.get("tasks", [])
+                                  if t.get("name") == row), None)
+                    if task is not None:
+                        task["tags"] = new_tags
+                        self.save(silent=True)
+                        self.refresh_table()
+                        self.set_status_line(f"🏷️ Tags de '{row}' atualizadas")
+
+            def _cancel(_e=None):
+                entry.destroy()
+
+            entry.bind("<Return>", _commit)
+            entry.bind("<FocusOut>", _commit)
+            entry.bind("<Escape>", _cancel)
+        except Exception as e:
+            print(f"[inline edit] {e}")
+
+    # v2025.10.11.20 — Drag-and-drop de arquivo --------------------------
+    def _setup_drag_drop(self):
+        """Habilita drag-drop de arquivos do Explorer. Requer tkinterdnd2."""
+        try:
+            from tkinterdnd2 import DND_FILES
+            self.tree.drop_target_register(DND_FILES)
+            self.tree.dnd_bind("<<Drop>>", self._on_drop_file)
+            return True
+        except Exception as e:
+            print(f"[dnd] disabled: {e}")
+            return False
+
+    def _on_drop_file(self, event):
+        """v2025.10.11.20 — Recebe arquivo arrastado e abre Assistente."""
+        try:
+            paths = event.data
+            # event.data pode ser "C:/foo.ktr" ou "{C:/foo bar.ktr} {C:/baz.kjb}"
+            import shlex as _sh
+            try:
+                files = _sh.split(paths)
+            except Exception:
+                files = [paths]
+            # pega o primeiro arquivo válido
+            for f in files:
+                f = f.strip().strip("{}")
+                if os.path.isfile(f):
+                    # Cria preset baseado no path
+                    ext = Path(f).suffix.lower()
+                    base = Path(f).stem
+                    preset = {
+                        "name": _safe_name(base),
+                        "path": f,
+                        "args": "",
+                        "working_dir": str(Path(f).parent),
+                        "schedule_type": "cron",
+                        "times": ["06:00"],
+                        "days": [True]*5 + [False, False],
+                        "timeout": "0",
+                        "notify_fail": True,
+                        "tags": [],
+                        "dynamic_params": True,
+                        "respect_maintenance": True,
+                    }
+                    if ext == ".ktr":
+                        preset["tags"] = ["ETL", "Pentaho"]
+                    elif ext == ".kjb":
+                        preset["tags"] = ["Pentaho", "Job"]
+                    elif ext == ".py":
+                        preset["tags"] = ["Python"]
+                    elif ext in (".bat", ".cmd"):
+                        preset["tags"] = ["Batch"]
+                    dlg = TaskDialog(self, preset,
+                                      existing_jobs=self._existing_job_names(),
+                                      all_tags=self._all_known_tags())
+                    self.wait_window(dlg)
+                    if dlg.result:
+                        if any(t["name"] == dlg.result["name"] for t in self.data["tasks"]):
+                            messagebox.showerror("Erro", "Já existe job com esse nome.")
+                            return
+                        dlg.result.setdefault("enabled", True)
+                        self.data["tasks"].append(dlg.result)
+                        self.save(silent=True)
+                        self.refresh_table()
+                        self.reschedule_all()
+                        self.set_status_line(f"📥 Job criado via drag-and-drop: {dlg.result['name']}")
+                    return
+            messagebox.showwarning("Drag-and-drop",
+                                   "Nenhum arquivo válido detectado.",
+                                   parent=self)
+        except Exception as e:
+            print(f"[dnd] {e}")
+
     # v2025.10.11.18 — Modo Manhã: 1-clique pra disparar todos os jobs da tag
     def run_morning_mode(self, automatic: bool = False):
         """Dispara em 1 clique todos os jobs com a tag configurada como Manhã.
@@ -7064,9 +7581,15 @@ class App(tk.Tk):
             m.add_separator()
             m.add_command(label="🧙  Assistente de criação...",
                           command=self.open_assistant)
+            m.add_command(label="📋  Criar a partir de template...",
+                          command=self.open_template_picker)
             m.add_command(label="✏️  Editar job selecionado",
                           accelerator="Ctrl+E",
                           command=self.edit_task)
+            m.add_command(label="📋  Duplicar job (Ctrl+D)",
+                          command=self.duplicate_task)
+            m.add_command(label="✏️  Editar SELECIONADOS em massa",
+                          command=self.bulk_edit_tasks)
             m.add_command(label="🗑️  Remover job selecionado",
                           accelerator="Del",
                           command=self.remove_task)
@@ -7099,7 +7622,7 @@ class App(tk.Tk):
             print(f"[more menu] {e}")
 
     def _show_tree_context_menu(self, event):
-        """v2025.10.11.11 — Menu de contexto ao clicar direito num job."""
+        """v2025.10.11.11/20 — Menu de contexto ao clicar direito num job."""
         try:
             # seleciona o item sob o cursor
             iid = self.tree.identify_row(event.y)
@@ -7109,29 +7632,77 @@ class App(tk.Tk):
             sel = self.tree.selection()
             if not sel:
                 return
+            n_sel = len(sel)
             task = next((t for t in self.data.get("tasks", []) if t.get("name") == sel[0]), None)
             if not task:
                 return
             m = tk.Menu(self, tearoff=0)
-            m.add_command(label="▶  Executar agora",
-                          accelerator="Ctrl+R",
-                          command=self.run_now)
-            enabled = task.get("enabled", True)
-            label = "▶️  Ativar" if not enabled else "⏸️  Pausar"
-            m.add_command(label=label, command=self.toggle_task_status)
-            m.add_separator()
-            m.add_command(label="✏️  Editar...",
-                          accelerator="Ctrl+E",
-                          command=self.edit_task)
-            m.add_command(label="🗑️  Remover...",
-                          accelerator="Del",
-                          command=self.remove_task)
-            m.add_separator()
-            m.add_command(label="📄  Abrir último log",
-                          command=self.open_last_log)
+            if n_sel > 1:
+                # v2025.10.11.20 — bulk actions quando múltiplos selecionados
+                m.add_command(label=f"▶  Executar agora ({n_sel} jobs)",
+                              accelerator="Ctrl+R", command=self.run_now)
+                m.add_command(label=f"✏️  Editar selecionados ({n_sel})...",
+                              command=self.bulk_edit_tasks)
+                m.add_command(label=f"🗑️  Remover selecionados ({n_sel})...",
+                              command=self.bulk_remove_tasks)
+            else:
+                m.add_command(label="▶  Executar agora",
+                              accelerator="Ctrl+R", command=self.run_now)
+                enabled = task.get("enabled", True)
+                label = "▶️  Ativar" if not enabled else "⏸️  Pausar"
+                m.add_command(label=label, command=self.toggle_task_status)
+                m.add_separator()
+                m.add_command(label="✏️  Editar...",
+                              accelerator="Ctrl+E", command=self.edit_task)
+                m.add_command(label="📋  Duplicar...",
+                              accelerator="Ctrl+D", command=self.duplicate_task)
+                m.add_command(label="🗑️  Remover...",
+                              accelerator="Del", command=self.remove_task)
+                m.add_separator()
+                m.add_command(label="📄  Abrir último log",
+                              command=self.open_last_log)
             m.tk_popup(event.x_root, event.y_root)
         except Exception as e:
             print(f"[context menu] {e}")
+
+    # v2025.10.11.20 — Duplicar job ----------------------------------------
+    def duplicate_task(self):
+        """Duplica o job selecionado com sufixo _copy. Abre editor pra ajustar."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        name = sel[0]
+        original = next((t for t in self.data.get("tasks", []) if t.get("name") == name), None)
+        if not original:
+            return
+        # Cria nome único
+        existing_names = {t["name"] for t in self.data.get("tasks", [])}
+        base = f"{name}_copy"
+        new_name = base
+        idx = 2
+        while new_name in existing_names:
+            new_name = f"{base}_{idx}"
+            idx += 1
+        # Copia o dict do job
+        clone = json.loads(json.dumps(original))  # deep copy via json
+        clone["name"] = new_name
+        clone["enabled"] = False  # começa pausado pra revisar antes de soltar
+        # Abre editor com o clone — usuário pode mudar nome, path, etc.
+        dlg = TaskDialog(self, clone,
+                          existing_jobs=self._existing_job_names(),
+                          all_tags=self._all_known_tags())
+        self.wait_window(dlg)
+        if dlg.result:
+            if any(t["name"] == dlg.result["name"] for t in self.data["tasks"]):
+                messagebox.showerror("Erro",
+                                     "Já existe um job com esse nome. Mude o nome do clone.")
+                return
+            dlg.result.setdefault("enabled", False)
+            self.data["tasks"].append(dlg.result)
+            self.save(silent=True)
+            self.refresh_table()
+            self.reschedule_all()
+            self.set_status_line(f"📋 Job '{name}' duplicado como '{dlg.result['name']}'")
 
     # v2025.10.11.9 — Painel de Ajuda --------------------------------------
     def open_help_panel(self):

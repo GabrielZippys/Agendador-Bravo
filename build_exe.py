@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # ── versão sincronizada com agendador.py ─────────────────────────────────────
-APP_VERSION = "2025.10.11.19"
+APP_VERSION = "2025.10.11.20"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -87,6 +87,9 @@ def create_executable():
         "--hidden-import=http.server",
         "--hidden-import=socketserver",
         "--hidden-import=urllib.parse",
+        # v2025.10.11.20 — drag-and-drop
+        "--hidden-import=tkinterdnd2",
+        "--collect-all=tkinterdnd2",
         str(main_script),
     ]
 
