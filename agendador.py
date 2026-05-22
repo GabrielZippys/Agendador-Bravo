@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.27"   # << aumente em cada build
+APP_VERSION = "2025.10.11.28"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1476,12 +1476,21 @@ def save_data(data):
     _data_cache["data"] = data.copy()
     _data_cache["mtime"] = DATA_FILE.stat().st_mtime
 
+# v2025.10.11.28 — hook opcional do Notion sync; App registra no boot.
+_history_hook = None  # type: callable(task_name) | None
+
 def append_history(data, task_name, rc, dur):
     hist = data.setdefault("history", {}).setdefault(task_name, [])
     hist.append({"ts": now_str(), "rc": int(rc), "dur": float(dur)})
     if len(hist) > 50:
         del hist[:-50]
     save_data(data)
+    # Notion sync (background) — só dispara se App registrou o hook
+    if _history_hook:
+        try:
+            _history_hook(task_name)
+        except Exception as _e:
+            print(f"[notion-sync] history hook falhou: {_e}")
 
 # ======================================================================================
 #  Limpeza automática de logs
@@ -2832,6 +2841,453 @@ def parse_times(text: str):
         if norm not in out:
             out.append(norm)
     return out or ["06:00"]
+
+# ======================================================================================
+#  Notion Sync — bidirecional (v2025.10.11.28)
+# ======================================================================================
+# Cliente REST puro pra Notion API v1. Sem deps extras (usa `requests`).
+# Sincroniza: cada job local <=> 1 página no database Notion configurado.
+#
+# Schema esperado no database Notion (o usuário cria as colunas):
+#   Name         (title)         <- task['name']
+#   Tipo         (select)        <- task['type']  (Pentaho .ktr / .kjb / Python / Robocopy / Comando)
+#   Agendamento  (rich_text)     <- cron humano    (Ex.: "Diário 08:00")
+#   Tags         (multi_select)  <- task['tags']
+#   Ativo        (checkbox)      <- not task['paused']
+#   Última execução (date)       <- last_run timestamp
+#   Último resultado (select)    <- "✅ Sucesso" / "❌ Falha" / "—"
+#   Notas        (rich_text)     <- editável no Notion (puxado pro local)
+#
+# Estratégia:
+#   - Push (local → Notion): após cada save_data() e após append_history(); em background.
+#   - Pull (Notion → local) : periódico (5 min) + botão manual. Só atualiza campos
+#     que o usuário edita no Notion: Notas, Tags, Ativo.
+#   - Match: cada job armazena `notion_page_id` na 1ª sincronização.
+# ======================================================================================
+
+NOTION_API_VERSION = "2022-06-28"
+NOTION_API_BASE = "https://api.notion.com/v1"
+
+class NotionSyncClient:
+    """Cliente REST minimalista para Notion API v1. Não joga exceptions pra fora —
+    devolve sempre (ok, data_or_error)."""
+
+    def __init__(self, token: str, database_id: str, timeout: float = 12.0):
+        self.token = (token or "").strip()
+        # Aceita URL completa (https://notion.so/.../<id>?v=...) ou só o ID
+        self.database_id = self._extract_id(database_id)
+        self.timeout = timeout
+        self._session = None
+
+    @staticmethod
+    def _extract_id(raw: str) -> str:
+        """Recebe URL ou ID puro e devolve o UUID (com ou sem hífens) limpo."""
+        if not raw:
+            return ""
+        s = str(raw).strip()
+        # Casos: https://www.notion.so/workspace/Title-XXXXXXXXXXXX?v=YYYY
+        m = re.search(r"([0-9a-fA-F]{32}|[0-9a-fA-F\-]{36})", s)
+        return m.group(1) if m else s
+
+    def _sess(self):
+        if self._session is None:
+            try:
+                import requests
+                self._session = requests.Session()
+                self._session.headers.update({
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": NOTION_API_VERSION,
+                    "Content-Type": "application/json",
+                })
+            except Exception:
+                self._session = False
+        return self._session
+
+    def _request(self, method: str, path: str, json_body=None, max_retries: int = 2):
+        s = self._sess()
+        if not s:
+            return False, "requests indisponível"
+        url = f"{NOTION_API_BASE}{path}"
+        last_err = None
+        for attempt in range(max_retries + 1):
+            try:
+                r = s.request(method, url, json=json_body, timeout=self.timeout)
+                if r.status_code == 429:
+                    # rate limited — espera Retry-After ou backoff exponencial
+                    wait = float(r.headers.get("Retry-After", 0)) or (2 ** attempt)
+                    time.sleep(min(wait, 30))
+                    continue
+                if 500 <= r.status_code < 600 and attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                if r.status_code >= 400:
+                    try:
+                        msg = r.json().get("message") or r.text[:200]
+                    except Exception:
+                        msg = r.text[:200]
+                    return False, f"HTTP {r.status_code}: {msg}"
+                return True, r.json() if r.text else {}
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return False, last_err
+        return False, last_err or "falha desconhecida"
+
+    # ---- operações alto-nível ----------------------------------------------------
+    def validate(self):
+        """Testa: token válido + database acessível. Devolve (ok, msg)."""
+        if not self.token:
+            return False, "Token vazio"
+        if not self.database_id:
+            return False, "Database ID vazio"
+        ok, data = self._request("GET", f"/databases/{self.database_id}")
+        if not ok:
+            return False, str(data)
+        # captura schema disponível
+        props = data.get("properties", {}) if isinstance(data, dict) else {}
+        return True, {"title": data.get("title", []), "properties": list(props.keys())}
+
+    def create_page(self, properties: dict):
+        body = {
+            "parent": {"database_id": self.database_id},
+            "properties": properties,
+        }
+        return self._request("POST", "/pages", body)
+
+    def update_page(self, page_id: str, properties: dict):
+        body = {"properties": properties}
+        return self._request("PATCH", f"/pages/{page_id}", body)
+
+    def archive_page(self, page_id: str):
+        return self._request("PATCH", f"/pages/{page_id}", {"archived": True})
+
+    def query_database(self, start_cursor: str = None, page_size: int = 100):
+        body = {"page_size": page_size}
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        return self._request("POST", f"/databases/{self.database_id}/query", body)
+
+    def query_all_pages(self):
+        """Paginação automática. Retorna (ok, list_of_pages)."""
+        out = []
+        cursor = None
+        for _ in range(50):  # hard limit pra evitar loop
+            ok, data = self.query_database(start_cursor=cursor)
+            if not ok:
+                return False, data
+            out.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+        return True, out
+
+
+# ----- field mapping helpers (local job ↔ Notion props) -----
+def _notion_title(text: str):
+    return {"title": [{"type": "text", "text": {"content": str(text or "")[:2000]}}]}
+
+def _notion_text(text: str):
+    return {"rich_text": [{"type": "text", "text": {"content": str(text or "")[:2000]}}]}
+
+def _notion_select(name: str):
+    if not name:
+        return {"select": None}
+    return {"select": {"name": str(name)[:100]}}
+
+def _notion_multi_select(names):
+    items = [{"name": str(n)[:100]} for n in (names or []) if n]
+    return {"multi_select": items}
+
+def _notion_checkbox(b: bool):
+    return {"checkbox": bool(b)}
+
+def _notion_date(iso_dt_str: str):
+    if not iso_dt_str:
+        return {"date": None}
+    # aceita "YYYY-MM-DD HH:MM:SS" ou ISO
+    try:
+        dt = datetime.fromisoformat(str(iso_dt_str).replace(" ", "T"))
+        return {"date": {"start": dt.isoformat()}}
+    except Exception:
+        return {"date": None}
+
+def _readable_schedule(task: dict) -> str:
+    """Devolve string humana do agendamento: 'Diário 08:00', 'Seg/Qua/Sex 14:00', etc."""
+    st = (task.get("schedule_type") or "").lower()
+    times = task.get("schedule_times") or [task.get("scheduled_time", "")]
+    times_str = "/".join(t for t in times if t)
+    if not st:
+        return ""
+    if st == "daily":
+        return f"Diário {times_str}".strip()
+    if st == "weekly":
+        days = task.get("scheduled_days") or []
+        d_lbl = "/".join(["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"][i] for i in days if 0 <= i < 7)
+        return f"{d_lbl} {times_str}".strip()
+    if st == "monthly":
+        d = task.get("scheduled_day_of_month", "?")
+        return f"Mensal dia {d} {times_str}".strip()
+    if st == "interval":
+        n = task.get("interval_value", "?")
+        u = task.get("interval_unit", "min")
+        return f"A cada {n} {u}"
+    if st == "cron":
+        return f"Cron: {task.get('cron_expr', '')}"
+    return st
+
+def _last_run_info(data: dict, task_name: str):
+    """Devolve (last_run_iso, last_result_label) da history."""
+    hist = (data.get("history") or {}).get(task_name) or []
+    if not hist:
+        return "", "—"
+    last = hist[-1]
+    ts = last.get("ts", "")
+    rc = int(last.get("rc", -1))
+    if rc == 0:
+        label = "✅ Sucesso"
+    elif rc == -999:
+        label = "⏸ Cancelado"
+    else:
+        label = "❌ Falha"
+    return ts, label
+
+def task_to_notion_props(task: dict, data: dict) -> dict:
+    """Constrói o dict 'properties' do Notion a partir de um task local."""
+    last_run, last_result = _last_run_info(data, task.get("name", ""))
+    return {
+        "Name": _notion_title(task.get("name", "")),
+        "Tipo": _notion_select(task.get("type", "")),
+        "Agendamento": _notion_text(_readable_schedule(task)),
+        "Tags": _notion_multi_select(task.get("tags", [])),
+        "Ativo": _notion_checkbox(not bool(task.get("paused", False))),
+        "Última execução": _notion_date(last_run),
+        "Último resultado": _notion_select(last_result),
+    }
+
+def extract_pullable_from_notion(page: dict) -> dict:
+    """Lê de uma página Notion os campos que o usuário pode editar:
+    paused (Ativo invertido), tags (multi_select), notas (rich_text)."""
+    props = (page or {}).get("properties", {}) or {}
+    out = {}
+    # Ativo → paused (invertido)
+    ativo = props.get("Ativo")
+    if isinstance(ativo, dict) and "checkbox" in ativo:
+        out["paused"] = not bool(ativo["checkbox"])
+    # Tags
+    tags_p = props.get("Tags")
+    if isinstance(tags_p, dict) and "multi_select" in tags_p:
+        out["tags"] = [t.get("name", "") for t in tags_p["multi_select"] if t.get("name")]
+    # Notas
+    notas_p = props.get("Notas")
+    if isinstance(notas_p, dict) and "rich_text" in notas_p:
+        out["notas"] = "".join(seg.get("plain_text", "") for seg in notas_p["rich_text"])
+    return out
+
+
+class NotionSyncManager:
+    """Gerencia push/pull em background. Mantido como attr da App.
+    Não bloqueia UI: cada operação roda em thread daemon."""
+
+    def __init__(self, app_ref):
+        self.app = app_ref
+        self._lock = threading.Lock()
+        self._pull_timer = None
+        self.last_status = {"ok": True, "ts": "", "msg": "", "pushed": 0, "pulled": 0, "errors": 0}
+
+    # ---- config helpers --------------------------------------------------------
+    def cfg(self) -> dict:
+        return (self.app.data.get("settings", {}) or {}).get("notion_sync", {}) or {}
+
+    def is_enabled(self) -> bool:
+        return bool(self.cfg().get("enabled", False))
+
+    def client(self):
+        c = self.cfg()
+        if not c.get("token") or not c.get("database_id"):
+            return None
+        # v2025.10.11.28 — token salvo criptografado com DPAPI
+        try:
+            tok = dpapi_decrypt(c["token"]) or c["token"]
+        except Exception:
+            tok = c["token"]
+        return NotionSyncClient(tok, c["database_id"])
+
+    # ---- validation (sync, called da UI) ---------------------------------------
+    def validate(self):
+        cli = self.client()
+        if not cli:
+            return False, "Token ou Database ID vazio"
+        return cli.validate()
+
+    # ---- push helpers ----------------------------------------------------------
+    def push_task_async(self, task_name: str):
+        """Push 1 task pelo nome. Não bloqueia."""
+        if not self.is_enabled():
+            return
+        threading.Thread(target=self._push_task_sync,
+                         args=(task_name,), daemon=True).start()
+
+    def push_all_async(self, on_done=None):
+        if not self.is_enabled():
+            if on_done:
+                self.app.after(0, lambda: on_done(False, "Sync desabilitado"))
+            return
+        threading.Thread(target=self._push_all_sync,
+                         args=(on_done,), daemon=True).start()
+
+    def _find_task(self, name: str):
+        for t in self.app.data.get("tasks", []):
+            if t.get("name") == name:
+                return t
+        return None
+
+    def _push_task_sync(self, task_name: str):
+        with self._lock:
+            cli = self.client()
+            if not cli:
+                return
+            task = self._find_task(task_name)
+            if not task:
+                return
+            props = task_to_notion_props(task, self.app.data)
+            page_id = task.get("notion_page_id")
+            try:
+                if page_id:
+                    ok, res = cli.update_page(page_id, props)
+                    if not ok and "not found" in str(res).lower():
+                        # página foi deletada no Notion → recria
+                        page_id = None
+                        ok, res = cli.create_page(props)
+                else:
+                    ok, res = cli.create_page(props)
+                if ok and isinstance(res, dict) and res.get("id"):
+                    new_id = res["id"]
+                    if new_id != page_id:
+                        task["notion_page_id"] = new_id
+                        save_data(self.app.data)
+                    self.last_status.update({"ok": True, "ts": now_str(),
+                                             "msg": f"Push OK: {task_name}",
+                                             "pushed": self.last_status["pushed"] + 1})
+                else:
+                    self.last_status.update({"ok": False, "ts": now_str(),
+                                             "msg": f"Push FALHOU ({task_name}): {res}",
+                                             "errors": self.last_status["errors"] + 1})
+                    print(f"[notion-sync] push falhou ({task_name}): {res}")
+            except Exception as e:
+                self.last_status.update({"ok": False, "ts": now_str(),
+                                         "msg": f"Push exception: {e}",
+                                         "errors": self.last_status["errors"] + 1})
+                print(f"[notion-sync] push exception: {e}")
+
+    def _push_all_sync(self, on_done=None):
+        cli = self.client()
+        if not cli:
+            if on_done:
+                self.app.after(0, lambda: on_done(False, "Sem cliente"))
+            return
+        tasks = list(self.app.data.get("tasks", []) or [])
+        pushed = errors = 0
+        for t in tasks:
+            try:
+                self._push_task_sync(t.get("name", ""))
+                pushed += 1
+            except Exception:
+                errors += 1
+        msg = f"Sincronizados {pushed}/{len(tasks)} jobs ({errors} erros)"
+        if on_done:
+            self.app.after(0, lambda: on_done(errors == 0, msg))
+
+    # ---- pull (Notion → local) -------------------------------------------------
+    def pull_all_async(self, on_done=None):
+        if not self.is_enabled():
+            if on_done:
+                self.app.after(0, lambda: on_done(False, "Sync desabilitado"))
+            return
+        threading.Thread(target=self._pull_all_sync,
+                         args=(on_done,), daemon=True).start()
+
+    def _pull_all_sync(self, on_done=None):
+        cli = self.client()
+        if not cli:
+            if on_done:
+                self.app.after(0, lambda: on_done(False, "Sem cliente"))
+            return
+        ok, pages = cli.query_all_pages()
+        if not ok:
+            self.last_status.update({"ok": False, "ts": now_str(),
+                                     "msg": f"Pull FALHOU: {pages}",
+                                     "errors": self.last_status["errors"] + 1})
+            if on_done:
+                self.app.after(0, lambda: on_done(False, str(pages)))
+            return
+
+        changed = 0
+        with self._lock:
+            # Index por notion_page_id
+            tasks_by_pid = {t.get("notion_page_id"): t
+                            for t in self.app.data.get("tasks", []) if t.get("notion_page_id")}
+            for page in pages:
+                pid = page.get("id")
+                if not pid:
+                    continue
+                t = tasks_by_pid.get(pid)
+                if not t:
+                    continue
+                pull = extract_pullable_from_notion(page)
+                dirty = False
+                if "paused" in pull and bool(pull["paused"]) != bool(t.get("paused", False)):
+                    t["paused"] = bool(pull["paused"])
+                    dirty = True
+                if "tags" in pull:
+                    new_tags = sorted(set(pull["tags"]))
+                    old_tags = sorted(set(t.get("tags", []) or []))
+                    if new_tags != old_tags:
+                        t["tags"] = pull["tags"]
+                        dirty = True
+                if "notas" in pull and pull["notas"]:
+                    if t.get("notes", "") != pull["notas"]:
+                        t["notes"] = pull["notas"]
+                        dirty = True
+                if dirty:
+                    changed += 1
+            if changed:
+                save_data(self.app.data)
+                # avisa a App que dados mudaram → re-render
+                try:
+                    self.app.after(0, self.app._refresh_table_silent)
+                except Exception:
+                    pass
+
+        self.last_status.update({"ok": True, "ts": now_str(),
+                                 "msg": f"Pull OK: {changed} jobs atualizados",
+                                 "pulled": self.last_status["pulled"] + changed})
+        if on_done:
+            self.app.after(0, lambda: on_done(True,
+                                              f"Pull OK: {changed} jobs atualizados"))
+
+    # ---- periodic pull loop ----------------------------------------------------
+    def start_periodic(self, interval_minutes: int = 5):
+        self.stop_periodic()
+        self._schedule_next(interval_minutes)
+
+    def stop_periodic(self):
+        if self._pull_timer:
+            try:
+                self.app.after_cancel(self._pull_timer)
+            except Exception:
+                pass
+            self._pull_timer = None
+
+    def _schedule_next(self, interval_minutes: int):
+        ms = max(60_000, int(interval_minutes * 60_000))  # mín 1 min
+        def _tick():
+            if self.is_enabled():
+                self.pull_all_async()
+            self._schedule_next(interval_minutes)
+        self._pull_timer = self.app.after(ms, _tick)
+
 
 # ===== classes =====
 class ToolTip:
@@ -4659,6 +5115,13 @@ class SettingsDialog(tk.Toplevel):
         self.var_rb_on = tk.BooleanVar(value=rb.get("enabled", True))
         self.var_rb_thr = tk.StringVar(value=str(rb.get("crash_threshold", 3)))
 
+        # ----- v2025.10.11.28 — Notion sync bidirecional -----
+        ns = settings.get("notion_sync", {}) or {}
+        self.var_ns_on = tk.BooleanVar(value=ns.get("enabled", False))
+        # token e database_id ficam em texto plano nas vars (mascarados no widget)
+        self.var_ns_token = tk.StringVar(value=dpapi_decrypt(ns.get("token", "")) if ns.get("token") else "")
+        self.var_ns_db = tk.StringVar(value=ns.get("database_id", ""))
+
         # ----- v2025.10.11.25 — Modo Showtime (substitui Modo Manhã) -----
         sm = settings.get("showtime_mode", {}) or {}
         self.var_st_on = tk.BooleanVar(value=sm.get("enabled", False))
@@ -4973,6 +5436,63 @@ class SettingsDialog(tk.Toplevel):
                         "POST /jobs/{nome}/run\n"
                         "Token é enviado no header X-Auth-Token. Mudar requer reiniciar o app."),
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        # === ABA: 🔗 NOTION SYNC (v2025.10.11.28) ===
+        tab_ns = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_ns, text="  🔗 Notion  ")
+        self._add_tab_header(tab_ns, "🔗  Notion Sync — espelhar jobs no Notion",
+                             "Cada job vira uma página num database do Notion (configure abaixo). "
+                             "Push automático a cada save/execução. Pull a cada 5 min puxa o que você "
+                             "editou no Notion (Tags, Ativo, Notas).")
+        row = 1
+        ttk.Checkbutton(tab_ns, text="🔗 Habilitar Notion sync",
+                        variable=self.var_ns_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        ttk.Label(tab_ns, text="Token de integração:",
+                  font=("Segoe UI", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(tab_ns, textvariable=self.var_ns_token, width=52, show="*")\
+            .grid(row=row, column=1, columnspan=2, sticky="we", padx=(8, 0), pady=(12, 0)); row += 1
+        ttk.Label(tab_ns,
+                  text="↑ Crie em https://www.notion.so/profile/integrations (tipo 'Internal'). "
+                       "Não compartilhe — fica criptografado no disco com DPAPI.",
+                  foreground="#888", wraplength=900).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
+
+        ttk.Label(tab_ns, text="Database (cole URL ou ID):",
+                  font=("Segoe UI", 9, "bold")).grid(row=row, column=0, sticky="w", pady=(12, 0))
+        ttk.Entry(tab_ns, textvariable=self.var_ns_db, width=52)\
+            .grid(row=row, column=1, columnspan=2, sticky="we", padx=(8, 0), pady=(12, 0)); row += 1
+        ttk.Label(tab_ns,
+                  text="↑ Abra o database no Notion → ⋯ → Copiar link. O app extrai o ID automaticamente. "
+                       "Compartilhe o database com a integração (Share → Convidar → selecione sua integração).",
+                  foreground="#888", wraplength=900).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
+
+        # Esquema esperado
+        ttk.Separator(tab_ns, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(16, 12)); row += 1
+        ttk.Label(tab_ns, text="📋  Colunas esperadas no database",
+                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Label(tab_ns,
+                  text=("Crie estas colunas no database do Notion (nomes exatos):\n"
+                        "   • Name (Title)  • Tipo (Select)  • Agendamento (Text)\n"
+                        "   • Tags (Multi-select)  • Ativo (Checkbox)\n"
+                        "   • Última execução (Date)  • Último resultado (Select)  • Notas (Text)"),
+                  foreground="#666", justify="left", font=("Consolas", 9)).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
+
+        # Botões de ação
+        ns_btn_frame = ttk.Frame(tab_ns)
+        ns_btn_frame.grid(row=row, column=0, columnspan=3, sticky="w", pady=(16, 0)); row += 1
+        ttk.Button(ns_btn_frame, text="🧪 Testar conexão",
+                   command=self._ns_test).pack(side="left", padx=(0, 8))
+        ttk.Button(ns_btn_frame, text="⬆ Sincronizar todos agora",
+                   command=self._ns_push_all).pack(side="left", padx=8)
+        ttk.Button(ns_btn_frame, text="⬇ Puxar do Notion agora",
+                   command=self._ns_pull_now).pack(side="left", padx=8)
+
+        # Status
+        self._ns_status_lbl = ttk.Label(tab_ns, text="Status: —", foreground="#888")
+        self._ns_status_lbl.grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self._ns_refresh_status()
 
         # === ABA 5: SISTEMA ===
         tab_sistema = ttk.Frame(notebook, padding=24)
@@ -5307,6 +5827,88 @@ class SettingsDialog(tk.Toplevel):
                             parent=self)
 
     # v2025.10.11.8 — helpers das novas abas ---------------------------------
+    # ----- v2025.10.11.28 — Notion sync helpers -----
+    def _ns_refresh_status(self):
+        """Atualiza a label de status da aba Notion."""
+        try:
+            app = self.master if hasattr(self.master, "notion_sync") else None
+            if app is None or not hasattr(app, "notion_sync"):
+                self._ns_status_lbl.config(text="Status: gerenciador não inicializado", foreground="#888")
+                return
+            st = app.notion_sync.last_status
+            if not st.get("ts"):
+                self._ns_status_lbl.config(text="Status: aguardando primeira sincronização",
+                                            foreground="#888")
+                return
+            cor = "#28a745" if st.get("ok") else "#dc3545"
+            self._ns_status_lbl.config(
+                text=f"Status: {st['msg']}  •  {st['ts']}  •  pushed={st['pushed']}  pulled={st['pulled']}  errors={st['errors']}",
+                foreground=cor)
+        except Exception as _e:
+            print(f"[ns-status] {_e}")
+
+    def _ns_test(self):
+        token = self.var_ns_token.get().strip()
+        db = self.var_ns_db.get().strip()
+        if not token or not db:
+            messagebox.showwarning("Notion sync", "Preencha token e database antes de testar.")
+            return
+        try:
+            cli = NotionSyncClient(token, db)
+            ok, res = cli.validate()
+            if ok:
+                cols = ", ".join(res.get("properties", []))
+                messagebox.showinfo("Notion sync",
+                                     f"Conexão OK!\n\nColunas do database:\n{cols}\n\n"
+                                     "Lembre-se de criar as colunas faltantes (ver lista na aba).")
+            else:
+                messagebox.showerror("Notion sync", f"Falha:\n{res}")
+        except Exception as e:
+            messagebox.showerror("Notion sync", f"Erro inesperado:\n{e}")
+
+    def _ns_push_all(self):
+        app = self.master
+        if not hasattr(app, "notion_sync"):
+            messagebox.showwarning("Notion sync", "Gerenciador não inicializado.")
+            return
+        # primeiro salva o token/db atuais (em memória) pro client picar
+        ns = app.data.setdefault("settings", {}).setdefault("notion_sync", {})
+        ns["enabled"] = bool(self.var_ns_on.get())
+        ns["token"] = dpapi_encrypt(self.var_ns_token.get().strip()) if self.var_ns_token.get().strip() else ""
+        ns["database_id"] = self.var_ns_db.get().strip()
+        save_data(app.data)
+
+        if not app.notion_sync.is_enabled():
+            messagebox.showwarning("Notion sync", "Habilite o sync primeiro e clique Salvar.")
+            return
+
+        def _done(ok, msg):
+            self._ns_refresh_status()
+            if ok:
+                messagebox.showinfo("Notion sync", msg)
+            else:
+                messagebox.showerror("Notion sync", msg)
+        app.notion_sync.push_all_async(on_done=_done)
+        self._ns_status_lbl.config(text="Status: sincronizando…", foreground="#0d6efd")
+
+    def _ns_pull_now(self):
+        app = self.master
+        if not hasattr(app, "notion_sync"):
+            messagebox.showwarning("Notion sync", "Gerenciador não inicializado.")
+            return
+        if not app.notion_sync.is_enabled():
+            messagebox.showwarning("Notion sync", "Habilite o sync primeiro e clique Salvar.")
+            return
+
+        def _done(ok, msg):
+            self._ns_refresh_status()
+            if ok:
+                messagebox.showinfo("Notion sync", msg)
+            else:
+                messagebox.showerror("Notion sync", msg)
+        app.notion_sync.pull_all_async(on_done=_done)
+        self._ns_status_lbl.config(text="Status: puxando do Notion…", foreground="#0d6efd")
+
     def test_webhooks(self):
         try:
             wh_text = self._wh_text.get("1.0", "end").strip()
@@ -5610,6 +6212,13 @@ class SettingsDialog(tk.Toplevel):
             "rollback": {
                 "enabled": self.var_rb_on.get(),
                 "crash_threshold": rb_thr,
+            },
+            # v2025.10.11.28 — Notion sync bidirecional
+            "notion_sync": {
+                "enabled": self.var_ns_on.get(),
+                "token": (dpapi_encrypt(self.var_ns_token.get().strip())
+                          if self.var_ns_token.get().strip() else ""),
+                "database_id": self.var_ns_db.get().strip(),
             },
             # v2025.10.11.25 — Modo Showtime (substitui Modo Manhã)
             "showtime_mode": {
@@ -7600,6 +8209,20 @@ class App(_AppBase):
             self._showtime_monitor.restart()
         except Exception as _e:
             print(f"[showtime] falha ao iniciar: {_e}")
+
+        # v2025.10.11.28 — Notion sync bidirecional (push em background + pull periódico)
+        try:
+            if not hasattr(self, "notion_sync"):
+                self.notion_sync = NotionSyncManager(self)
+            # registra hook global para append_history disparar push após cada execução
+            global _history_hook
+            _history_hook = lambda task_name: self.notion_sync.push_task_async(task_name)
+            if self.notion_sync.is_enabled():
+                # Pull a cada 5 minutos. 1° tick em 30s pra deixar UI estabilizar.
+                self.notion_sync.stop_periodic()
+                self.after(30_000, lambda: self.notion_sync.start_periodic(5))
+        except Exception as _e:
+            print(f"[notion-sync] falha ao iniciar: {_e}")
 
         # garante scheduler rodando
         if not self.scheduler.running:
@@ -9843,6 +10466,13 @@ class App(_AppBase):
 
 
     # ===== tabela & gráfico =====
+    def _refresh_table_silent(self):
+        """v2025.10.11.28 — refresh sem mexer em scroll/selecao (usado pelo pull Notion)."""
+        try:
+            self.refresh_table(full_refresh=False)
+        except Exception as _e:
+            print(f"[refresh-silent] {_e}")
+
     def refresh_table(self, full_refresh=True):
         """Atualiza a tabela. full_refresh=False apenas atualiza status."""
         # Salva a seleção atual
@@ -10557,6 +11187,11 @@ class App(_AppBase):
             dlg.result.setdefault("enabled", True)
             self.data["tasks"].append(dlg.result)
             self.save(silent=True); self.refresh_table(); self.reschedule_all()
+            # v2025.10.11.28 — Notion sync: push novo job em background
+            try:
+                if hasattr(self, "notion_sync"):
+                    self.notion_sync.push_task_async(dlg.result["name"])
+            except Exception: pass
 
     def open_assistant(self):
         dlg = AssistantDialog(self); self.wait_window(dlg)
@@ -10579,14 +11214,23 @@ class App(_AppBase):
         name = sel[0]
         task = next((t for t in self.data["tasks"] if t["name"]==name), None)
         if not task: return
+        # preserva notion_page_id ao editar
+        prev_notion_pid = task.get("notion_page_id")
         dlg = TaskDialog(self, task,
                          existing_jobs=self._existing_job_names(),
                          all_tags=self._all_known_tags())
         self.wait_window(dlg)
         if dlg.result:
+            if prev_notion_pid and not dlg.result.get("notion_page_id"):
+                dlg.result["notion_page_id"] = prev_notion_pid
             idx = self.data["tasks"].index(task)
             self.data["tasks"][idx] = dlg.result
             self.save(silent=True); self.refresh_table(); self.reschedule_all()
+            # v2025.10.11.28 — Notion sync: push alteração em background
+            try:
+                if hasattr(self, "notion_sync"):
+                    self.notion_sync.push_task_async(dlg.result["name"])
+            except Exception: pass
 
     def remove_task(self):
      sel = self.tree.selection()
@@ -10595,6 +11239,10 @@ class App(_AppBase):
      name = sel[0]
      if not messagebox.askyesno("Confirmar", f"Remover a tarefa '{name}'?"):
         return
+
+     # v2025.10.11.28 — pega notion_page_id ANTES de remover (pra archive depois)
+     task_being_removed = next((t for t in self.data["tasks"] if t["name"] == name), None)
+     notion_pid = task_being_removed.get("notion_page_id") if task_being_removed else None
 
      # remove do JSON
      self.data["tasks"] = [t for t in self.data["tasks"] if t["name"] != name]
@@ -10610,6 +11258,16 @@ class App(_AppBase):
 
      self.save(silent=True)
      self.refresh_table()
+
+     # v2025.10.11.28 — arquiva página correspondente no Notion (background)
+     if notion_pid and hasattr(self, "notion_sync"):
+        try:
+            def _archive():
+                cli = self.notion_sync.client()
+                if cli:
+                    cli.archive_page(notion_pid)
+            threading.Thread(target=_archive, daemon=True).start()
+        except Exception: pass
 
     def toggle_task_status(self):
         """Ativa ou desativa a tarefa selecionada"""
