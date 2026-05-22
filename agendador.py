@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.20"   # << aumente em cada build
+APP_VERSION = "2025.10.11.21"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -930,6 +930,107 @@ def _is_dark_mode(master) -> bool:
         return bool(master.var_dark.get())
     except Exception:
         return False
+
+def compute_health_score(history_entries: list, sample_size: int = 20) -> dict:
+    """v2025.10.11.21 — Calcula health score (0-100) de um job baseado no histórico.
+
+    Critérios:
+    - 60% peso: taxa de sucesso das últimas N execuções
+    - 20% peso: estabilidade de duração (variância baixa = melhor)
+    - 20% peso: recência (rodou recentemente = melhor)
+
+    Retorna dict com:
+      score: 0-100 int
+      label: "🟢 Excelente" / "🟡 Atenção" / "🔴 Crítico" / "⚪ Sem dados"
+      color: hex
+      runs: nº execuções analisadas
+    """
+    if not history_entries:
+        return {"score": 0, "label": "⚪ Sem dados", "color": "#9ca3af", "runs": 0}
+
+    sample = history_entries[-sample_size:]
+    total = len(sample)
+    if total == 0:
+        return {"score": 0, "label": "⚪ Sem dados", "color": "#9ca3af", "runs": 0}
+
+    # Sucesso = rc == 0; ignora interrompidos (-999)
+    ok = sum(1 for e in sample if int(e.get("rc", -1)) == 0)
+    fail = sum(1 for e in sample if int(e.get("rc", -1)) not in (0, -999))
+    relevant = ok + fail
+    success_rate = (ok / relevant * 100.0) if relevant else 50.0
+
+    # Estabilidade de duração: coeficiente de variação. Baixo = bom.
+    durs = [float(e.get("dur", 0)) for e in sample if float(e.get("dur", 0)) > 0]
+    if len(durs) >= 3:
+        avg = sum(durs) / len(durs)
+        if avg > 0:
+            variance = sum((d - avg) ** 2 for d in durs) / len(durs)
+            stddev = variance ** 0.5
+            cv = stddev / avg
+            stability = max(0, 100 - (cv * 100))  # 0% cv = 100, 1.0 cv = 0
+        else:
+            stability = 50
+    else:
+        stability = 50
+
+    # Recência: rodou nas últimas 24h = 100; >7 dias = 0
+    recency = 50
+    try:
+        last_ts = sample[-1].get("ts", "")
+        last_dt = datetime.strptime(last_ts, "%Y-%m-%d %H:%M:%S")
+        hours_ago = (datetime.now() - last_dt).total_seconds() / 3600.0
+        if hours_ago < 24:
+            recency = 100
+        elif hours_ago < 168:  # 7 dias
+            recency = max(0, 100 - (hours_ago - 24) / (168 - 24) * 100)
+        else:
+            recency = 0
+    except Exception:
+        pass
+
+    score = int(0.6 * success_rate + 0.2 * stability + 0.2 * recency)
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        return {"score": score, "label": "🟢 Excelente", "color": "#22c55e", "runs": total}
+    elif score >= 50:
+        return {"score": score, "label": "🟡 Atenção",  "color": "#f59e0b", "runs": total}
+    else:
+        return {"score": score, "label": "🔴 Crítico",  "color": "#ef4444", "runs": total}
+
+
+def detect_slow_regression(history_entries: list, recent_n: int = 3, baseline_n: int = 20) -> dict:
+    """v2025.10.11.21 — Detecta regressão de duração.
+
+    Compara as últimas `recent_n` execuções de sucesso com a média histórica
+    de `baseline_n` execuções anteriores. Se as recentes estão 2x+ mais lentas,
+    retorna alerta.
+
+    Retorna dict:
+      is_slow: bool
+      ratio: float (recente / baseline)
+      recent_avg: float
+      baseline_avg: float
+    """
+    succ = [e for e in history_entries if int(e.get("rc", -1)) == 0 and float(e.get("dur", 0)) > 0]
+    if len(succ) < (recent_n + 3):
+        return {"is_slow": False, "ratio": 0.0, "recent_avg": 0.0, "baseline_avg": 0.0}
+    recent = succ[-recent_n:]
+    baseline = succ[-(recent_n + baseline_n):-recent_n] if len(succ) >= (recent_n + baseline_n) else succ[:-recent_n]
+    if not baseline:
+        return {"is_slow": False, "ratio": 0.0, "recent_avg": 0.0, "baseline_avg": 0.0}
+    recent_avg = sum(float(e["dur"]) for e in recent) / len(recent)
+    baseline_avg = sum(float(e["dur"]) for e in baseline) / len(baseline)
+    if baseline_avg <= 0:
+        return {"is_slow": False, "ratio": 0.0, "recent_avg": recent_avg, "baseline_avg": 0.0}
+    ratio = recent_avg / baseline_avg
+    return {
+        "is_slow": ratio >= 2.0 and recent_avg > 10,  # 2x mais lento E pelo menos 10s
+        "ratio": ratio,
+        "recent_avg": recent_avg,
+        "baseline_avg": baseline_avg,
+    }
+
 
 def _resolve_fonts():
     """Detecta as fontes Bravo (Montserrat / Roboto). Fallback Segoe UI."""
@@ -2915,6 +3016,312 @@ class AssistantDialog(tk.Toplevel):
 
 
 
+class CalendarDayView(tk.Toplevel):
+    """v2025.10.11.21 — Timeline do dia mostrando jobs em cada horário.
+
+    Útil pra ver visualmente conflitos: '10 jobs disparam às 06:00'.
+    """
+    def __init__(self, master, data: dict):
+        super().__init__(master)
+        self.title("Calendário do dia — Agendador-Bravo")
+        self.geometry("760x720")
+        self.minsize(620, 540)
+        try:
+            self.transient(master)
+        except Exception:
+            pass
+        self._dark = _is_dark_mode(master)
+        self._theme = _bravo_theme(self._dark)
+        self._font_title, self._font_body = _resolve_fonts()
+        T = self._theme
+
+        self.configure(bg=T['bg_app'])
+        try:
+            ico = find_logo_ico()
+            if ico: self.iconbitmap(default=str(ico))
+        except Exception: pass
+
+        # Header
+        h = tk.Frame(self, bg=T['bg_surface'])
+        h.pack(fill="x")
+        hi = tk.Frame(h, bg=T['bg_surface'])
+        hi.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(hi, text="📅  Calendário do dia",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(self._font_title, 15, "bold")).pack(side="left")
+        tk.Label(hi, text=f"Hoje · {date.today().strftime('%d/%m/%Y')}",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(self._font_body, 9)).pack(side="right")
+        tk.Frame(self, bg=T['border'], height=1).pack(fill="x")
+
+        # Body com canvas + scroll
+        body = tk.Frame(self, bg=T['bg_app'])
+        body.pack(fill="both", expand=True)
+        self._canvas = tk.Canvas(body, bg=T['bg_surface'], highlightthickness=0)
+        vb = ttk.Scrollbar(body, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vb.set)
+        vb.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        # Footer
+        tk.Frame(self, bg=T['border'], height=1).pack(fill="x")
+        f = tk.Frame(self, bg=T['bg_surface'])
+        f.pack(fill="x")
+        fi = tk.Frame(f, bg=T['bg_surface'])
+        fi.pack(fill="x", padx=20, pady=12)
+        tk.Label(fi, text="🔴 horários com 3+ jobs em conflito · clique no nome do job pra abrir editar",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(self._font_body, 9)).pack(side="left")
+        ttk.Button(fi, text="Fechar", command=self.destroy).pack(side="right")
+
+        self._data = data
+        self.after(50, self._draw)
+
+    def _draw(self):
+        T = self._theme
+        tasks = self._data.get("tasks", []) or []
+        today = date.today()
+        today_weekday = today.weekday()  # 0=seg
+
+        # Coleta {hh:mm: [(task_name, task)]}
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for t in tasks:
+            if not t.get("enabled", True):
+                continue
+            days = t.get("days") or [True]*7
+            if not (0 <= today_weekday < len(days) and days[today_weekday]):
+                continue
+            stype = (t.get("schedule_type") or "cron").lower()
+            if stype == "cron":
+                times = t.get("times") or [t.get("time", "06:00")]
+                if isinstance(times, str): times = [times]
+                for h in times:
+                    buckets[str(h).strip()].append(t)
+            elif stype == "interval":
+                ev = int(t.get("every_value", 0) or 0)
+                unit = (t.get("every_unit") or "minutes").lower()
+                step = ev * (60 if unit == "hours" else 1)
+                if step > 0:
+                    minute = 0
+                    while minute < 24 * 60:
+                        buckets[f"{minute//60:02d}:{minute%60:02d}"].append(t)
+                        minute += step
+            elif stype == "start_repeat":
+                start = t.get("sr_start") or t.get("time", "06:00")
+                ev = int(t.get("sr_every_value", 5) or 5)
+                cnt = int(t.get("sr_count", 0) or 0)
+                unit = (t.get("sr_every_unit") or "minutes").lower()
+                times = expand_start_repeat(start, ev, unit, cnt)
+                for h in times:
+                    buckets[h].append(t)
+
+        c = self._canvas
+        c.delete("all")
+        # Canvas largo
+        canvas_w = max(720, self.winfo_width() - 30)
+        row_h = 32
+        margin_l = 80
+        margin_r = 30
+        total_h = 24 * 60 // 15 * (row_h // 4)  # placeholder
+        # Vamos desenhar 24 linhas horárias (1 linha por hora)
+        total_h = 24 * (row_h + 6) + 40
+        c.configure(scrollregion=(0, 0, canvas_w, total_h))
+
+        # Desenha cada hora
+        now_hh = datetime.now().hour
+        now_mm = datetime.now().minute
+
+        for h in range(24):
+            y = 20 + h * (row_h + 6)
+            # hora label
+            c.create_text(margin_l - 10, y + row_h/2,
+                          text=f"{h:02d}:00",
+                          fill=T['subtext'], anchor="e",
+                          font=(self._font_body, 10, "bold"))
+            # linha guia
+            c.create_line(margin_l, y + row_h/2, canvas_w - margin_r, y + row_h/2,
+                          fill=T['border'], dash=(2, 3))
+
+            # marca "agora"
+            if h == now_hh:
+                y_now = y + row_h/2 + (now_mm / 60.0) * (row_h + 6) - (row_h + 6) / 2
+                c.create_line(margin_l, y_now, canvas_w - margin_r, y_now,
+                              fill=T['error'], width=2)
+                c.create_text(canvas_w - margin_r - 4, y_now - 8,
+                              text="◀ agora", fill=T['error'],
+                              anchor="e", font=(self._font_body, 8, "bold"))
+
+            # jobs dessa hora
+            slots_this_hour = sorted([(k, v) for k, v in buckets.items()
+                                       if int(k.split(":")[0]) == h],
+                                      key=lambda x: x[0])
+            x_offset = margin_l + 10
+            for slot_key, jobs in slots_this_hour:
+                mm = int(slot_key.split(":")[1])
+                slot_y = y + (mm / 60.0) * (row_h + 6)
+                count = len(jobs)
+                is_conflict = count >= 3
+                color = T['error'] if is_conflict else T['accent']
+                # bullet
+                c.create_oval(margin_l + 4, slot_y + 4, margin_l + 14, slot_y + 14,
+                              fill=color, outline="")
+                # texto: slot + (count) jobs
+                label = f"{slot_key}  ·  {count} job{'s' if count != 1 else ''}: "
+                label += ", ".join(j["name"] for j in jobs[:2])
+                if count > 2:
+                    label += f", +{count-2}"
+                c.create_text(margin_l + 22, slot_y + 9,
+                              text=label, fill=T['text'], anchor="w",
+                              font=(self._font_body, 9, "bold" if is_conflict else "normal"))
+
+
+class HeatmapWeekView(tk.Toplevel):
+    """v2025.10.11.21 — Heatmap 7 dias × 24 horas mostrando carga de jobs."""
+    def __init__(self, master, data: dict):
+        super().__init__(master)
+        self.title("Heatmap semanal — Agendador-Bravo")
+        self.geometry("900x520")
+        self.minsize(720, 420)
+        try: self.transient(master)
+        except Exception: pass
+
+        self._dark = _is_dark_mode(master)
+        self._theme = _bravo_theme(self._dark)
+        self._font_title, self._font_body = _resolve_fonts()
+        T = self._theme
+
+        self.configure(bg=T['bg_app'])
+        try:
+            ico = find_logo_ico()
+            if ico: self.iconbitmap(default=str(ico))
+        except Exception: pass
+
+        h = tk.Frame(self, bg=T['bg_surface'])
+        h.pack(fill="x")
+        hi = tk.Frame(h, bg=T['bg_surface'])
+        hi.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(hi, text="🔥  Heatmap semanal",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(self._font_title, 15, "bold")).pack(side="left")
+        tk.Label(hi, text="Quantos jobs disparam em cada hora/dia",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(self._font_body, 9)).pack(side="right")
+        tk.Frame(self, bg=T['border'], height=1).pack(fill="x")
+
+        self._canvas = tk.Canvas(self, bg=T['bg_surface'], highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True, padx=14, pady=14)
+
+        tk.Frame(self, bg=T['border'], height=1).pack(fill="x")
+        f = tk.Frame(self, bg=T['bg_surface'])
+        f.pack(fill="x")
+        fi = tk.Frame(f, bg=T['bg_surface'])
+        fi.pack(fill="x", padx=20, pady=12)
+        tk.Label(fi, text="Verde claro = poucos jobs  ·  Vermelho = sobrecarga",
+                 bg=T['bg_surface'], fg=T['subtext'],
+                 font=(self._font_body, 9)).pack(side="left")
+        ttk.Button(fi, text="Fechar", command=self.destroy).pack(side="right")
+
+        self._data = data
+        self.after(50, self._draw)
+
+    def _draw(self):
+        T = self._theme
+        c = self._canvas
+        c.delete("all")
+        tasks = self._data.get("tasks", []) or []
+
+        # Conta jobs por (weekday, hour)
+        from collections import defaultdict
+        grid = defaultdict(int)
+        for t in tasks:
+            if not t.get("enabled", True): continue
+            days = t.get("days") or [True]*7
+            stype = (t.get("schedule_type") or "cron").lower()
+            for wd in range(7):
+                if not (wd < len(days) and days[wd]): continue
+                if stype == "cron":
+                    times = t.get("times") or [t.get("time", "06:00")]
+                    if isinstance(times, str): times = [times]
+                    for h in times:
+                        try: grid[(wd, int(str(h).split(":")[0]))] += 1
+                        except Exception: pass
+                elif stype == "interval":
+                    ev = int(t.get("every_value", 0) or 0)
+                    unit = (t.get("every_unit") or "minutes").lower()
+                    if unit == "hours":
+                        for hh in range(0, 24, max(1, ev)):
+                            grid[(wd, hh)] += 1
+                    else:
+                        # minutes — conta uma vez por hora
+                        for hh in range(24):
+                            grid[(wd, hh)] += max(1, 60 // max(1, ev))
+                elif stype == "start_repeat":
+                    start = t.get("sr_start") or t.get("time", "06:00")
+                    ev = int(t.get("sr_every_value", 5) or 5)
+                    cnt = int(t.get("sr_count", 0) or 0)
+                    unit = (t.get("sr_every_unit") or "minutes").lower()
+                    times = expand_start_repeat(start, ev, unit, cnt)
+                    for h in times:
+                        try: grid[(wd, int(h.split(":")[0]))] += 1
+                        except Exception: pass
+
+        max_v = max(grid.values()) if grid else 1
+        # Cores: 0 = bg, ramp accent_bg → error
+        def cell_color(v):
+            if v == 0: return T['bg_app']
+            ratio = min(1.0, v / max(1, max_v))
+            # interpolar entre azul claro e vermelho
+            if ratio < 0.5:
+                # azul claro → laranja
+                t_ = ratio / 0.5
+                r = int(135 + (245 - 135) * t_)
+                g = int(206 + (158 - 206) * t_)
+                b = int(250 + (11 - 250) * t_)
+            else:
+                # laranja → vermelho
+                t_ = (ratio - 0.5) / 0.5
+                r = int(245 + (220 - 245) * t_)
+                g = int(158 + (53 - 158) * t_)
+                b = int(11 + (69 - 11) * t_)
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        # Layout
+        w = self.winfo_width() - 28
+        h = self.winfo_height() - 100
+        if w <= 100: w = 850
+        if h <= 100: h = 320
+
+        margin_l = 60
+        margin_t = 30
+        cell_w = (w - margin_l - 20) / 24
+        cell_h = (h - margin_t - 20) / 7
+
+        days_labels = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+        # Headers de hora
+        for hh in range(24):
+            x = margin_l + hh * cell_w + cell_w / 2
+            c.create_text(x, margin_t - 8, text=f"{hh:02d}",
+                          fill=T['subtext'], font=(self._font_body, 8))
+        # Headers de dia + células
+        for wd in range(7):
+            y = margin_t + wd * cell_h + cell_h / 2
+            c.create_text(margin_l - 10, y, text=days_labels[wd],
+                          fill=T['subtext'], anchor="e",
+                          font=(self._font_body, 10, "bold"))
+            for hh in range(24):
+                v = grid.get((wd, hh), 0)
+                x = margin_l + hh * cell_w
+                y0 = margin_t + wd * cell_h
+                col = cell_color(v)
+                c.create_rectangle(x + 1, y0 + 1, x + cell_w - 1, y0 + cell_h - 1,
+                                   fill=col, outline=T['border'])
+                if v > 0:
+                    c.create_text(x + cell_w / 2, y0 + cell_h / 2,
+                                  text=str(v), fill=T['text_strong'],
+                                  font=(self._font_body, 8, "bold"))
+
+
 class HelpPanel(tk.Toplevel):
     """v2025.10.11.9 — Painel de Ajuda lateral com tutoriais passo-a-passo."""
 
@@ -4897,10 +5304,11 @@ class App(_AppBase):
             self.tree.set(item, 'Status', self.tree.set(item, 'Status'))
         
         # Ajusta o alinhamento das outras colunas
-        for col in ["Nome", "Horário", "Tipo", "Dias", "Tags", "Arquivo"]:
+        for col in ["Saúde", "Nome", "Horário", "Tipo", "Dias", "Tags", "Arquivo"]:
             try:
-                self.tree.column(col, anchor="w")
-                self.tree.heading(col, text=col, anchor="w")
+                anchor = "center" if col == "Saúde" else "w"
+                self.tree.column(col, anchor=anchor)
+                self.tree.heading(col, text=col, anchor=anchor)
             except Exception:
                 pass
 
@@ -5320,12 +5728,36 @@ class App(_AppBase):
                                                 self.refresh_table()))
         self.btn_clear_filters.grid(row=0, column=4, padx=(6, 0))
         ToolTip(self.btn_clear_filters, "Limpar busca e filtros")
+
+        # v2025.10.11.21 — Quick filter chips
+        chips_row = tk.Frame(search_frame)
+        chips_row.grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        self._chips_row = chips_row
+        self._active_chip = None  # nome do chip ativo ou None
+        self._chip_buttons = {}
+        chip_defs = [
+            ("falhando",   "🔴  Falhando hoje"),
+            ("sem_tag",    "🏷️  Sem tag"),
+            ("pausados",   "⏸  Pausados"),
+            ("proximos",   "⏰  Próximos 1h"),
+            ("lentos",     "⚠  Lentos"),
+            ("criticos",   "💀  Saúde crítica"),
+        ]
+        for key, label in chip_defs:
+            b = tk.Button(chips_row, text=label,
+                          relief="flat", borderwidth=0,
+                          cursor="hand2",
+                          padx=10, pady=4,
+                          font=("Segoe UI", 9),
+                          command=lambda k=key: self._toggle_filter_chip(k))
+            b.pack(side="left", padx=(0, 6))
+            self._chip_buttons[key] = b
         # liga atualização em tempo real
         self.search_var.trace_add("write", lambda *_: self.refresh_table())
         self.tag_filter.bind("<<ComboboxSelected>>", lambda *_: self.refresh_table())
 
-        # Definindo as colunas da tabela (Tags inserida antes de Arquivo)
-        cols = ("Status", "Nome", "Horário", "Tipo", "Dias", "Tags", "Arquivo")
+        # Definindo as colunas da tabela (Saúde + Tags antes de Arquivo)
+        cols = ("Status", "Saúde", "Nome", "Horário", "Tipo", "Dias", "Tags", "Arquivo")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="extended")
 
         # Configurando os cabeçalhos
@@ -5337,6 +5769,7 @@ class App(_AppBase):
         # Configuração responsiva das colunas
         col_configs = {
             "Status": {"width": 100, "minwidth": 90, "stretch": False},
+            "Saúde": {"width": 110, "minwidth": 90, "stretch": False},
             "Nome": {"width": 200, "minwidth": 160, "stretch": True},
             "Horário": {"width": 150, "minwidth": 110, "stretch": False},
             "Tipo": {"width": 100, "minwidth": 90, "stretch": False},
@@ -5706,6 +6139,13 @@ class App(_AppBase):
         try:
             if hasattr(self, 'btn_morning'):
                 self._refresh_morning_button_theme()
+        except Exception:
+            pass
+
+        # v2025.10.11.21 — refresca chips de filtro
+        try:
+            if hasattr(self, '_chip_buttons'):
+                self._refresh_chips_theme()
         except Exception:
             pass
 
@@ -6581,6 +7021,43 @@ class App(_AppBase):
                 messagebox.showerror("Export YAML", msg)
         except Exception as e:
             messagebox.showerror("Export YAML", f"Falha:\n{e}")
+
+    # v2025.10.11.21 — Quick filter chips
+    def _toggle_filter_chip(self, key):
+        """Toggle de chip: click ativa, click novamente desativa."""
+        if self._active_chip == key:
+            self._active_chip = None
+        else:
+            self._active_chip = key
+        self._refresh_chips_theme()
+        self.refresh_table()
+
+    def _refresh_chips_theme(self):
+        """Aplica cores nos chips conforme tema + estado ativo."""
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+        # bg do row acompanha bg_app
+        try:
+            self._chips_row.configure(bg=T['bg_app'])
+        except Exception:
+            pass
+        for key, btn in self._chip_buttons.items():
+            active = (self._active_chip == key)
+            if active:
+                btn.configure(
+                    bg=T['accent'], fg="#ffffff",
+                    activebackground=T['accent_dark'],
+                    activeforeground="#ffffff",
+                )
+            else:
+                btn.configure(
+                    bg=T['bg_surface'], fg=T['text'],
+                    activebackground=T['bg_hover'],
+                    activeforeground=T['text_strong'],
+                )
 
     # v2025.10.11.18 — Refresca cor do botão Modo Manhã (laranja sol)
     def _refresh_morning_button_theme(self):
@@ -7579,6 +8056,11 @@ class App(_AppBase):
                           accelerator="Ctrl+Shift+T",
                           command=self.run_tag)
             m.add_separator()
+            m.add_command(label="📅  Calendário do dia",
+                          command=self.open_calendar_view)
+            m.add_command(label="🔥  Heatmap semanal",
+                          command=self.open_heatmap_view)
+            m.add_separator()
             m.add_command(label="🧙  Assistente de criação...",
                           command=self.open_assistant)
             m.add_command(label="📋  Criar a partir de template...",
@@ -7703,6 +8185,21 @@ class App(_AppBase):
             self.refresh_table()
             self.reschedule_all()
             self.set_status_line(f"📋 Job '{name}' duplicado como '{dlg.result['name']}'")
+
+    # v2025.10.11.21 — Calendar / Heatmap -----------------------------------
+    def open_calendar_view(self):
+        try:
+            if getattr(self, "_calendar_win", None) and self._calendar_win.winfo_exists():
+                self._calendar_win.lift(); self._calendar_win.focus_force(); return
+        except Exception: pass
+        self._calendar_win = CalendarDayView(self, self.data)
+
+    def open_heatmap_view(self):
+        try:
+            if getattr(self, "_heatmap_win", None) and self._heatmap_win.winfo_exists():
+                self._heatmap_win.lift(); self._heatmap_win.focus_force(); return
+        except Exception: pass
+        self._heatmap_win = HeatmapWeekView(self, self.data)
 
     # v2025.10.11.9 — Painel de Ajuda --------------------------------------
     def open_help_panel(self):
@@ -8281,6 +8778,11 @@ class App(_AppBase):
         for i in self.tree.get_children():
             self.tree.delete(i)
 
+        # v2025.10.11.21 — chip filter ativo
+        active_chip = getattr(self, "_active_chip", None)
+        today = date.today()
+        now_minutes = datetime.now().hour * 60 + datetime.now().minute
+
         # Preenche com as tarefas (aplicando filtros)
         for i, task in enumerate(self.data.get("tasks", [])):
             task_name = task["name"]
@@ -8299,6 +8801,54 @@ class App(_AppBase):
                 ])
                 if search_term not in hay:
                     continue
+
+            # v2025.10.11.21 — chip filters
+            if active_chip:
+                history = self.data.get("history", {}).get(task_name, [])
+                if active_chip == "falhando":
+                    # Pelo menos 1 falha hoje
+                    has_fail_today = False
+                    for e in history:
+                        try:
+                            dt = datetime.strptime(e.get("ts", ""), "%Y-%m-%d %H:%M:%S")
+                            if dt.date() == today and int(e.get("rc", -1)) not in (0, -999):
+                                has_fail_today = True
+                                break
+                        except Exception:
+                            pass
+                    if not has_fail_today:
+                        continue
+                elif active_chip == "sem_tag":
+                    if task_tags:
+                        continue
+                elif active_chip == "pausados":
+                    if task.get("enabled", True):
+                        continue
+                elif active_chip == "proximos":
+                    # Tem horário cron nos próximos 60 minutos?
+                    times = task.get("times") or [task.get("time", "06:00")]
+                    if isinstance(times, str):
+                        times = [times]
+                    has_upcoming = False
+                    for t in times:
+                        try:
+                            hh, mm = map(int, str(t).split(":"))
+                            t_min = hh * 60 + mm
+                            if 0 <= t_min - now_minutes <= 60:
+                                has_upcoming = True
+                                break
+                        except Exception:
+                            pass
+                    if not has_upcoming:
+                        continue
+                elif active_chip == "lentos":
+                    slow = detect_slow_regression(history)
+                    if not slow["is_slow"]:
+                        continue
+                elif active_chip == "criticos":
+                    hs = compute_health_score(history)
+                    if hs["score"] >= 50:
+                        continue
 
             is_selected = task_name in current_selection
 
@@ -8341,10 +8891,21 @@ class App(_AppBase):
 
             tags_text = " · ".join(task_tags) if task_tags else "—"
 
+            # v2025.10.11.21 — Saúde: calcula a partir do histórico
+            history = self.data.get("history", {}).get(task_name, [])
+            hs = compute_health_score(history)
+            saude_text = f"{hs['label'].split(' ')[0]} {hs['score']}" if hs['score'] > 0 else hs['label']
+            # Detecta regressão de duração — adiciona ⚠ ao status se lento
+            slow = detect_slow_regression(history)
+            display_status = status_text
+            if slow["is_slow"] and "Rodando" not in status_text:
+                display_status = f"⚠ Lento  {status_text}"
+
             # Adiciona a tarefa à tabela
             self.tree.insert("", "end", iid=task_name,
                            values=(
-                               status_text,
+                               display_status,
+                               saude_text,
                                task_name,
                                times,
                                schedule_type.capitalize(),
@@ -8417,6 +8978,7 @@ class App(_AppBase):
 
         # Configuração de largura para as outras colunas
         col_widths = {
+            "Saúde": 110,
             "Nome": 180,
             "Horário": 130,
             "Tipo": 100,
