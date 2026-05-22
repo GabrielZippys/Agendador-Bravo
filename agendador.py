@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.24"   # << aumente em cada build
+APP_VERSION = "2025.10.11.25"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1325,21 +1325,30 @@ def _migrate_data_schema(data: dict) -> dict:
     settings.setdefault("rest_api", {
         "enabled": False, "port": 17654, "token": "", "bind_host": "127.0.0.1",
     })
-    # v2025.10.11.18 — Modo Manhã (auto-disparo da tag em horário-limite)
-    settings.setdefault("morning_mode", {
-        "enabled": False,
-        "tag": "",                  # qual tag disparar
-        "auto_trigger_time": "08:00",  # horário do auto-disparo se ninguém rodou
-        "auto_trigger_days": [True]*5 + [False, False],  # seg-sex
-        "notify_when_auto": True,    # avisa quando dispara automaticamente
-        # v2025.10.11.24 — checklist de arquivos esperados
-        "required_files": [],        # lista de paths que precisam existir antes de disparar
-        "block_if_files_missing": True,  # se True, NÃO dispara se algum faltar
-    })
-    # Migra config antiga (sem required_files)
-    mm = settings.get("morning_mode", {})
-    mm.setdefault("required_files", [])
-    mm.setdefault("block_if_files_missing", True)
+    # v2025.10.11.25 — Modo Showtime (100% automático com file watcher)
+    # Substitui o antigo "morning_mode" (com retrocompat na migração).
+    if "showtime_mode" not in settings:
+        old_mm = settings.get("morning_mode", {}) or {}
+        settings["showtime_mode"] = {
+            "enabled": old_mm.get("enabled", False),
+            "tag": old_mm.get("tag", ""),
+            "required_files": old_mm.get("required_files", []) or [],
+            "active_days": old_mm.get("auto_trigger_days", [True]*5 + [False, False]),
+            "notify_when_fired": old_mm.get("notify_when_auto", True),
+            "debounce_seconds": 30,        # espera 30s após arquivos chegarem (garantir escrita completa)
+            "fire_once_per_day": True,     # dispara no max 1x/dia
+            "last_fired_date": "",         # ISO date string da última execução
+        }
+    # Mantém morning_mode legacy só pra leitura (se alguém ainda referenciar)
+    settings.setdefault("morning_mode", settings["showtime_mode"])
+    # Garante campos novos no showtime_mode (config antiga)
+    sm = settings["showtime_mode"]
+    sm.setdefault("required_files", [])
+    sm.setdefault("active_days", [True]*5 + [False, False])
+    sm.setdefault("notify_when_fired", True)
+    sm.setdefault("debounce_seconds", 30)
+    sm.setdefault("fire_once_per_day", True)
+    sm.setdefault("last_fired_date", "")
     # rollback
     settings.setdefault("rollback", {"enabled": True, "crash_threshold": 3})
     # secrets_encrypted flag
@@ -1432,13 +1441,16 @@ def load_data():
                 "token": "",              # vazio = sem auth (só localhost)
                 "bind_host": "127.0.0.1",
             },
-            # v2025.10.11.18 — Modo Manhã (auto-disparo)
-            "morning_mode": {
+            # v2025.10.11.25 — Modo Showtime (100% automático, watcher-based)
+            "showtime_mode": {
                 "enabled": False,
                 "tag": "",
-                "auto_trigger_time": "08:00",
-                "auto_trigger_days": [True]*5 + [False, False],
-                "notify_when_auto": True,
+                "required_files": [],
+                "active_days": [True]*5 + [False, False],
+                "notify_when_fired": True,
+                "debounce_seconds": 30,
+                "fire_once_per_day": True,
+                "last_fired_date": "",
             },
             # v2025.10.11.8 — rollback automático após N crashes seguidos
             "rollback": {
@@ -2266,6 +2278,161 @@ def _lazy_notion():
         return Client
     except Exception:
         return None
+
+
+class ShowtimeMonitor:
+    """v2025.10.11.25 — Monitor automático para o Modo Showtime.
+
+    Observa as pastas dos arquivos esperados. Sempre que algo muda, re-checa
+    se TODOS os arquivos esperados estão presentes. Se sim e não disparou
+    hoje, aguarda debounce (30s, default) pra garantir escrita completa,
+    re-checa, e dispara os jobs da tag configurada.
+
+    O fluxo é 100% reativo — sem cron, sem clique manual. O Ítalo chega,
+    pessoal sobe os arquivos, app dispara sozinho.
+    """
+
+    def __init__(self, app_ref):
+        self.app = app_ref
+        self.observers = []
+        self._pending_debounce_timer = None
+        self._enabled = False
+
+    def stop(self):
+        for o in self.observers:
+            try:
+                o.stop()
+                o.join(timeout=1)
+            except Exception:
+                pass
+        self.observers = []
+        if self._pending_debounce_timer:
+            try:
+                self._pending_debounce_timer.cancel()
+            except Exception:
+                pass
+            self._pending_debounce_timer = None
+        self._enabled = False
+
+    def restart(self):
+        """Para e re-inicia com a config atual do showtime_mode."""
+        self.stop()
+        cfg = self.app.data.get("settings", {}).get("showtime_mode", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        required = cfg.get("required_files", []) or []
+        if not required:
+            return
+        Observer, _FSE, PME = _lazy_watchdog()
+        if not Observer:
+            return
+
+        # Pastas únicas a observar (cada arquivo pode estar em uma pasta diferente)
+        from pathlib import Path as _P
+        folders = set()
+        for raw in required:
+            try:
+                resolved = resolve_dynamic(raw)
+                p = _P(resolved)
+                # Se é glob (com *), pega a pasta antes do *
+                if "*" in str(p) or "?" in str(p):
+                    parent = str(p.parent).split("*")[0].split("?")[0]
+                else:
+                    parent = str(p.parent)
+                if parent and _P(parent).exists():
+                    folders.add(parent)
+            except Exception:
+                pass
+
+        monitor = self
+
+        class ShowtimeHandler(PME):
+            def __init__(self):
+                super().__init__(patterns=["*"], ignore_directories=True)
+
+            def _maybe_trigger(self, ev):
+                monitor._on_file_change()
+
+            def on_created(self, ev): self._maybe_trigger(ev)
+            def on_modified(self, ev): self._maybe_trigger(ev)
+
+        for folder in folders:
+            try:
+                obs = Observer()
+                obs.schedule(ShowtimeHandler(), folder, recursive=False)
+                obs.start()
+                self.observers.append(obs)
+                print(f"[showtime] monitorando: {folder}")
+            except Exception as e:
+                print(f"[showtime] falha ao monitorar {folder}: {e}")
+
+        self._enabled = True
+        # Re-checa imediatamente (caso os arquivos JÁ estejam lá quando o app inicia)
+        self._on_file_change()
+
+    def _on_file_change(self):
+        """Algum arquivo mudou — re-checa todos e dispara se completo."""
+        cfg = self.app.data.get("settings", {}).get("showtime_mode", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        # Dia ativo?
+        weekday = datetime.now().weekday()
+        days = cfg.get("active_days") or [True]*5 + [False, False]
+        if not (0 <= weekday < len(days) and days[weekday]):
+            return
+        # Já disparou hoje?
+        if cfg.get("fire_once_per_day", True):
+            last_fired = cfg.get("last_fired_date", "")
+            if last_fired == date.today().strftime("%Y-%m-%d"):
+                return
+        # Todos os arquivos estão presentes?
+        all_present, _status = self.app._check_showtime_required_files()
+        if not all_present:
+            return
+        # Cancela timer anterior se houver e agenda novo (debounce)
+        if self._pending_debounce_timer:
+            try:
+                self._pending_debounce_timer.cancel()
+            except Exception:
+                pass
+        delay = int(cfg.get("debounce_seconds", 30) or 30)
+        try:
+            t = threading.Timer(delay, self._fire_now)
+            t.daemon = True
+            t.start()
+            self._pending_debounce_timer = t
+            # Status UI: arquivos prontos, aguardando debounce
+            try:
+                self.app.set_status_line(f"🎸 Showtime: arquivos prontos · disparando em {delay}s...")
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[showtime] falha ao agendar debounce: {e}")
+
+    def _fire_now(self):
+        """Dispara após debounce. Re-checa antes pra garantir."""
+        cfg = self.app.data.get("settings", {}).get("showtime_mode", {}) or {}
+        if not cfg.get("enabled"):
+            return
+        all_present, status = self.app._check_showtime_required_files()
+        if not all_present:
+            # Algum sumiu durante o debounce; aborta
+            try:
+                self.app.set_status_line("🎸 Showtime cancelado: arquivos sumiram durante debounce")
+            except Exception:
+                pass
+            return
+        # Marca disparo
+        cfg["last_fired_date"] = date.today().strftime("%Y-%m-%d")
+        try:
+            save_data(self.app.data)
+        except Exception:
+            pass
+        # Dispara via run_morning_mode (preserva comportamento de tag dispatch)
+        try:
+            self.app.after(0, lambda: self.app.run_showtime(automatic=True))
+        except Exception:
+            print("[showtime] falha ao chamar run_showtime")
 
 
 # ======================================================================================
@@ -4492,17 +4659,16 @@ class SettingsDialog(tk.Toplevel):
         self.var_rb_on = tk.BooleanVar(value=rb.get("enabled", True))
         self.var_rb_thr = tk.StringVar(value=str(rb.get("crash_threshold", 3)))
 
-        # ----- v2025.10.11.18 — Modo Manhã -----
-        mm = settings.get("morning_mode", {}) or {}
-        self.var_mm_on = tk.BooleanVar(value=mm.get("enabled", False))
-        self.var_mm_tag = tk.StringVar(value=mm.get("tag", ""))
-        self.var_mm_time = tk.StringVar(value=mm.get("auto_trigger_time", "08:00"))
-        mm_days = mm.get("auto_trigger_days") or [True]*5 + [False, False]
-        self.var_mm_days = [tk.BooleanVar(value=bool(mm_days[i])) for i in range(7)]
-        self.var_mm_notify = tk.BooleanVar(value=mm.get("notify_when_auto", True))
-        # v2025.10.11.24 — checklist de arquivos
-        self.var_mm_block = tk.BooleanVar(value=mm.get("block_if_files_missing", True))
-        self._mm_required_files = list(mm.get("required_files", []) or [])
+        # ----- v2025.10.11.25 — Modo Showtime (substitui Modo Manhã) -----
+        sm = settings.get("showtime_mode", {}) or {}
+        self.var_st_on = tk.BooleanVar(value=sm.get("enabled", False))
+        self.var_st_tag = tk.StringVar(value=sm.get("tag", ""))
+        st_days = sm.get("active_days") or [True]*5 + [False, False]
+        self.var_st_days = [tk.BooleanVar(value=bool(st_days[i])) for i in range(7)]
+        self.var_st_notify = tk.BooleanVar(value=sm.get("notify_when_fired", True))
+        self.var_st_debounce = tk.StringVar(value=str(sm.get("debounce_seconds", 30)))
+        self.var_st_once = tk.BooleanVar(value=sm.get("fire_once_per_day", True))
+        self._st_required_files = list(sm.get("required_files", []) or [])
 
         # ---------- LAYOUT COM ABAS ----------
         main_frame = ttk.Frame(self, padding=10)
@@ -4606,85 +4772,86 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(tab_wh, text="Testar webhooks", command=self.test_webhooks)\
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
-        # === ABA: MODO MANHÃ (v2025.10.11.18) ===
-        tab_mm = ttk.Frame(notebook, padding=24)
-        notebook.add(tab_mm, text="  Modo Manhã  ")
-        self._add_tab_header(tab_mm, "🌅  Modo Manhã (auto-disparo)",
-                             "Dispara em 1 clique todos os jobs de uma tag específica. "
-                             "Útil quando o time chega de manhã e precisa subir bases ASAP. "
-                             "O app também pode disparar AUTOMATICAMENTE se ninguém rodou até X horas.")
+        # === ABA: 🎸 SHOWTIME (v2025.10.11.25) — substitui Modo Manhã ===
+        tab_st = ttk.Frame(notebook, padding=24)
+        notebook.add(tab_st, text="  🎸 Showtime  ")
+        self._add_tab_header(tab_st, "🎸  Showtime — automação quando os arquivos chegam",
+                             "O app monitora as pastas dos arquivos esperados. Quando TODOS chegam, "
+                             "aguarda alguns segundos (debounce) e dispara os jobs da tag automaticamente. "
+                             "Sem clique, sem horário-limite. Pessoal sobe os arquivos, o show começa.")
         row = 1
-        ttk.Checkbutton(tab_mm, text="Habilitar Modo Manhã (botão 🌅 fica funcional)",
-                        variable=self.var_mm_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Checkbutton(tab_st, text="🎸 Habilitar Showtime (automação ativa)",
+                        variable=self.var_st_on).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
 
-        ttk.Label(tab_mm, text="Tag de Manhã:").grid(row=row, column=0, sticky="w", pady=(12, 0))
-        tag_combo = ttk.Combobox(tab_mm, textvariable=self.var_mm_tag,
+        ttk.Label(tab_st, text="Tag de Showtime:").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        tag_combo = ttk.Combobox(tab_st, textvariable=self.var_st_tag,
                                   values=self._all_known_tags_from_master(),
                                   width=24)
         tag_combo.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=(12, 0)); row += 1
-        ttk.Label(tab_mm, text="↑ Selecione uma tag existente ou digite nova. Marque seus jobs prioritários com ela em Editar → Avançado → Tags.",
+        ttk.Label(tab_st, text="↑ Tag dos jobs que serão disparados. Marque cada job em Editar → Avançado → Tags.",
                   foreground="#888", wraplength=900).grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
 
-        # Separador
-        ttk.Separator(tab_mm, orient="horizontal").grid(
-            row=row, column=0, columnspan=3, sticky="we", pady=(16, 12)); row += 1
-
-        ttk.Label(tab_mm, text="⏰  Auto-disparo (caso ninguém rode no horário)",
-                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-
-        ttk.Label(tab_mm, text="Horário-limite:").grid(row=row, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(tab_mm, textvariable=self.var_mm_time, width=10).grid(
-            row=row, column=1, sticky="w", padx=(8, 0), pady=(8, 0)); row += 1
-        ttk.Label(tab_mm, text="↑ Se até esse horário nenhum job da tag rodou, o app dispara sozinho. Ex.: 08:00",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
-
-        ttk.Label(tab_mm, text="Dias:").grid(row=row, column=0, sticky="w", pady=(10, 0))
-        mm_days_frame = ttk.Frame(tab_mm)
-        mm_days_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(10, 0))
+        ttk.Label(tab_st, text="Dias ativos:").grid(row=row, column=0, sticky="w", pady=(12, 0))
+        st_days_frame = ttk.Frame(tab_st)
+        st_days_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(12, 0))
         for i, lab in enumerate(["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]):
-            ttk.Checkbutton(mm_days_frame, text=lab, variable=self.var_mm_days[i]).pack(side="left", padx=2)
+            ttk.Checkbutton(st_days_frame, text=lab, variable=self.var_st_days[i]).pack(side="left", padx=2)
         row += 1
 
-        ttk.Checkbutton(tab_mm, text="Notificar (e-mail/webhook) quando auto-disparar",
-                        variable=self.var_mm_notify).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0)); row += 1
-
-        # v2025.10.11.24 — Checklist de arquivos esperados
-        ttk.Separator(tab_mm, orient="horizontal").grid(
+        # Arquivos esperados
+        ttk.Separator(tab_st, orient="horizontal").grid(
             row=row, column=0, columnspan=3, sticky="we", pady=(16, 12)); row += 1
-        ttk.Label(tab_mm, text="📋  Arquivos esperados (checklist antes de disparar)",
+        ttk.Label(tab_st, text="📋  Arquivos esperados (o show começa quando todos chegam)",
                   font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
-        ttk.Label(tab_mm,
-                  text="Liste paths que precisam existir antes de disparar. Suporta padrões glob (*.csv).\n"
-                       "Variáveis dinâmicas funcionam: ${data_atual}, ${ultimo_dia_util}, etc.",
+        ttk.Label(tab_st,
+                  text="Liste paths que precisam aparecer na pasta. Suporta glob (*.csv) e variáveis dinâmicas.\n"
+                       "Quando TODOS estiverem presentes, o Showtime dispara automaticamente.",
                   foreground="#888", justify="left").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 6)); row += 1
 
-        self._mm_files_listbox = tk.Listbox(tab_mm, height=6, width=70, exportselection=False,
+        self._st_files_listbox = tk.Listbox(tab_st, height=6, width=70, exportselection=False,
                                               font=("Segoe UI", 9))
-        self._mm_files_listbox.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
-        for p in self._mm_required_files:
-            self._mm_files_listbox.insert("end", p)
+        self._st_files_listbox.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
+        for p in self._st_required_files:
+            self._st_files_listbox.insert("end", p)
         row += 1
 
-        mm_files_btns = ttk.Frame(tab_mm)
-        mm_files_btns.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
-        ttk.Button(mm_files_btns, text="➕ Adicionar arquivo...",
-                   command=self._mm_add_file).pack(side="left", padx=4)
-        ttk.Button(mm_files_btns, text="✏️ Adicionar padrão (texto)...",
-                   command=self._mm_add_pattern).pack(side="left", padx=4)
-        ttk.Button(mm_files_btns, text="🗑️ Remover selecionado",
-                   command=self._mm_remove_file).pack(side="left", padx=4)
+        st_files_btns = ttk.Frame(tab_st)
+        st_files_btns.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Button(st_files_btns, text="➕ Adicionar arquivo...",
+                   command=self._st_add_file).pack(side="left", padx=4)
+        ttk.Button(st_files_btns, text="✏️ Adicionar padrão (texto)...",
+                   command=self._st_add_pattern).pack(side="left", padx=4)
+        ttk.Button(st_files_btns, text="🗑️ Remover selecionado",
+                   command=self._st_remove_file).pack(side="left", padx=4)
+        ttk.Button(st_files_btns, text="🔍 Ver status agora",
+                   command=self._st_show_status).pack(side="left", padx=4)
         row += 1
 
-        ttk.Checkbutton(tab_mm, text="🛡️ Bloquear auto-disparo se algum arquivo estiver faltando",
-                        variable=self.var_mm_block).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0)); row += 1
+        # Comportamento
+        ttk.Separator(tab_st, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(16, 12)); row += 1
+        ttk.Label(tab_st, text="⚙️  Comportamento",
+                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
 
-        ttk.Label(tab_mm,
-                  text=("💡  Como funciona o auto-disparo:\n"
-                        "  1. Você marca seus jobs críticos com a tag (ex.: 'Manhã').\n"
-                        "  2. O app checa todo dia no horário-limite.\n"
-                        "  3. Se a checklist de arquivos esperados tá completa, dispara.\n"
-                        "  4. Se faltar arquivo e 'Bloquear' está marcado, NÃO dispara e avisa o time.\n"
-                        "  5. Quando você clica o botão 🌅 manualmente, vê o checklist antes de disparar."),
+        ttk.Label(tab_st, text="Debounce (s):").grid(row=row, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(tab_st, textvariable=self.var_st_debounce, width=10).grid(
+            row=row, column=1, sticky="w", padx=(8, 0), pady=(8, 0)); row += 1
+        ttk.Label(tab_st, text="↑ Após todos os arquivos chegarem, espera X segundos antes de disparar (default 30s).",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 0)); row += 1
+
+        ttk.Checkbutton(tab_st, text="🚫 Disparar apenas 1x por dia (recomendado)",
+                        variable=self.var_st_once).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0)); row += 1
+        ttk.Checkbutton(tab_st, text="📧 Notificar (e-mail/webhook) quando disparar",
+                        variable=self.var_st_notify).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        ttk.Label(tab_st,
+                  text=("💡  Como funciona o Showtime:\n"
+                        "  1. Você marca seus jobs com uma tag (ex.: 'Manhã' ou 'Showtime').\n"
+                        "  2. Lista aqui os arquivos que precisam chegar na pasta.\n"
+                        "  3. O app fica monitorando essas pastas em background.\n"
+                        "  4. Quando TODOS chegam, espera o debounce e dispara automaticamente.\n"
+                        "  5. Notifica: '🎸 Showtime: N jobs disparados'.\n"
+                        "  6. Não precisa clicar nada. Sem horário-limite. É 100% reativo."),
                   foreground="#666", justify="left").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(16, 0))
 
@@ -5079,34 +5246,67 @@ class SettingsDialog(tk.Toplevel):
         sep = tk.Frame(header, bg=T['border'], height=1)
         sep.grid(row=2, column=0, sticky="we", pady=(10, 0))
 
-    # v2025.10.11.24 — Helpers do checklist de arquivos do Modo Manhã
-    def _mm_refresh_list(self):
-        self._mm_files_listbox.delete(0, "end")
-        for p in self._mm_required_files:
-            self._mm_files_listbox.insert("end", p)
+    # v2025.10.11.25 — Helpers do Showtime
+    def _st_refresh_list(self):
+        self._st_files_listbox.delete(0, "end")
+        for p in self._st_required_files:
+            self._st_files_listbox.insert("end", p)
 
-    def _mm_add_file(self):
+    def _st_add_file(self):
         p = filedialog.askopenfilename(title="Selecione um arquivo esperado",
                                         parent=self)
         if p:
-            self._mm_required_files.append(p)
-            self._mm_refresh_list()
+            self._st_required_files.append(p)
+            self._st_refresh_list()
 
-    def _mm_add_pattern(self):
+    def _st_add_pattern(self):
         p = simpledialog.askstring(
             "Adicionar padrão",
             "Digite o caminho ou padrão glob (ex.: C:/dados/*.csv, "
             "C:/relatorios/${data_atual}/*.xlsx):",
             parent=self)
         if p and p.strip():
-            self._mm_required_files.append(p.strip())
-            self._mm_refresh_list()
+            self._st_required_files.append(p.strip())
+            self._st_refresh_list()
 
-    def _mm_remove_file(self):
-        sel = self._mm_files_listbox.curselection()
+    def _st_remove_file(self):
+        sel = self._st_files_listbox.curselection()
         if not sel: return
-        del self._mm_required_files[sel[0]]
-        self._mm_refresh_list()
+        del self._st_required_files[sel[0]]
+        self._st_refresh_list()
+
+    def _st_show_status(self):
+        """v2025.10.11.25 — Mostra status ao vivo dos arquivos esperados."""
+        from glob import glob as _glob
+        msg_lines = []
+        all_ok = True
+        for raw in self._st_required_files:
+            p = raw.strip()
+            if not p: continue
+            try:
+                resolved = resolve_dynamic(p)
+            except Exception:
+                resolved = p
+            if "*" in resolved or "?" in resolved:
+                matches = _glob(resolved)
+                if matches:
+                    msg_lines.append(f"✅  {resolved}  ({len(matches)} arquivo(s))")
+                else:
+                    msg_lines.append(f"❌  {resolved}  (0 matches)")
+                    all_ok = False
+            else:
+                if os.path.exists(resolved):
+                    msg_lines.append(f"✅  {resolved}")
+                else:
+                    msg_lines.append(f"❌  {resolved}  (não encontrado)")
+                    all_ok = False
+        if not msg_lines:
+            messagebox.showinfo("Status Showtime", "Nenhum arquivo configurado.", parent=self)
+            return
+        header = "🎸 Todos arquivos prontos — Showtime disparará automaticamente!" if all_ok \
+                 else "⚠️ Faltam arquivos — Showtime aguardando."
+        messagebox.showinfo("Status Showtime", header + "\n\n" + "\n".join(msg_lines),
+                            parent=self)
 
     # v2025.10.11.8 — helpers das novas abas ---------------------------------
     def test_webhooks(self):
@@ -5413,15 +5613,18 @@ class SettingsDialog(tk.Toplevel):
                 "enabled": self.var_rb_on.get(),
                 "crash_threshold": rb_thr,
             },
-            "morning_mode": {
-                "enabled": self.var_mm_on.get(),
-                "tag": self.var_mm_tag.get().strip(),
-                "auto_trigger_time": self.var_mm_time.get().strip() or "08:00",
-                "auto_trigger_days": [v.get() for v in self.var_mm_days],
-                "notify_when_auto": self.var_mm_notify.get(),
-                # v2025.10.11.24 — checklist
-                "required_files": list(self._mm_required_files),
-                "block_if_files_missing": self.var_mm_block.get(),
+            # v2025.10.11.25 — Modo Showtime (substitui Modo Manhã)
+            "showtime_mode": {
+                "enabled": self.var_st_on.get(),
+                "tag": self.var_st_tag.get().strip(),
+                "required_files": list(self._st_required_files),
+                "active_days": [v.get() for v in self.var_st_days],
+                "notify_when_fired": self.var_st_notify.get(),
+                "debounce_seconds": int(self.var_st_debounce.get() or 30),
+                "fire_once_per_day": self.var_st_once.get(),
+                # Preserva last_fired_date pra não disparar 2x no mesmo dia ao trocar config
+                "last_fired_date": (self.master.data.get("settings", {})
+                                    .get("showtime_mode", {}).get("last_fired_date", "")),
             },
             "secrets_encrypted": True,
         }
@@ -6196,17 +6399,9 @@ class App(_AppBase):
         self.btn_toggle.pack(side="left", padx=(12, 6))
         _tip(self.btn_toggle, "Pausa/retoma o job selecionado")
 
-        # v2025.10.11.18 — Botão Modo Manhã (laranja/sol — destaque diferente do azul)
-        self.btn_morning = tk.Button(bar, text="🌅  Modo Manhã",
-                                      command=self.run_morning_mode,
-                                      relief="flat", borderwidth=0,
-                                      cursor="hand2",
-                                      padx=14, pady=8,
-                                      font=("Segoe UI", 10, "bold"))
-        self.btn_morning.pack(side="left", padx=(12, 0))
-        _tip(self.btn_morning,
-             "Dispara em 1 clique todos os jobs da tag configurada como 'Manhã' (Ctrl+M).\n"
-             "Configure a tag em ⚙ → Modo Manhã.")
+        # v2025.10.11.25 — Botão Showtime removido: agora é 100% automático.
+        # O ShowtimeMonitor monitora as pastas e dispara sozinho quando os
+        # arquivos esperados chegam. Configure em ⚙ → Showtime.
 
         # Spacer flexível
         ttk.Frame(bar).pack(side="left", padx=12)
@@ -6229,9 +6424,7 @@ class App(_AppBase):
         # v2025.10.11.16 — Ctrl+Shift+T = Executar tag
         self.bind("<Control-Shift-T>", lambda e: self.run_tag())
         self.bind("<Control-Shift-t>", lambda e: self.run_tag())
-        # v2025.10.11.18 — Ctrl+M = Modo Manhã
-        self.bind("<Control-m>", lambda e: self.run_morning_mode())
-        self.bind("<Control-M>", lambda e: self.run_morning_mode())
+        # v2025.10.11.25 — Atalho Ctrl+M removido (Modo Showtime é automático)
         # v2025.10.11.20 — Ctrl+D = Duplicar job
         self.bind("<Control-d>", lambda e: self.duplicate_task())
         self.bind("<Control-D>", lambda e: self.duplicate_task())
@@ -6716,12 +6909,7 @@ class App(_AppBase):
         except Exception:
             pass
 
-        # v2025.10.11.18 — refresca botão Modo Manhã (laranja sol)
-        try:
-            if hasattr(self, 'btn_morning'):
-                self._refresh_morning_button_theme()
-        except Exception:
-            pass
+        # v2025.10.11.25 — botão Modo Manhã removido (Showtime é automático agora)
 
         # v2025.10.11.21 — refresca chips de filtro
         try:
@@ -7396,19 +7584,24 @@ class App(_AppBase):
         except Exception as _e:
             print(f"[digest] falha ao agendar: {_e}")
 
-        # v2025.10.11.18 — Agenda Modo Manhã auto-trigger (se habilitado)
-        try:
-            self._schedule_morning_auto()
-        except Exception as _e:
-            print(f"[morning auto] falha ao agendar: {_e}")
+        # v2025.10.11.25 — Schedule cron de Modo Manhã removido (Showtime
+        # agora monitora arquivos via watcher, sem horário-limite)
 
-        # v2025.10.11.22 — Re-inicializa file watchers
+        # v2025.10.11.22 — Re-inicializa file watchers (por job, schedule_type=watcher)
         try:
             if not hasattr(self, "_watcher_mgr"):
                 self._watcher_mgr = WatcherManager(self)
             self._watcher_mgr.restart_for_tasks(self.data.get("tasks", []))
         except Exception as _e:
             print(f"[watcher] falha ao iniciar: {_e}")
+
+        # v2025.10.11.25 — Re-inicializa Showtime Monitor (arquivos esperados → auto-dispatch)
+        try:
+            if not hasattr(self, "_showtime_monitor"):
+                self._showtime_monitor = ShowtimeMonitor(self)
+            self._showtime_monitor.restart()
+        except Exception as _e:
+            print(f"[showtime] falha ao iniciar: {_e}")
 
         # garante scheduler rodando
         if not self.scheduler.running:
@@ -8415,10 +8608,10 @@ class App(_AppBase):
         else:
             return None
 
-    # v2025.10.11.24 — Checa status dos arquivos esperados do Modo Manhã
-    def _check_morning_required_files(self):
-        """Retorna (all_present, status_list) onde status_list = [(path, exists), ...]."""
-        cfg = self.data.get("settings", {}).get("morning_mode", {}) or {}
+    # v2025.10.11.25 — Checa status dos arquivos esperados do Showtime
+    def _check_showtime_required_files(self):
+        """Retorna (all_present, status_list) onde status_list = [(path, exists, matches)]."""
+        cfg = self.data.get("settings", {}).get("showtime_mode", {}) or {}
         required = cfg.get("required_files", []) or []
         status = []
         for raw in required:
@@ -8440,96 +8633,35 @@ class App(_AppBase):
         all_present = all(s[1] for s in status) if status else True
         return all_present, status
 
-    # v2025.10.11.18/24 — Modo Manhã: 1-clique pra disparar todos os jobs da tag
+    # v2025.10.11.25 — Backward compat: alias antigo
     def run_morning_mode(self, automatic: bool = False):
-        """Dispara em 1 clique todos os jobs com a tag configurada como Manhã.
+        return self.run_showtime(automatic=automatic)
 
-        v2025.10.11.24 — Antes de disparar, checa se os arquivos esperados
-        estão presentes na pasta. Se faltarem, abre diálogo (manual) ou
-        notifica time + aguarda (automático).
+    # v2025.10.11.25 — Modo Showtime: 100% automático (chamado pelo ShowtimeMonitor)
+    def run_showtime(self, automatic: bool = True):
+        """v2025.10.11.25 — Dispara jobs da tag Showtime.
 
-        automatic=True: chamado pelo schedule automático às Xh.
-                       Pula notificação manual e usa flag de auditoria.
+        Chamado pelo ShowtimeMonitor quando arquivos esperados aparecem.
+        Sem diálogo nem clique manual — é 100% automático.
         """
-        cfg = self.data.get("settings", {}).get("morning_mode", {}) or {}
+        cfg = self.data.get("settings", {}).get("showtime_mode", {}) or {}
         tag = (cfg.get("tag") or "").strip()
-
-        # Sem tag configurada → pede configuração
         if not tag:
-            if automatic:
-                return  # silencioso no auto-disparo
-            messagebox.showinfo(
-                "Modo Manhã",
-                "Você ainda não configurou a tag do Modo Manhã.\n\n"
-                "Vá em ⚙ Configurações → Modo Manhã → defina qual tag será disparada.\n\n"
-                "Sugestão: marque seus jobs prioritários com a tag 'Manhã' "
-                "(Editar job → Avançado → Tags) e configure aqui pra disparar todos em 1 clique.",
-                parent=self)
             return
-
-        # v2025.10.11.24 — Checagem de arquivos esperados ANTES de disparar
-        all_present, file_status = self._check_morning_required_files()
-        block_if_missing = cfg.get("block_if_files_missing", True)
-        missing = [s for s in file_status if not s[1]]
-
-        if missing:
-            if automatic:
-                # Auto-disparo: NÃO dispara se faltar arquivo (a menos que block_if_missing=False)
-                if block_if_missing:
-                    # Notifica que faltam arquivos
-                    try:
-                        sched_log = LOG_DIR / "_scheduler.log"
-                        with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
-                            f.write(f"[{now_str()}] MORNING_AUTO_BLOCKED tag={tag} "
-                                    f"missing={[m[0] for m in missing]}\n")
-                    except Exception:
-                        pass
-                    # Avisa o time
-                    if cfg.get("notify_when_auto", True):
-                        try:
-                            subject = "⚠️ Modo Manhã BLOQUEADO: arquivos faltando"
-                            body = (f"O Modo Manhã não disparou às {cfg.get('auto_trigger_time', '08:00')} "
-                                    f"porque os seguintes arquivos esperados não estavam na pasta:\n\n")
-                            for path, _exists, _matches in missing:
-                                body += f"  ❌ {path}\n"
-                            body += f"\nQuando os arquivos chegarem, clique no botão 🌅 Modo Manhã."
-                            send_email(self.data["settings"], subject, body)
-                            send_webhook(self.data["settings"], subject, body, ok=False)
-                        except Exception as e:
-                            print(f"[morning blocked notify] {e}")
-                    self.set_status_line(f"⚠️ Modo Manhã: {len(missing)} arquivo(s) faltando — não disparou")
-                    return
-            else:
-                # Manual: mostra diálogo com status dos arquivos
-                proceed = self._show_morning_files_dialog(tag, file_status, missing)
-                if proceed is None:  # cancelado
-                    return
-                if not proceed:  # esperar
-                    self.set_status_line(f"⏰ Modo Manhã aguardando arquivos chegarem...")
-                    return
-                # se proceed=True, segue e dispara mesmo assim
 
         # Coleta jobs ativos com a tag
         jobs = [t for t in self.data.get("tasks", [])
                 if tag in (t.get("tags") or []) and t.get("enabled", True)]
         if not jobs:
-            if automatic:
-                # Log silencioso
-                try:
-                    sched_log = LOG_DIR / "_scheduler.log"
-                    with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
-                        f.write(f"[{now_str()}] MORNING_AUTO_SKIP tag={tag} (nenhum job ativo)\n")
-                except Exception:
-                    pass
-                return
-            messagebox.showinfo(
-                "Modo Manhã",
-                f"Nenhum job ATIVO com a tag '{tag}'.\n\n"
-                "Verifique se os jobs estão ativos e marcados com a tag.",
-                parent=self)
+            try:
+                sched_log = LOG_DIR / "_scheduler.log"
+                with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"[{now_str()}] SHOWTIME_SKIP tag={tag} (nenhum job ativo)\n")
+            except Exception:
+                pass
             return
 
-        # Dispara TODOS em paralelo (sem confirmação — é a graça do 1-clique)
+        # Dispara TODOS em paralelo
         launched = 0
         skipped = 0
         for task in jobs:
@@ -8538,8 +8670,7 @@ class App(_AppBase):
                     skipped += 1
                     continue
             t_run = dict(task)
-            # Modo Manhã ignora janelas de manutenção (modo emergência)
-            t_run["respect_maintenance"] = False
+            t_run["respect_maintenance"] = False  # Showtime ignora janelas (é trigger event)
             threading.Thread(
                 target=lambda t=t_run: self._job_wrapper(t),
                 daemon=True
@@ -8549,11 +8680,29 @@ class App(_AppBase):
         # Audit log
         try:
             sched_log = LOG_DIR / "_scheduler.log"
-            kind = "MORNING_AUTO" if automatic else "MORNING_MANUAL"
             with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
-                f.write(f"[{now_str()}] {kind} tag={tag} launched={launched} skipped={skipped}\n")
+                f.write(f"[{now_str()}] SHOWTIME_FIRED tag={tag} launched={launched} skipped={skipped}\n")
         except Exception:
             pass
+
+        self.set_status_line(f"🎸 Showtime: arquivos chegaram · disparando {launched} job(s) da tag '{tag}'")
+
+        # Notificação
+        if cfg.get("notify_when_fired", True):
+            try:
+                subject = f"🎸 Showtime: {launched} job(s) disparados"
+                body = (f"Os arquivos esperados chegaram na pasta. Disparando automaticamente "
+                        f"{launched} job(s) da tag '{tag}'.\n\n")
+                if skipped:
+                    body += f"(Pulados {skipped} que já estavam rodando.)\n\n"
+                _, status = self._check_showtime_required_files()
+                body += "Arquivos detectados:\n"
+                for path, _exists, _matches in status:
+                    body += f"  ✅ {path}\n"
+                send_email(self.data["settings"], subject, body)
+                send_webhook(self.data["settings"], subject, body, ok=True)
+            except Exception as e:
+                print(f"[showtime notify] {e}")
 
         # Notificação
         prefix = "⏰ AUTO" if automatic else "🌅 MANUAL"
