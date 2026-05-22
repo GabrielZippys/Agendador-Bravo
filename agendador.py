@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.25"   # << aumente em cada build
+APP_VERSION = "2025.10.11.26"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -4773,8 +4773,45 @@ class SettingsDialog(tk.Toplevel):
             .grid(row=row, column=1, sticky="w", pady=(8, 0))
 
         # === ABA: 🎸 SHOWTIME (v2025.10.11.25) — substitui Modo Manhã ===
-        tab_st = ttk.Frame(notebook, padding=24)
-        notebook.add(tab_st, text="  🎸 Showtime  ")
+        # v2025.10.11.26 — tab com bastante conteúdo: embrulhamos numa Canvas
+        # com scrollbar vertical para evitar conteúdo cortado quando a janela
+        # de Configurações não está maximizada.
+        tab_st_outer = ttk.Frame(notebook)
+        notebook.add(tab_st_outer, text="  🎸 Showtime  ")
+
+        _st_canvas = tk.Canvas(tab_st_outer, highlightthickness=0, borderwidth=0,
+                                background=getattr(self, '_theme',
+                                                   _bravo_theme(False))['bg'])
+        _st_vbar = ttk.Scrollbar(tab_st_outer, orient="vertical",
+                                  command=_st_canvas.yview)
+        _st_canvas.configure(yscrollcommand=_st_vbar.set)
+        _st_vbar.pack(side="right", fill="y")
+        _st_canvas.pack(side="left", fill="both", expand=True)
+
+        tab_st = ttk.Frame(_st_canvas, padding=24)
+        _st_window = _st_canvas.create_window((0, 0), window=tab_st, anchor="nw")
+
+        def _st_on_frame_configure(_e=None):
+            _st_canvas.configure(scrollregion=_st_canvas.bbox("all"))
+        def _st_on_canvas_configure(e):
+            # mantém o conteúdo do mesmo tamanho horizontal da canvas
+            _st_canvas.itemconfig(_st_window, width=e.width)
+        tab_st.bind("<Configure>", _st_on_frame_configure)
+        _st_canvas.bind("<Configure>", _st_on_canvas_configure)
+
+        # scroll com roda do mouse só quando o cursor está sobre a aba
+        def _st_on_mousewheel(e):
+            try:
+                _st_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+        def _st_bind_wheel(_e=None):
+            _st_canvas.bind_all("<MouseWheel>", _st_on_mousewheel)
+        def _st_unbind_wheel(_e=None):
+            _st_canvas.unbind_all("<MouseWheel>")
+        tab_st_outer.bind("<Enter>", _st_bind_wheel)
+        tab_st_outer.bind("<Leave>", _st_unbind_wheel)
+
         self._add_tab_header(tab_st, "🎸  Showtime — automação quando os arquivos chegam",
                              "O app monitora as pastas dos arquivos esperados. Quando TODOS chegam, "
                              "aguarda alguns segundos (debounce) e dispara os jobs da tag automaticamente. "
