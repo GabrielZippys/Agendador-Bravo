@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.23"   # << aumente em cada build
+APP_VERSION = "2025.10.11.24"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1332,7 +1332,14 @@ def _migrate_data_schema(data: dict) -> dict:
         "auto_trigger_time": "08:00",  # horário do auto-disparo se ninguém rodou
         "auto_trigger_days": [True]*5 + [False, False],  # seg-sex
         "notify_when_auto": True,    # avisa quando dispara automaticamente
+        # v2025.10.11.24 — checklist de arquivos esperados
+        "required_files": [],        # lista de paths que precisam existir antes de disparar
+        "block_if_files_missing": True,  # se True, NÃO dispara se algum faltar
     })
+    # Migra config antiga (sem required_files)
+    mm = settings.get("morning_mode", {})
+    mm.setdefault("required_files", [])
+    mm.setdefault("block_if_files_missing", True)
     # rollback
     settings.setdefault("rollback", {"enabled": True, "crash_threshold": 3})
     # secrets_encrypted flag
@@ -4493,6 +4500,9 @@ class SettingsDialog(tk.Toplevel):
         mm_days = mm.get("auto_trigger_days") or [True]*5 + [False, False]
         self.var_mm_days = [tk.BooleanVar(value=bool(mm_days[i])) for i in range(7)]
         self.var_mm_notify = tk.BooleanVar(value=mm.get("notify_when_auto", True))
+        # v2025.10.11.24 — checklist de arquivos
+        self.var_mm_block = tk.BooleanVar(value=mm.get("block_if_files_missing", True))
+        self._mm_required_files = list(mm.get("required_files", []) or [])
 
         # ---------- LAYOUT COM ABAS ----------
         main_frame = ttk.Frame(self, padding=10)
@@ -4638,12 +4648,43 @@ class SettingsDialog(tk.Toplevel):
         ttk.Checkbutton(tab_mm, text="Notificar (e-mail/webhook) quando auto-disparar",
                         variable=self.var_mm_notify).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0)); row += 1
 
+        # v2025.10.11.24 — Checklist de arquivos esperados
+        ttk.Separator(tab_mm, orient="horizontal").grid(
+            row=row, column=0, columnspan=3, sticky="we", pady=(16, 12)); row += 1
+        ttk.Label(tab_mm, text="📋  Arquivos esperados (checklist antes de disparar)",
+                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+        ttk.Label(tab_mm,
+                  text="Liste paths que precisam existir antes de disparar. Suporta padrões glob (*.csv).\n"
+                       "Variáveis dinâmicas funcionam: ${data_atual}, ${ultimo_dia_util}, etc.",
+                  foreground="#888", justify="left").grid(row=row, column=0, columnspan=3, sticky="w", pady=(2, 6)); row += 1
+
+        self._mm_files_listbox = tk.Listbox(tab_mm, height=6, width=70, exportselection=False,
+                                              font=("Segoe UI", 9))
+        self._mm_files_listbox.grid(row=row, column=0, columnspan=3, sticky="we", pady=(0, 6))
+        for p in self._mm_required_files:
+            self._mm_files_listbox.insert("end", p)
+        row += 1
+
+        mm_files_btns = ttk.Frame(tab_mm)
+        mm_files_btns.grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        ttk.Button(mm_files_btns, text="➕ Adicionar arquivo...",
+                   command=self._mm_add_file).pack(side="left", padx=4)
+        ttk.Button(mm_files_btns, text="✏️ Adicionar padrão (texto)...",
+                   command=self._mm_add_pattern).pack(side="left", padx=4)
+        ttk.Button(mm_files_btns, text="🗑️ Remover selecionado",
+                   command=self._mm_remove_file).pack(side="left", padx=4)
+        row += 1
+
+        ttk.Checkbutton(tab_mm, text="🛡️ Bloquear auto-disparo se algum arquivo estiver faltando",
+                        variable=self.var_mm_block).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0)); row += 1
+
         ttk.Label(tab_mm,
                   text=("💡  Como funciona o auto-disparo:\n"
                         "  1. Você marca seus jobs críticos com a tag (ex.: 'Manhã').\n"
                         "  2. O app checa todo dia no horário-limite.\n"
-                        "  3. Se nenhum job da tag rodou hoje ainda, dispara sozinho e avisa o time.\n"
-                        "  4. Modo Manhã ignora janelas de manutenção (é emergência)."),
+                        "  3. Se a checklist de arquivos esperados tá completa, dispara.\n"
+                        "  4. Se faltar arquivo e 'Bloquear' está marcado, NÃO dispara e avisa o time.\n"
+                        "  5. Quando você clica o botão 🌅 manualmente, vê o checklist antes de disparar."),
                   foreground="#666", justify="left").grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(16, 0))
 
@@ -5038,6 +5079,35 @@ class SettingsDialog(tk.Toplevel):
         sep = tk.Frame(header, bg=T['border'], height=1)
         sep.grid(row=2, column=0, sticky="we", pady=(10, 0))
 
+    # v2025.10.11.24 — Helpers do checklist de arquivos do Modo Manhã
+    def _mm_refresh_list(self):
+        self._mm_files_listbox.delete(0, "end")
+        for p in self._mm_required_files:
+            self._mm_files_listbox.insert("end", p)
+
+    def _mm_add_file(self):
+        p = filedialog.askopenfilename(title="Selecione um arquivo esperado",
+                                        parent=self)
+        if p:
+            self._mm_required_files.append(p)
+            self._mm_refresh_list()
+
+    def _mm_add_pattern(self):
+        p = simpledialog.askstring(
+            "Adicionar padrão",
+            "Digite o caminho ou padrão glob (ex.: C:/dados/*.csv, "
+            "C:/relatorios/${data_atual}/*.xlsx):",
+            parent=self)
+        if p and p.strip():
+            self._mm_required_files.append(p.strip())
+            self._mm_refresh_list()
+
+    def _mm_remove_file(self):
+        sel = self._mm_files_listbox.curselection()
+        if not sel: return
+        del self._mm_required_files[sel[0]]
+        self._mm_refresh_list()
+
     # v2025.10.11.8 — helpers das novas abas ---------------------------------
     def test_webhooks(self):
         try:
@@ -5349,6 +5419,9 @@ class SettingsDialog(tk.Toplevel):
                 "auto_trigger_time": self.var_mm_time.get().strip() or "08:00",
                 "auto_trigger_days": [v.get() for v in self.var_mm_days],
                 "notify_when_auto": self.var_mm_notify.get(),
+                # v2025.10.11.24 — checklist
+                "required_files": list(self._mm_required_files),
+                "block_if_files_missing": self.var_mm_block.get(),
             },
             "secrets_encrypted": True,
         }
@@ -8236,9 +8309,144 @@ class App(_AppBase):
         except Exception as e:
             print(f"[dnd] {e}")
 
-    # v2025.10.11.18 — Modo Manhã: 1-clique pra disparar todos os jobs da tag
+    # v2025.10.11.24 — Diálogo de status dos arquivos esperados (Modo Manhã)
+    def _show_morning_files_dialog(self, tag, file_status, missing):
+        """Mostra dialog com checklist de arquivos. Retorna True=disparar mesmo assim,
+        False=esperar e tentar de novo depois, None=cancelar."""
+        try:
+            dark = bool(self.var_dark.get())
+        except Exception:
+            dark = False
+        T = _bravo_theme(dark)
+        font_title, font_body = _resolve_fonts()
+
+        dlg = tk.Toplevel(self)
+        dlg.title(f"Modo Manhã — checklist de arquivos")
+        dlg.geometry("680x520")
+        dlg.minsize(560, 420)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.configure(bg=T['bg_app'])
+        try:
+            ico = find_logo_ico()
+            if ico: dlg.iconbitmap(default=str(ico))
+        except Exception: pass
+
+        result = {"action": None}
+
+        # Header
+        h = tk.Frame(dlg, bg=T['bg_surface']); h.pack(fill="x")
+        hi = tk.Frame(h, bg=T['bg_surface']); hi.pack(fill="x", padx=20, pady=(18, 12))
+        tk.Label(hi, text="🌅  Modo Manhã — checklist",
+                 bg=T['bg_surface'], fg=T['accent'],
+                 font=(font_title, 14, "bold")).pack(anchor="w")
+        warn_color = T['warning'] if missing else T['success']
+        warn_text = (f"⚠ Faltam {len(missing)} arquivo(s) esperados"
+                     if missing else "✅ Todos os arquivos estão prontos")
+        tk.Label(hi, text=warn_text,
+                 bg=T['bg_surface'], fg=warn_color,
+                 font=(font_body, 10, "bold")).pack(anchor="w", pady=(4, 0))
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+
+        # Body — lista de arquivos
+        body = tk.Frame(dlg, bg=T['bg_app'])
+        body.pack(fill="both", expand=True, padx=20, pady=14)
+
+        canvas_frame = tk.Frame(body, bg=T['bg_surface'],
+                                 highlightthickness=1, highlightbackground=T['border'])
+        canvas_frame.pack(fill="both", expand=True)
+
+        for path, exists, matches in file_status:
+            row = tk.Frame(canvas_frame, bg=T['bg_surface'])
+            row.pack(fill="x", padx=12, pady=4)
+            icon = "✅" if exists else "❌"
+            color = T['success'] if exists else T['error']
+            tk.Label(row, text=icon,
+                     bg=T['bg_surface'], fg=color,
+                     font=(font_body, 12, "bold"),
+                     width=3).pack(side="left")
+            txt_frame = tk.Frame(row, bg=T['bg_surface'])
+            txt_frame.pack(side="left", fill="x", expand=True)
+            tk.Label(txt_frame, text=path,
+                     bg=T['bg_surface'], fg=T['text'],
+                     font=(font_body, 10),
+                     anchor="w", justify="left").pack(anchor="w")
+            if matches:
+                tk.Label(txt_frame, text=f"  → {len(matches)} arquivo(s) encontrado(s)",
+                         bg=T['bg_surface'], fg=T['subtext'],
+                         font=(font_body, 8)).pack(anchor="w")
+            elif not exists:
+                tk.Label(txt_frame, text="  → não encontrado",
+                         bg=T['bg_surface'], fg=T['subtext'],
+                         font=(font_body, 8, "italic")).pack(anchor="w")
+
+        # Footer com botões
+        tk.Frame(dlg, bg=T['border'], height=1).pack(fill="x")
+        f = tk.Frame(dlg, bg=T['bg_surface']); f.pack(fill="x")
+        fi = tk.Frame(f, bg=T['bg_surface']); fi.pack(fill="x", padx=20, pady=14)
+
+        def _proceed():
+            result["action"] = "proceed"
+            dlg.destroy()
+        def _wait():
+            result["action"] = "wait"
+            dlg.destroy()
+        def _cancel():
+            result["action"] = "cancel"
+            dlg.destroy()
+
+        ttk.Button(fi, text="Cancelar", command=_cancel).pack(side="right", padx=(8, 0))
+        if missing:
+            ttk.Button(fi, text="⏰ Aguardar arquivos chegarem",
+                       command=_wait).pack(side="right", padx=(8, 0))
+            ttk.Button(fi, text=f"▶ Disparar mesmo assim ({len(missing)} faltando)",
+                       style="Accent.TButton",
+                       command=_proceed).pack(side="right")
+        else:
+            ttk.Button(fi, text=f"▶ Disparar agora ({len([s for s in file_status if s[1]])} OK)",
+                       style="Accent.TButton",
+                       command=_proceed).pack(side="right")
+
+        dlg.wait_window()
+        if result["action"] == "proceed":
+            return True
+        elif result["action"] == "wait":
+            return False
+        else:
+            return None
+
+    # v2025.10.11.24 — Checa status dos arquivos esperados do Modo Manhã
+    def _check_morning_required_files(self):
+        """Retorna (all_present, status_list) onde status_list = [(path, exists), ...]."""
+        cfg = self.data.get("settings", {}).get("morning_mode", {}) or {}
+        required = cfg.get("required_files", []) or []
+        status = []
+        for raw in required:
+            p = raw.strip()
+            if not p:
+                continue
+            # Resolve variáveis dinâmicas se houver
+            try:
+                p_resolved = resolve_dynamic(p)
+            except Exception:
+                p_resolved = p
+            # Suporta padrões glob (*.csv) — se tem coringa, verifica se ao menos 1 arquivo casa
+            if "*" in p_resolved or "?" in p_resolved:
+                from glob import glob as _glob
+                matches = _glob(p_resolved)
+                status.append((p_resolved, bool(matches), matches[:3]))
+            else:
+                status.append((p_resolved, os.path.exists(p_resolved), []))
+        all_present = all(s[1] for s in status) if status else True
+        return all_present, status
+
+    # v2025.10.11.18/24 — Modo Manhã: 1-clique pra disparar todos os jobs da tag
     def run_morning_mode(self, automatic: bool = False):
         """Dispara em 1 clique todos os jobs com a tag configurada como Manhã.
+
+        v2025.10.11.24 — Antes de disparar, checa se os arquivos esperados
+        estão presentes na pasta. Se faltarem, abre diálogo (manual) ou
+        notifica time + aguarda (automático).
 
         automatic=True: chamado pelo schedule automático às Xh.
                        Pula notificação manual e usa flag de auditoria.
@@ -8258,6 +8466,48 @@ class App(_AppBase):
                 "(Editar job → Avançado → Tags) e configure aqui pra disparar todos em 1 clique.",
                 parent=self)
             return
+
+        # v2025.10.11.24 — Checagem de arquivos esperados ANTES de disparar
+        all_present, file_status = self._check_morning_required_files()
+        block_if_missing = cfg.get("block_if_files_missing", True)
+        missing = [s for s in file_status if not s[1]]
+
+        if missing:
+            if automatic:
+                # Auto-disparo: NÃO dispara se faltar arquivo (a menos que block_if_missing=False)
+                if block_if_missing:
+                    # Notifica que faltam arquivos
+                    try:
+                        sched_log = LOG_DIR / "_scheduler.log"
+                        with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                            f.write(f"[{now_str()}] MORNING_AUTO_BLOCKED tag={tag} "
+                                    f"missing={[m[0] for m in missing]}\n")
+                    except Exception:
+                        pass
+                    # Avisa o time
+                    if cfg.get("notify_when_auto", True):
+                        try:
+                            subject = "⚠️ Modo Manhã BLOQUEADO: arquivos faltando"
+                            body = (f"O Modo Manhã não disparou às {cfg.get('auto_trigger_time', '08:00')} "
+                                    f"porque os seguintes arquivos esperados não estavam na pasta:\n\n")
+                            for path, _exists, _matches in missing:
+                                body += f"  ❌ {path}\n"
+                            body += f"\nQuando os arquivos chegarem, clique no botão 🌅 Modo Manhã."
+                            send_email(self.data["settings"], subject, body)
+                            send_webhook(self.data["settings"], subject, body, ok=False)
+                        except Exception as e:
+                            print(f"[morning blocked notify] {e}")
+                    self.set_status_line(f"⚠️ Modo Manhã: {len(missing)} arquivo(s) faltando — não disparou")
+                    return
+            else:
+                # Manual: mostra diálogo com status dos arquivos
+                proceed = self._show_morning_files_dialog(tag, file_status, missing)
+                if proceed is None:  # cancelado
+                    return
+                if not proceed:  # esperar
+                    self.set_status_line(f"⏰ Modo Manhã aguardando arquivos chegarem...")
+                    return
+                # se proceed=True, segue e dispara mesmo assim
 
         # Coleta jobs ativos com a tag
         jobs = [t for t in self.data.get("tasks", [])
