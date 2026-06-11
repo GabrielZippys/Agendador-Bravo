@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.29"   # << aumente em cada build
+APP_VERSION = "2025.10.11.30"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -4992,8 +4992,8 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Configurações")
         self.resizable(True, True)
-        self.geometry("1180x740")  # v2025.10.11.12 — sidebar à esquerda, content respirado
-        self.minsize(960, 620)
+        self.geometry("1180x840")  # v2025.10.11.29 — altura p/ caber as 11 abas verticais sem cortar (Notion/Sistema)
+        self.minsize(960, 700)
         self.result = None
 
         # v2025.10.11.15 — Sidebar com cores Bravo TI DINÂMICAS (light + dark)
@@ -5008,7 +5008,7 @@ class SettingsDialog(tk.Toplevel):
                             borderwidth=0,
                             padding=0)
             style.configure("Sidebar.TNotebook.Tab",
-                            padding=[20, 14],
+                            padding=[20, 9],
                             font=("Segoe UI", 10),
                             width=20,
                             background=T['bg_sidebar'],
@@ -7923,7 +7923,7 @@ class App(_AppBase):
             messagebox.showinfo("Aviso", "Nenhuma tarefa selecionada.")
             return False
             
-        task_names = [self.tree.item(i, 'values')[1] for i in selected]
+        task_names = list(selected)  # iid da linha == nome do job (ver refresh_table); nao depende do indice da coluna
         running_tasks = []
         
         # Filtra apenas as tarefas selecionadas que estão em execução
@@ -11334,7 +11334,8 @@ class App(_AppBase):
                     return
                 
                 # Obtém os nomes das tarefas selecionadas
-                task_names = [self.tree.item(i, 'values')[1] for i in selected]
+                # iid da linha == nome do job (ver refresh_table); nao depende do indice da coluna
+                task_names = list(selected)
                 
                 # Executa as tarefas selecionadas
                 if len(task_names) > 1:
@@ -11473,7 +11474,7 @@ class App(_AppBase):
         
         # Atualiza o status na árvore de tarefas
         for item in self.tree.get_children():
-            if self.tree.item(item, 'values')[1] == task_name:  # Índice 1 é a coluna 'Nome'
+            if item == task_name:  # iid da linha == nome do job (ver refresh_table)
                 # Atualiza o status (índice 0 é a coluna 'Status')
                 values = list(self.tree.item(item, 'values'))
                 values[0] = '✅' if success else '❌'
