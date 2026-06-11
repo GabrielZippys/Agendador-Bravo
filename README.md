@@ -152,6 +152,7 @@ Defina as variáveis de ambiente para apontar o manifesto:
 * `C:\ProgramData\AgendadorBravo\config.json`
 
   * `settings.pdi_home`
+  * `settings.max_concurrent_runs` — limite global de jobs simultâneos (padrão **4**; `0` = sem limite; os demais aguardam em fila)
   * `settings.email` (enabled, smtp\_host, smtp\_port, username, password, from\_email, to\_emails)
   * `settings.whatsapp` (enabled, mode, node\_path, webjs\_script, my\_number, to\_targets)
   * `tasks`: lista de tarefas

@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.30"   # << aumente em cada build
+APP_VERSION = "2025.10.11.31"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1370,6 +1370,8 @@ def _migrate_data_schema(data: dict) -> dict:
     settings.setdefault("webhook_inbound", {"enabled": False, "tokens": []})
     settings.setdefault("slack", {"enabled": False, "signing_secret": ""})
     settings.setdefault("notion_sync", {"enabled": False, "token": "", "database_id": ""})
+    # v2025.10.11.31 — limite global de execuções simultâneas (0 = sem limite)
+    settings.setdefault("max_concurrent_runs", 4)
     return data
 
 def load_data():
@@ -2664,6 +2666,39 @@ def cleanup_orphaned_python_processes():
     except Exception as e:
         print(f"[CLEANUP] Erro geral na limpeza de processos: {e}")
 
+# v2025.10.11.31 — Fila de concorrência global: limita quantos jobs supervisionados
+# rodam ao mesmo tempo (settings.max_concurrent_runs; 0 = sem limite). Jobs em modo
+# spawn (segundo plano) não contam — não dá pra saber quando terminam.
+class _ConcurrencyGate:
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._active = 0
+
+    def acquire(self, limit, progress_cb=None, name=""):
+        """Bloqueia até abrir vaga. Retorna quantos segundos esperou na fila."""
+        t0 = time.time()
+        notified = False
+        with self._cv:
+            while limit > 0 and self._active >= limit:
+                if not notified and progress_cb:
+                    try:
+                        progress_cb(f"na fila: aguardando vaga ({self._active}/{limit} jobs rodando)")
+                    except Exception:
+                        pass
+                    notified = True
+                self._cv.wait(timeout=5)
+            self._active += 1
+        return time.time() - t0
+
+    def release(self):
+        with self._cv:
+            self._active = max(0, self._active - 1)
+            self._cv.notify_all()
+
+
+_run_gate = _ConcurrencyGate()
+
+
 def run_task(task, settings, progress_cb=None, process_callback=None):
     ensure_dirs()
     name = task["name"]
@@ -2750,6 +2785,15 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
     # modo tradicional: stream da saída para o log, aguardando terminar
     with open(log_file, "w", encoding="utf-8", errors="ignore") as f:
         f.write(f"# {name} @ {now_str()}\nCMD: {' '.join(cmd)}\n\n")
+        # v2025.10.11.31 — fila de concorrência global (Configurações → Geral)
+        try:
+            _gate_limit = int(settings.get("max_concurrent_runs", 4) or 0)
+        except Exception:
+            _gate_limit = 4
+        _queued_s = _run_gate.acquire(_gate_limit, progress_cb=progress_cb, name=name)
+        if _queued_s >= 1:
+            f.write(f"# aguardou {_queued_s:.0f}s na fila (limite de {_gate_limit} execuções simultâneas)\n\n")
+        start = time.time()  # duração do job não conta o tempo de fila
         try:
             proc = subprocess.Popen(
                 cmd, cwd=workdir,
@@ -2762,26 +2806,41 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
             if process_callback and callable(process_callback):
                 process_callback(proc, task['name'])
 
-            while True:
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    f.write(line)
-                    if progress_cb:
-                        progress_cb(line.strip()[:140])
-            
-            # Aguarda o processo terminar completamente
-            proc.wait()
-            
-            if timeout and (time.time() - start) > timeout:
-                try: 
-                    proc.kill()
-                    proc.wait(timeout=2)  # Aguarda até 2 segundos para o processo morrer
-                except Exception: 
-                    pass
+            # v2025.10.11.31 — timeout REAL: watchdog mata o processo no estouro.
+            # (Antes, o tempo só era verificado DEPOIS do processo terminar sozinho,
+            #  então um job travado ficava travado pra sempre.)
+            _timed_out = threading.Event()
+            _watchdog = None
+            if timeout:
+                def _kill_on_timeout():
+                    _timed_out.set()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                _watchdog = threading.Timer(timeout, _kill_on_timeout)
+                _watchdog.daemon = True
+                _watchdog.start()
+
+            try:
+                while True:
+                    line = proc.stdout.readline()
+                    if not line and proc.poll() is not None:
+                        break
+                    if line:
+                        f.write(line)
+                        if progress_cb:
+                            progress_cb(line.strip()[:140])
+
+                # Aguarda o processo terminar completamente
+                proc.wait()
+            finally:
+                if _watchdog:
+                    _watchdog.cancel()
+
+            if _timed_out.is_set():
                 rc = -9
-                f.write("\n### TIMEOUT atingido.\n")
+                f.write(f"\n### TIMEOUT atingido ({timeout}s) — processo finalizado à força.\n")
             else:
                 rc = proc.returncode
             
@@ -2819,6 +2878,8 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
                     proc.wait(timeout=2)
             except Exception:
                 pass
+        finally:
+            _run_gate.release()  # v2025.10.11.31 — libera a vaga da fila
 
     return rc, time.time() - start, str(log_file)
 
@@ -5154,6 +5215,14 @@ class SettingsDialog(tk.Toplevel):
         ttk.Entry(tab_geral, textvariable=self.var_pdi, width=40).grid(row=row, column=1, sticky="we", padx=(5, 5))
         ttk.Button(tab_geral, text="...", command=self.pick_pdi, width=3).grid(row=row, column=2); row += 1
         ttk.Label(tab_geral, text="Aponte para a pasta do PDI que contém `Pan.bat` e `Kitchen.bat`.",
+                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0)); row += 1
+
+        # v2025.10.11.31 — limite global de execuções simultâneas
+        self.var_max_conc = tk.StringVar(value=str(settings.get("max_concurrent_runs", 4)))
+        ttk.Label(tab_geral, text="Execuções simultâneas (máx.):").grid(row=row, column=0, sticky="w", pady=(18, 0))
+        ttk.Spinbox(tab_geral, from_=0, to=64, textvariable=self.var_max_conc, width=6)\
+            .grid(row=row, column=1, sticky="w", padx=(5, 5), pady=(18, 0)); row += 1
+        ttk.Label(tab_geral, text="Quantos jobs podem rodar ao mesmo tempo; os demais aguardam na fila. 0 = sem limite.",
                   foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         # === ABA 2: E-MAIL ===
@@ -6163,8 +6232,15 @@ class SettingsDialog(tk.Toplevel):
         encrypted_pwd = dpapi_encrypt(self.var_pass.get()) if self.var_pass.get() else ""
         encrypted_api_token = dpapi_encrypt(self.var_api_token.get()) if self.var_api_token.get() else ""
 
+        # v2025.10.11.31 — limite de execuções simultâneas
+        try:
+            max_conc = max(0, int(self.var_max_conc.get()))
+        except Exception:
+            max_conc = 4
+
         return {
             "pdi_home": self.var_pdi.get().strip(),
+            "max_concurrent_runs": max_conc,
             "email": {
                 "enabled": self.var_mail_on.get(),
                 "smtp_host": self.var_host.get().strip(),
@@ -6854,6 +6930,10 @@ class App(_AppBase):
         # Dicionário para armazenar processos em execução
         self.running_processes = {}
         self.running_lock = threading.Lock()  # Para evitar condições de corrida
+        # v2025.10.11.31 — jobs em lançamento (janela entre o clique e o Popen);
+        # junto com running_processes forma a trava anti-sobreposição
+        self._launching_jobs = set()
+        self._channels_cache = None  # cache (ts, em_ok, wa_ok) p/ _pulse_status
 
 
         # Estilos melhorados
@@ -7134,7 +7214,9 @@ class App(_AppBase):
             b.pack(side="left", padx=(0, 6))
             self._chip_buttons[key] = b
         # liga atualização em tempo real
-        self.search_var.trace_add("write", lambda *_: self.refresh_table())
+        # v2025.10.11.31 — debounce 250ms: antes cada tecla reconstruía a tabela
+        # inteira (delete all + health score de cada job)
+        self.search_var.trace_add("write", lambda *_: self._debounced_refresh())
         self.tag_filter.bind("<<ComboboxSelected>>", lambda *_: self.refresh_table())
 
         # Definindo as colunas da tabela (Saúde + Tags antes de Arquivo)
@@ -7651,7 +7733,20 @@ class App(_AppBase):
         Alterna a cor de fundo da tag 'running' entre 2 tons de azul Bravo
         a cada 600ms, criando efeito visual de breathing/pulse. Também
         anima o ícone no texto Status (▶ → ▶▶).
+
+        v2025.10.11.31 — modo ocioso: sem jobs rodando, não faz trabalho
+        nenhum e verifica em cadência mais lenta (economiza CPU constante).
         """
+        try:
+            with self.running_lock:
+                _idle = not self.running_processes
+        except Exception:
+            _idle = True
+        if _idle:
+            self._pulse_running_state = False
+            self.after(1500, self._pulse_running_rows)
+            return
+
         try:
             dark = bool(self.var_dark.get())
         except Exception:
@@ -7703,7 +7798,15 @@ class App(_AppBase):
 
     def _pulse_status(self):
         """Animação suave dos indicadores de status"""
-        em_ok, wa_ok = self._channels_ok()
+        # v2025.10.11.31 — cache 10s: _channels_ok faz os.path.exists 2x;
+        # sem cache isso batia no disco a cada 800ms. Invalidado ao salvar config.
+        now_m = time.monotonic()
+        cache = getattr(self, "_channels_cache", None)
+        if cache and (now_m - cache[0]) < 10.0:
+            em_ok, wa_ok = cache[1], cache[2]
+        else:
+            em_ok, wa_ok = self._channels_ok()
+            self._channels_cache = (now_m, em_ok, wa_ok)
         
         # Usa cores do tema se disponível
         if hasattr(self, '_theme_colors'):
@@ -7742,8 +7845,8 @@ class App(_AppBase):
         except Exception as e:
             print(f"Erro no monitoramento do botão Interromper: {e}")
         finally:
-            # Verifica a cada 2 segundos
-            self.after(2000, self._monitor_stop_button)
+            # v2025.10.11.31 — rede de segurança; 5s basta (era 2s)
+            self.after(5000, self._monitor_stop_button)
 
     # ===== utilidades UI =====
     def _on_tree_resize(self, event=None):
@@ -7774,6 +7877,15 @@ class App(_AppBase):
         self.update_status_indicators()
         if not silent:
             messagebox.showinfo("Salvo", "Configurações salvas.")
+
+    def _is_job_active(self, task_name):
+        """v2025.10.11.31 — True se o job está rodando ou em lançamento.
+
+        Não chamar segurando running_lock (faz o próprio acquire).
+        """
+        with self.running_lock:
+            return (task_name in self.running_processes
+                    or task_name in self._launching_jobs)
 
     def _register_process(self, process, task_name):
         """Registra um processo em execução e atualiza a interface."""
@@ -9978,6 +10090,26 @@ class App(_AppBase):
                         f"'{task_name}' pulado: dependências não satisfeitas ({', '.join(m)})"))
                 return
 
+        # ---- 2.5) Anti-sobreposição (v2025.10.11.31) -----------------------
+        # Se o job já roda (ex.: disparo manual em andamento), pula esta fire.
+        # max_instances=1 do APScheduler só cobre fires do próprio scheduler.
+        with self.running_lock:
+            _overlap = (task_name in self.running_processes
+                        or task_name in self._launching_jobs)
+            if not _overlap:
+                self._launching_jobs.add(task_name)
+        if _overlap:
+            try:
+                sched_log = LOG_DIR / "_scheduler.log"
+                with open(sched_log, "a", encoding="utf-8", errors="ignore") as f:
+                    f.write(f"[{now_str()}] SKIP_OVERLAP job={task_name} (já em execução)\n")
+            except Exception:
+                pass
+            if self.winfo_exists():
+                self.after(0, lambda: self.set_status_line(
+                    f"'{task_name}' pulado: já está em execução"))
+            return
+
         # ---- callbacks de UI ---------------------------------------------
         def on_task_start():
             if self.winfo_exists():
@@ -10019,6 +10151,10 @@ class App(_AppBase):
         except Exception as e:
             print(f"Erro ao executar tarefa {task_name}: {e}")
             rc, dur, log_path = 1, 0, None
+        finally:
+            # v2025.10.11.31 — libera a marca de lançamento (anti-sobreposição)
+            with self.running_lock:
+                self._launching_jobs.discard(task_name)
 
         # Atualiza a interface após o término
         on_task_end(rc, dur, log_path)
@@ -10466,6 +10602,19 @@ class App(_AppBase):
 
 
     # ===== tabela & gráfico =====
+    def _debounced_refresh(self, delay_ms=250):
+        """v2025.10.11.31 — agenda UM refresh_table após pausa na digitação."""
+        try:
+            if getattr(self, "_refresh_after_id", None):
+                self.after_cancel(self._refresh_after_id)
+        except Exception:
+            pass
+        self._refresh_after_id = self.after(delay_ms, self._do_debounced_refresh)
+
+    def _do_debounced_refresh(self):
+        self._refresh_after_id = None
+        self.refresh_table()
+
     def _refresh_table_silent(self):
         """v2025.10.11.28 — refresh sem mexer em scroll/selecao (usado pelo pull Notion)."""
         try:
@@ -11388,11 +11537,21 @@ class App(_AppBase):
                 return
 
             # Filtra apenas tarefas que existem
-            valid_tasks = [name for name in task_names 
-                          if name in {t["name"] for t in self.data["tasks"]}]
-            
+            existing = {t["name"] for t in self.data["tasks"]}
+            # v2025.10.11.31 — pula as que já estão em execução (anti-sobreposição)
+            ja_rodando = [n for n in task_names if self._is_job_active(n)]
+            valid_tasks = [name for name in task_names
+                          if name in existing and name not in ja_rodando]
+
+            if ja_rodando:
+                self.after(0, lambda m=", ".join(ja_rodando): self.set_status_line(
+                    f"Pulados (já em execução): {m}"))
+
             if not valid_tasks:
-                self.after(0, lambda: messagebox.showinfo("Aviso", "Nenhuma tarefa válida para executar."))
+                self.after(0, lambda: messagebox.showinfo(
+                    "Aviso",
+                    "Nenhuma tarefa para executar."
+                    + (f"\n(Já em execução: {', '.join(ja_rodando)})" if ja_rodando else "")))
                 return
             
             # Atualiza a interface para mostrar que as tarefas estão sendo executadas
@@ -11429,19 +11588,42 @@ class App(_AppBase):
         task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
         if not task:
             return
-        
+
+        # v2025.10.11.31 — anti-sobreposição: check-and-add atômico
+        with self.running_lock:
+            if (task_name in self.running_processes
+                    or task_name in self._launching_jobs):
+                self.after(0, lambda: messagebox.showwarning(
+                    "Já em execução",
+                    f"O job '{task_name}' já está em execução.\n"
+                    "Aguarde terminar para rodar de novo."))
+                return
+            self._launching_jobs.add(task_name)
+
         self._set_ui_busy(True, f"Executando '{task['name']}'...")
-        
+
         # Atualiza o status visual para "Rodando"
         self.after(0, lambda: self._set_task_running(task_name, True))
-        
+
         def worker(task=task):
+            # v2025.10.11.31 — throttle: no máx. 1 update de UI a cada 200ms
+            # (jobs com muito output não congelam mais a interface)
+            _last_ui = [0.0]
+
             def progress(line):
+                now_m = time.monotonic()
+                if now_m - _last_ui[0] < 0.2:
+                    return
+                _last_ui[0] = now_m
                 self.after(0, lambda: self.set_status_line(f"[{task['name']}] {line}"))
-            
-            rc, dur, log_path = run_task(task, self.data["settings"], 
-                                     progress_cb=progress,
-                                     process_callback=self._register_process)
+
+            try:
+                rc, dur, log_path = run_task(task, self.data["settings"],
+                                         progress_cb=progress,
+                                         process_callback=self._register_process)
+            finally:
+                with self.running_lock:
+                    self._launching_jobs.discard(task_name)
             append_history(self.data, task["name"], rc, dur)
             self._maybe_notify(task, rc, log_path)
             
@@ -11587,7 +11769,10 @@ class App(_AppBase):
     current_version=APP_VERSION,
 ); self.wait_window(dlg)
         if dlg.result:
-            self.data["settings"] = dlg.result
+            # v2025.10.11.31 — merge em vez de substituir: preserva chaves que o
+            # diálogo não edita (webhook_inbound, slack, etc.)
+            self.data["settings"].update(dlg.result)
+            self._channels_cache = None  # invalida cache dos indicadores
             self.save(silent=True); self.reschedule_all()
             self.update_status_indicators()
 
