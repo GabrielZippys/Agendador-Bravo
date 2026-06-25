@@ -68,17 +68,25 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
             else:
                 same = 0
                 last = ok
-            if same >= stable and app_ref and app_ref.winfo_exists():
+            if same >= stable and app_ref:
+                # v2025.10.11.33 — Tk não é thread-safe: NÃO chamar winfo_exists()
+                # na thread worker. Agenda na main thread e checa a existência lá.
+                def _dispatch(s=ok):
+                    try:
+                        if app_ref.winfo_exists():
+                            app_ref.on_net_status_change(s)
+                    except Exception:
+                        pass
                 try:
-                    app_ref.after(0, lambda s=ok: app_ref.on_net_status_change(s))
+                    app_ref.after(0, _dispatch)
                 except Exception:
                     pass
             time.sleep(max(2, int(interval)))
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, daemon=True, name="net-monitor").start()
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.32"   # << aumente em cada build
+APP_VERSION = "2025.10.11.33"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1304,6 +1312,10 @@ def format_days_bool(days_list):
 
 # Cache de dados para evitar leituras repetidas
 _data_cache = {"data": None, "mtime": 0}
+# v2025.10.11.33 — lock global de dados: serializa mutações + escrita de config.json
+# entre as várias threads worker (max_concurrent_runs). RLock = reentrante
+# (append_history chama save_data dentro do mesmo lock).
+_DATA_LOCK = threading.RLock()
 
 def _migrate_data_schema(data: dict) -> dict:
     """Adiciona keys novas (v2025.10.11.8) em config.json antigos, sem destruir nada."""
@@ -1471,22 +1483,42 @@ def load_data():
     return default_data
 
 def save_data(data):
-    """Salva dados e atualiza cache."""
+    """Salva dados de forma ATÔMICA e thread-safe, e atualiza o cache.
+
+    v2025.10.11.33 — antes era um write_text direto, não-atômico e sem lock:
+    com vários workers concorrentes (max_concurrent_runs) duas gravações podiam
+    se intercalar e corromper o config.json (perda de TODAS as tasks). Agora a
+    serialização+escrita ocorre sob _DATA_LOCK e a troca é atômica via os.replace
+    de um arquivo temporário no mesmo diretório (atômico no NTFS).
+    """
     ensure_dirs()
-    DATA_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    # Atualiza cache
-    _data_cache["data"] = data.copy()
-    _data_cache["mtime"] = DATA_FILE.stat().st_mtime
+    with _DATA_LOCK:
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+        tmp = DATA_FILE.with_name(DATA_FILE.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, DATA_FILE)
+        # Atualiza cache
+        _data_cache["data"] = data.copy()
+        _data_cache["mtime"] = DATA_FILE.stat().st_mtime
 
 # v2025.10.11.28 — hook opcional do Notion sync; App registra no boot.
 _history_hook = None  # type: callable(task_name) | None
 
 def append_history(data, task_name, rc, dur):
-    hist = data.setdefault("history", {}).setdefault(task_name, [])
-    hist.append({"ts": now_str(), "rc": int(rc), "dur": float(dur)})
-    if len(hist) > 50:
-        del hist[:-50]
-    save_data(data)
+    # v2025.10.11.33 — mutação do history + persistência sob o mesmo lock global
+    # (evita corrida entre workers concorrentes que corrompia o config.json).
+    with _DATA_LOCK:
+        hist = data.setdefault("history", {}).setdefault(task_name, [])
+        hist.append({"ts": now_str(), "rc": int(rc), "dur": float(dur)})
+        if len(hist) > 50:
+            del hist[:-50]
+        save_data(data)
     # Notion sync (background) — só dispara se App registrou o hook
     if _history_hook:
         try:
@@ -3205,42 +3237,54 @@ class NotionSyncManager:
         return None
 
     def _push_task_sync(self, task_name: str):
+        # v2025.10.11.33 — não segurar self._lock durante a chamada de REDE.
+        # Antes o lock cobria todo o update_page/create_page (timeout alto),
+        # serializando e travando todos os pushes. Agora: snapshot sob lock →
+        # rede FORA do lock → write-back sob lock. Pushes de tasks diferentes
+        # passam a rodar em paralelo.
+        cli = self.client()
+        if not cli:
+            return
         with self._lock:
-            cli = self.client()
-            if not cli:
-                return
             task = self._find_task(task_name)
             if not task:
                 return
             props = task_to_notion_props(task, self.app.data)
             page_id = task.get("notion_page_id")
-            try:
-                if page_id:
-                    ok, res = cli.update_page(page_id, props)
-                    if not ok and "not found" in str(res).lower():
-                        # página foi deletada no Notion → recria
-                        page_id = None
-                        ok, res = cli.create_page(props)
-                else:
+
+        try:
+            if page_id:
+                ok, res = cli.update_page(page_id, props)
+                if not ok and "not found" in str(res).lower():
+                    # página foi deletada no Notion → recria
+                    page_id = None
                     ok, res = cli.create_page(props)
-                if ok and isinstance(res, dict) and res.get("id"):
-                    new_id = res["id"]
-                    if new_id != page_id:
-                        task["notion_page_id"] = new_id
-                        save_data(self.app.data)
-                    self.last_status.update({"ok": True, "ts": now_str(),
-                                             "msg": f"Push OK: {task_name}",
-                                             "pushed": self.last_status["pushed"] + 1})
-                else:
-                    self.last_status.update({"ok": False, "ts": now_str(),
-                                             "msg": f"Push FALHOU ({task_name}): {res}",
-                                             "errors": self.last_status["errors"] + 1})
-                    print(f"[notion-sync] push falhou ({task_name}): {res}")
-            except Exception as e:
+            else:
+                ok, res = cli.create_page(props)
+        except Exception as e:
+            with self._lock:
                 self.last_status.update({"ok": False, "ts": now_str(),
                                          "msg": f"Push exception: {e}",
                                          "errors": self.last_status["errors"] + 1})
-                print(f"[notion-sync] push exception: {e}")
+            print(f"[notion-sync] push exception: {e}")
+            return
+
+        with self._lock:
+            if ok and isinstance(res, dict) and res.get("id"):
+                new_id = res["id"]
+                # re-lê a task (pode ter mudado durante a rede) p/ não sobrescrever
+                task = self._find_task(task_name) or task
+                if new_id != task.get("notion_page_id"):
+                    task["notion_page_id"] = new_id
+                    save_data(self.app.data)
+                self.last_status.update({"ok": True, "ts": now_str(),
+                                         "msg": f"Push OK: {task_name}",
+                                         "pushed": self.last_status["pushed"] + 1})
+            else:
+                self.last_status.update({"ok": False, "ts": now_str(),
+                                         "msg": f"Push FALHOU ({task_name}): {res}",
+                                         "errors": self.last_status["errors"] + 1})
+                print(f"[notion-sync] push falhou ({task_name}): {res}")
 
     def _push_all_sync(self, on_done=None):
         cli = self.client()
@@ -7888,24 +7932,31 @@ class App(_AppBase):
                     or task_name in self._launching_jobs)
 
     def _register_process(self, process, task_name):
-        """Registra um processo em execução e atualiza a interface."""
-        def update_ui():
-            try:
-                with self.running_lock:
-                    # Garante que temos o PID do processo
-                    if not hasattr(process, 'pid') and hasattr(process, 'popen'):
-                        process.pid = process.popen.pid
-                    self.running_processes[task_name] = process
-                    # Habilita o botão de parada se houver processos em execução
-                    if self.running_processes and self.btn_stop['state'] == 'disabled':
-                        self.btn_stop.config(state="normal")
-                print(f"Processo registrado: {task_name} (PID: {process.pid})")
-            except Exception as e:
-                print(f"Erro ao registrar processo: {e}")
-        
-        # Garante que a atualização da UI seja feita na thread principal
-        if self.winfo_exists():
-            self.after(0, update_ui)
+        """Registra um processo em execução (SÍNCRONO) e atualiza o botão na UI.
+
+        v2025.10.11.33 — o registro em running_processes era adiado via after(0).
+        Se a janela não existisse ou o job terminasse antes do callback rodar, o
+        processo NUNCA entrava em running_processes: não dava pra 'Parar' e o
+        anti-sobreposição do _job_wrapper corria com o término. Agora o registro é
+        síncrono na thread chamadora (worker), sob running_lock — simétrico ao del
+        em finish()/on_task_end. Apenas o widget (btn_stop) é tocado na main thread.
+        """
+        try:
+            if not hasattr(process, 'pid') and hasattr(process, 'popen'):
+                process.pid = process.popen.pid
+        except Exception:
+            pass
+        with self.running_lock:
+            self.running_processes[task_name] = process
+        # Habilita o botão Interromper na main thread (Tk não é thread-safe)
+        try:
+            self.after(0, self._update_stop_button_state)
+        except Exception:
+            pass
+        try:
+            print(f"Processo registrado: {task_name} (PID: {getattr(process, 'pid', '?')})")
+        except Exception:
+            pass
 
     def _log_interruption(self, task_name):
         """Registra a interrupção de uma tarefa no arquivo de log."""
@@ -10277,6 +10328,17 @@ class App(_AppBase):
         except Exception as e:
             print(f"[burst alert] {e}")
 
+    def _refresh_and_reschedule(self):
+        """v2025.10.11.33 — roda na main thread (agendado via after) para aplicar
+        mudanças de estado que tocam Tk e o scheduler com segurança."""
+        if not self.winfo_exists():
+            return
+        try:
+            self.refresh_table()
+            self.reschedule_all()
+        except Exception as e:
+            print(f"[circuit breaker] refresh/reschedule falhou: {e}")
+
     def _check_circuit_breaker(self, task):
         """v2025.10.11.23 — Pausa job se últimas N execuções falharam em sequência."""
         name = task.get("name")
@@ -10295,8 +10357,14 @@ class App(_AppBase):
             task["circuit_breaker_pause_ts"] = now_str()
             try:
                 save_data(self.data)
-                self.refresh_table()
-                self.reschedule_all()
+            except Exception as e:
+                print(f"[circuit breaker] save_data falhou (job={name}): {e}")
+            # v2025.10.11.33 — refresh_table/reschedule_all tocam Tk e o scheduler;
+            # _check_circuit_breaker roda em thread worker (via _maybe_notify), então
+            # precisam ser agendados na main thread (Tk não é thread-safe). A checagem
+            # de existência fica DENTRO do callback (que roda na main thread).
+            try:
+                self.after(0, self._refresh_and_reschedule)
             except Exception:
                 pass
             # Audit log
@@ -11560,21 +11628,23 @@ class App(_AppBase):
             # Habilita o botão de parada
             self.after(0, lambda: self.btn_stop.config(state="normal"))
             
-            # Cria uma thread para cada tarefa
-            threads = []
+            # v2025.10.11.33 — FIX (execução dupla): caminho ÚNICO de execução.
+            # Antes, cada tarefa era disparada DUAS vezes: uma por thread em
+            # _run_single_task aqui, e outra dentro de _monitor_tasks_completion
+            # (que ignorava as threads recebidas e chamava run_task de novo) —
+            # subindo 2 subprocessos Pentaho por job. Agora _run_single_task é o
+            # único executor (já tem anti-sobreposição, histórico, notify e limpeza
+            # de running_processes/_launching_jobs) e o monitor só aguarda + agrega.
+            results = {}
+            worker_threads = []
             for task_name in valid_tasks:
-                thread = threading.Thread(
-                    target=self._run_single_task,
-                    args=(task_name,),
-                    daemon=True
-                )
-                threads.append(thread)
-                thread.start()
-            
-            # Inicia uma thread para monitorar o término das tarefas
+                t = self._run_single_task(task_name, batch=True, results=results)
+                if t is not None:
+                    worker_threads.append(t)
+
             monitor_thread = threading.Thread(
                 target=self._monitor_tasks_completion,
-                args=(threads, valid_tasks),
+                args=(worker_threads, valid_tasks, results),
                 daemon=True
             )
             monitor_thread.start()
@@ -11584,23 +11654,39 @@ class App(_AppBase):
             self.after(0, lambda: messagebox.showerror("Erro", f"Falha ao executar as tarefas: {e}"))
             self._set_ui_busy(False, "Erro ao executar tarefas")
 
-    def _run_single_task(self, task_name):
+    def _run_single_task(self, task_name, batch=False, results=None):
+        """Executa uma tarefa imediatamente em uma thread worker.
+
+        batch=True   : modo lote (chamado por run_multiple_tasks) — suprime a
+                       messagebox por-tarefa e o _set_ui_busy próprio; quem mostra
+                       o resumo agregado é _monitor_tasks_completion.
+        results      : dict opcional {task_name: rc} preenchido ao concluir (sob
+                       running_lock) para o monitor agregar sucesso/falha.
+        Retorna a thread worker (ou None se não pôde iniciar).
+        """
         task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
         if not task:
-            return
+            if results is not None:
+                with self.running_lock:
+                    results[task_name] = None
+            return None
 
         # v2025.10.11.31 — anti-sobreposição: check-and-add atômico
         with self.running_lock:
             if (task_name in self.running_processes
                     or task_name in self._launching_jobs):
-                self.after(0, lambda: messagebox.showwarning(
-                    "Já em execução",
-                    f"O job '{task_name}' já está em execução.\n"
-                    "Aguarde terminar para rodar de novo."))
-                return
+                if not batch:
+                    self.after(0, lambda: messagebox.showwarning(
+                        "Já em execução",
+                        f"O job '{task_name}' já está em execução.\n"
+                        "Aguarde terminar para rodar de novo."))
+                if results is not None:
+                    results[task_name] = None
+                return None
             self._launching_jobs.add(task_name)
 
-        self._set_ui_busy(True, f"Executando '{task['name']}'...")
+        if not batch:
+            self._set_ui_busy(True, f"Executando '{task['name']}'...")
 
         # Atualiza o status visual para "Rodando"
         self.after(0, lambda: self._set_task_running(task_name, True))
@@ -11641,24 +11727,30 @@ class App(_AppBase):
                     del self.running_processes[task_name]
                 else:
                     was_interrupted = True
+                if results is not None:
+                    results[task_name] = rc
 
             def finish():
                 # Atualiza o status visual para "Ativo" (preserva o visual de parada
                 # quando a tarefa foi interrompida manualmente pelo usuário)
                 if not was_interrupted:
                     self._set_task_running(task_name, False)
-                self._set_ui_busy(False)
+                if not batch:
+                    self._set_ui_busy(False)
                 self._update_stop_button_state()
                 self.draw_chart()
-                msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
-                messagebox.showinfo(
-                    "Execução",
-                    f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}"
-                )
+                if not batch:
+                    msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
+                    messagebox.showinfo(
+                        "Execução",
+                        f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}"
+                    )
 
             self.after(0, finish)
 
-        threading.Thread(target=worker, daemon=True).start()
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return t
 
     def _update_task_status(self, task_name, success):
         """Atualiza o status de uma tarefa na interface.
@@ -11722,62 +11814,24 @@ class App(_AppBase):
             if not self.running_processes:
                 self.after(0, lambda: self.btn_stop.config(state="disabled"))
 
-    def _monitor_tasks_completion(self, threads, task_names):
-        total = len(task_names)
-        completed = 0
-        success_count = 0
-        failed_count = 0
-        completion_shown = False
-        
-        # Função para atualizar o estado da tarefa de forma thread-safe
-        def task_completed(name, success):
-            nonlocal completed, success_count, failed_count, completion_shown
-            with threading.Lock():
-                completed += 1
-                if success:
-                    success_count += 1
-                else:
-                    failed_count += 1
-                
-                # Atualiza a UI na thread principal
-                self.after(0, lambda: self._update_task_status(name, success))
-                
-                # Atualiza a barra de progresso e status
-                progress = int((completed / total) * 100)
-                status = f"Concluído: {completed}/{total} | Sucesso: {success_count} | Falhas: {failed_count}"
-                self.after(0, lambda: self.set_status_line(status))
-                
-                # Atualiza a barra de progresso se existir
-                if hasattr(self, 'progress') and self.progress.winfo_exists():
-                    self.after(0, lambda: self.progress.config(value=progress))
-                
-                # Se todas as tarefas foram concluídas
-                if completed >= total and not completion_shown:
-                    completion_shown = True
-                    self.after(0, self._update_ui_after_completion, success_count, failed_count)
-        
-        # Inicia cada tarefa em uma thread separada
-        for task_name in task_names:
-            task = next((t for t in self.data["tasks"] if t["name"] == task_name), None)
-            if task:
-                def worker(task=task):
-                    try:
-                        rc, dur, log_path = run_task(task, self.data["settings"],
-                                             process_callback=self._register_process)
-                        append_history(self.data, task["name"], rc, dur)
-                        self._maybe_notify(task, rc, log_path)
-                        task_completed(task["name"], rc == 0)
-                    except Exception as e:
-                        print(f"Erro ao executar tarefa {task['name']}: {e}")
-                        task_completed(task["name"], False)
-                
-                threading.Thread(target=worker, daemon=True).start()
-            else:
-                print(f"Tarefa não encontrada: {task_name}")
-                task_completed(task_name, False)
-            
-            # Garante que o botão Interromper esteja ativado
-            self.after(100, self._update_stop_button_state)
+    def _monitor_tasks_completion(self, threads, task_names, results=None):
+        """v2025.10.11.33 — Monitor PURO: aguarda as threads worker já iniciadas por
+        run_multiple_tasks (via _run_single_task) terminarem e mostra o resumo
+        agregado. NÃO reexecuta os jobs (antes ele recriava workers e chamava
+        run_task de novo, causando execução em dobro).
+        """
+        for t in (threads or []):
+            try:
+                t.join()
+            except Exception:
+                pass
+
+        results = results or {}
+        # rc == 0 → sucesso; rc não-nulo e != 0 → falha; None → pulada/não encontrada
+        success_count = sum(1 for rc in results.values() if rc == 0)
+        failed_count = sum(1 for rc in results.values() if rc is not None and rc != 0)
+
+        self.after(0, self._update_ui_after_completion, success_count, failed_count)
 
     def open_settings(self):
         dlg = SettingsDialog(

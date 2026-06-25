@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 # ── versão sincronizada com agendador.py ─────────────────────────────────────
-APP_VERSION = "2025.10.11.32"
+APP_VERSION = "2025.10.11.33"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -67,6 +67,7 @@ def create_executable():
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
+        "--noconfirm",                 # << limpa dist/ anterior sem perguntar (build idempotente)
         "--onedir",                    # << pasta com tudo (não mais .exe único)
         "--windowed",
         "--noupx",                     # << evita UPX (AV trata UPX como suspeito)
