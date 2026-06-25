@@ -78,7 +78,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.31"   # << aumente em cada build
+APP_VERSION = "2025.10.11.32"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -11626,18 +11626,36 @@ class App(_AppBase):
                     self._launching_jobs.discard(task_name)
             append_history(self.data, task["name"], rc, dur)
             self._maybe_notify(task, rc, log_path)
-            
+
+            # v2025.10.11.32 — FIX: libera a entrada em running_processes ao concluir
+            # um disparo MANUAL de tarefa única. Sem isto, a entrada ficava presa para
+            # sempre e o anti-sobreposição do _job_wrapper pulava TODOS os disparos
+            # agendados seguintes (SKIP_OVERLAP) até o usuário clicar em "Parar".
+            # Feito aqui na thread do worker (DEPOIS de _maybe_notify, que usa a
+            # presença da entrada para detectar parada manual) para destravar o
+            # agendador independentemente da thread de UI. Espelha o on_task_end do
+            # _job_wrapper e o _update_task_status do caminho multi-tarefa.
+            was_interrupted = False
+            with self.running_lock:
+                if task_name in self.running_processes:
+                    del self.running_processes[task_name]
+                else:
+                    was_interrupted = True
+
             def finish():
-                # Atualiza o status visual para "Ativo"
-                self._set_task_running(task_name, False)
+                # Atualiza o status visual para "Ativo" (preserva o visual de parada
+                # quando a tarefa foi interrompida manualmente pelo usuário)
+                if not was_interrupted:
+                    self._set_task_running(task_name, False)
                 self._set_ui_busy(False)
+                self._update_stop_button_state()
                 self.draw_chart()
                 msg = "SUCESSO" if rc == 0 else f"FALHA (RC={rc})"
                 messagebox.showinfo(
-                    "Execução", 
+                    "Execução",
                     f"{task['name']}: {msg}\n\nDuração: {dur:.1f}s\nLog:\n{log_path}"
                 )
-            
+
             self.after(0, finish)
 
         threading.Thread(target=worker, daemon=True).start()
