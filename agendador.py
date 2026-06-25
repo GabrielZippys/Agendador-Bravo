@@ -86,7 +86,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.33"   # << aumente em cada build
+APP_VERSION = "2025.10.11.34"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -1530,9 +1530,33 @@ def append_history(data, task_name, rc, dur):
 #  Limpeza automática de logs
 # ======================================================================================
 
+def _rotate_sched_log(max_bytes: int = 5 * 1024 * 1024, backups: int = 3):
+    """v2025.10.11.34 — Rotaciona logs/_scheduler.log quando ultrapassa max_bytes.
+
+    O cleanup por idade (cleanup_logs) NUNCA remove esse arquivo, pois ele é
+    escrito continuamente (mtime sempre recente) — então crescia sem limite.
+    Mantém até `backups` arquivos .1.._N (que o glob '*.log' não pega). Best-effort.
+    """
+    try:
+        p = LOG_DIR / "_scheduler.log"
+        if not p.exists() or p.stat().st_size < max_bytes:
+            return
+        (LOG_DIR / f"_scheduler.log.{backups}").unlink(missing_ok=True)
+        for i in range(backups - 1, 0, -1):
+            src = LOG_DIR / f"_scheduler.log.{i}"
+            if src.exists():
+                src.replace(LOG_DIR / f"_scheduler.log.{i + 1}")
+        p.replace(LOG_DIR / "_scheduler.log.1")
+        print(f"[CLEANUP] _scheduler.log rotacionado (> {max_bytes // (1024*1024)} MB)")
+    except Exception as e:
+        print(f"[CLEANUP] falha ao rotacionar _scheduler.log: {e}")
+
+
 def cleanup_logs(settings):
     """Remove logs antigos baseado na configuração de limpeza."""
     print(f"[CLEANUP] Iniciando limpeza de logs @ {now_str()}")
+    # v2025.10.11.34 — rotaciona o _scheduler.log (cresce continuamente)
+    _rotate_sched_log()
     
     cleanup_cfg = settings.get("log_cleanup", {})
     if not cleanup_cfg.get("enabled", True):
@@ -1727,8 +1751,16 @@ def send_webhook(settings, subject, body, ok: bool):
     urls = cfg.get("urls", []) or []
     if isinstance(urls, str):
         urls = [u.strip() for u in urls.split(",") if u.strip()]
+    if not urls:
+        return
+
+    # v2025.10.11.34 — envia em PARALELO com timeout curto. Antes eram N requests
+    # sequenciais com timeout de 15s cada — N URLs lentas travavam o caller (e,
+    # via _maybe_notify, a thread do job, prendendo o anti-sobreposição) por minutos.
     errors = []
-    for url in urls:
+    err_lock = threading.Lock()
+
+    def _post(url):
         kind = _detect_webhook_kind(url)
         payload = _webhook_payload(kind, subject, body, ok)
         try:
@@ -1738,10 +1770,17 @@ def send_webhook(settings, subject, body, ok: bool):
                 headers={"Content-Type": "application/json", "User-Agent": "AgendadorBravo/1.0"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with urllib.request.urlopen(req, timeout=6) as r:
                 _ = r.read()
         except Exception as e:
-            errors.append(f"{kind}: {e}")
+            with err_lock:
+                errors.append(f"{kind}: {e}")
+
+    threads = [threading.Thread(target=_post, args=(u,), daemon=True) for u in urls]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
     if errors:
         raise RuntimeError("Webhook: " + " | ".join(errors))
 
@@ -3187,6 +3226,10 @@ class NotionSyncManager:
         self.app = app_ref
         self._lock = threading.Lock()
         self._pull_timer = None
+        # v2025.10.11.34 — coalescência de pushes: evita criar várias threads
+        # (e vários POSTs) para a MESMA task quando ela conclui em rajada.
+        self._pending_push = set()
+        self._pending_lock = threading.Lock()
         self.last_status = {"ok": True, "ts": "", "msg": "", "pushed": 0, "pulled": 0, "errors": 0}
 
     # ---- config helpers --------------------------------------------------------
@@ -3216,11 +3259,25 @@ class NotionSyncManager:
 
     # ---- push helpers ----------------------------------------------------------
     def push_task_async(self, task_name: str):
-        """Push 1 task pelo nome. Não bloqueia."""
+        """Push 1 task pelo nome. Não bloqueia.
+
+        v2025.10.11.34 — coalesce: se já há um push pendente para a MESMA task,
+        não cria outra thread (o push em andamento já enviará o estado atual).
+        """
         if not self.is_enabled():
             return
-        threading.Thread(target=self._push_task_sync,
-                         args=(task_name,), daemon=True).start()
+        with self._pending_lock:
+            if task_name in self._pending_push:
+                return
+            self._pending_push.add(task_name)
+
+        def _run():
+            try:
+                self._push_task_sync(task_name)
+            finally:
+                with self._pending_lock:
+                    self._pending_push.discard(task_name)
+        threading.Thread(target=_run, daemon=True).start()
 
     def push_all_async(self, on_done=None):
         if not self.is_enabled():
@@ -3236,7 +3293,7 @@ class NotionSyncManager:
                 return t
         return None
 
-    def _push_task_sync(self, task_name: str):
+    def _push_task_sync(self, task_name: str, persist: bool = True):
         # v2025.10.11.33 — não segurar self._lock durante a chamada de REDE.
         # Antes o lock cobria todo o update_page/create_page (timeout alto),
         # serializando e travando todos os pushes. Agora: snapshot sob lock →
@@ -3276,7 +3333,8 @@ class NotionSyncManager:
                 task = self._find_task(task_name) or task
                 if new_id != task.get("notion_page_id"):
                     task["notion_page_id"] = new_id
-                    save_data(self.app.data)
+                    if persist:  # v2025.10.11.34 — em lote, _push_all_sync salva 1x no fim
+                        save_data(self.app.data)
                 self.last_status.update({"ok": True, "ts": now_str(),
                                          "msg": f"Push OK: {task_name}",
                                          "pushed": self.last_status["pushed"] + 1})
@@ -3296,10 +3354,15 @@ class NotionSyncManager:
         pushed = errors = 0
         for t in tasks:
             try:
-                self._push_task_sync(t.get("name", ""))
+                self._push_task_sync(t.get("name", ""), persist=False)
                 pushed += 1
             except Exception:
                 errors += 1
+        # v2025.10.11.34 — persiste UMA vez no fim (antes: 1 save_data por task)
+        try:
+            save_data(self.app.data)
+        except Exception:
+            pass
         msg = f"Sincronizados {pushed}/{len(tasks)} jobs ({errors} erros)"
         if on_done:
             self.app.after(0, lambda: on_done(errors == 0, msg))
@@ -5753,14 +5816,38 @@ class SettingsDialog(tk.Toplevel):
 
             app = self.master  # App()
 
-            # Aplica SETTINGS (e reflete nos campos da tela)
+            # v2025.10.11.34 — valida estrutura antes de sobrescrever o estado em
+            # runtime (antes: aplicava JSON arbitrário, podendo corromper settings/tasks).
+            # Aplica SETTINGS por merge (mantém keys não presentes no backup).
             if new_settings:
-                app.data["settings"] = new_settings
-                self._apply_settings_to_vars(new_settings)
+                if not isinstance(new_settings, dict):
+                    messagebox.showwarning("Importar", "Campo 'settings' inválido (esperado objeto).")
+                    return
+                base = app.data.setdefault("settings", {})
+                base.update(new_settings)
+                self._apply_settings_to_vars(app.data["settings"])
 
-            # Aplica TASKS (reescalona)
+            # Aplica TASKS (valida estrutura mínima: lista de objetos com 'name')
             if new_tasks:
-                app.data["tasks"] = new_tasks
+                if not isinstance(new_tasks, list):
+                    messagebox.showwarning("Importar", "Campo 'tasks' inválido (esperado lista).")
+                    return
+                valid_tasks = [t for t in new_tasks if isinstance(t, dict) and t.get("name")]
+                skipped = len(new_tasks) - len(valid_tasks)
+                app.data["tasks"] = valid_tasks
+                if skipped:
+                    messagebox.showwarning(
+                        "Importar",
+                        f"{skipped} tarefa(s) ignorada(s) por estrutura inválida (sem 'name').")
+
+            # Garante todas as keys obrigatórias do schema atual (defaults).
+            _migrate_data_schema(app.data)
+            # v2025.10.11.34 — re-cifra segredos vindos do backup (DPAPI) para não
+            # persistir senha/token em texto puro no config.json.
+            try:
+                migrate_secrets_to_dpapi(app.data)
+            except Exception:
+                pass
 
             app.save(silent=True)
             app.refresh_table()
@@ -5782,7 +5869,9 @@ class SettingsDialog(tk.Toplevel):
         self.var_host.set(em.get("smtp_host", "smtp.gmail.com"))
         self.var_port.set(str(em.get("smtp_port", 587)))
         self.var_user.set(em.get("username", ""))
-        self.var_pass.set(em.get("password", ""))
+        # v2025.10.11.34 — senha pode vir cifrada (DPAPI) no backup; decifra como o
+        # construtor faz, senão o campo mostraria o blob 'dpapi::...' em vez da senha.
+        self.var_pass.set(dpapi_decrypt(em.get("password", "")) if em.get("password") else "")
         self.var_from.set(em.get("from_email", ""))
         self.var_to.set(",".join(em.get("to_emails", [])))
 
@@ -7433,6 +7522,10 @@ class App(_AppBase):
 
         # Limpeza de processos órfãos em background (psutil é lento)
         def _cleanup_bg():
+            try:
+                _rotate_sched_log()  # v2025.10.11.34 — evita _scheduler.log gigante
+            except Exception:
+                pass
             try:
                 cleanup_orphaned_python_processes()
             except Exception:
