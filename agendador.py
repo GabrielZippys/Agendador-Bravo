@@ -86,7 +86,7 @@ def start_net_monitor(app_ref, interval=NET_CHECK_EVERY_SEC, stable=NET_FLAP_STA
 # --- /CONECTIVIDADE ----------------------------------------------------------
 
 
-APP_VERSION = "2025.10.11.34"   # << aumente em cada build
+APP_VERSION = "2025.10.11.35"   # << aumente em cada build
 UPDATE_MANIFEST_URL = os.getenv(
     "AGENDADOR_UPDATE_MANIFEST",
     "https://raw.githubusercontent.com/GabrielZippys/Agendador-Bravo/main/update/manifest.json"
@@ -127,8 +127,14 @@ def find_logo_ico() -> Path | None:
 
 def _download(url: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # v2025.10.11.35 — streaming em blocos de 1 MB (não carrega o .zip inteiro,
+    # ~23 MB, de uma vez na RAM).
     with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
-        f.write(r.read())
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
 
 def _sha256(p: Path) -> str:
     h = hashlib.sha256()
@@ -2824,6 +2830,7 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
 
     if spawn:
         # inicia DETACHED escrevendo direto no log e retorna
+        log_fh = None
         try:
             log_fh = open(log_file, "a", encoding="utf-8", errors="ignore")
             log_fh.write(f"# {name} @ {now_str()} (spawn)\nCMD: {' '.join(cmd)}\n\n")
@@ -2843,15 +2850,19 @@ def run_task(task, settings, progress_cb=None, process_callback=None):
             _write_pid(task, proc.pid)
             if process_callback:
                 process_callback(proc, task['name'])
-            try:
-                log_fh.flush(); log_fh.close()
-            except Exception:
-                pass
             return 0, time.time() - start, str(log_file)
         except Exception as e:
             with open(log_file, "a", encoding="utf-8", errors="ignore") as f:
                 f.write("\n### ERRO ao iniciar em modo spawn:\n" + "".join(traceback.format_exception(e)))
             return -1, time.time() - start, str(log_file)
+        finally:
+            # v2025.10.11.35 — fecha o handle em TODOS os caminhos (o processo filho
+            # já herdou seu próprio handle). Antes vazava se o Popen falhasse.
+            if log_fh is not None:
+                try:
+                    log_fh.flush(); log_fh.close()
+                except Exception:
+                    pass
 
     # modo tradicional: stream da saída para o log, aguardando terminar
     with open(log_file, "w", encoding="utf-8", errors="ignore") as f:
@@ -4438,6 +4449,20 @@ class CalendarDayView(tk.Toplevel):
         now_hh = datetime.now().hour
         now_mm = datetime.now().minute
 
+        # v2025.10.11.35 — parse tolerante de "HH:MM": uma chave malformada (horário
+        # digitado errado num job) não quebra mais o desenho inteiro do calendário.
+        def _slot_hh(k):
+            try:
+                return int(str(k).split(":")[0])
+            except Exception:
+                return -1
+
+        def _slot_mm(k):
+            try:
+                return int(str(k).split(":")[1])
+            except Exception:
+                return 0
+
         for h in range(24):
             y = 20 + h * (row_h + 6)
             # hora label
@@ -4460,11 +4485,11 @@ class CalendarDayView(tk.Toplevel):
 
             # jobs dessa hora
             slots_this_hour = sorted([(k, v) for k, v in buckets.items()
-                                       if int(k.split(":")[0]) == h],
+                                       if _slot_hh(k) == h],
                                       key=lambda x: x[0])
             x_offset = margin_l + 10
             for slot_key, jobs in slots_this_hour:
-                mm = int(slot_key.split(":")[1])
+                mm = _slot_mm(slot_key)
                 slot_y = y + (mm / 60.0) * (row_h + 6)
                 count = len(jobs)
                 is_conflict = count >= 3
@@ -6296,11 +6321,24 @@ class SettingsDialog(tk.Toplevel):
             if n == 0:
                 self._logs_status_lbl.config(text="Pasta vazia. Nenhum log gerado ainda.")
                 return
-            total_bytes = sum(p.stat().st_size for p in files)
+            # v2025.10.11.35 — 1 stat() por arquivo (antes ~5x → travava ao abrir
+            # Configurações em pastas com muitos logs).
+            infos = []
+            for p in files:
+                try:
+                    st = p.stat()
+                    infos.append((p, st.st_size, st.st_mtime))
+                except Exception:
+                    pass
+            if not infos:
+                self._logs_status_lbl.config(text="Pasta vazia. Nenhum log gerado ainda.")
+                return
+            n = len(infos)
+            total_bytes = sum(sz for _, sz, _ in infos)
             mb = total_bytes / (1024 * 1024)
             # mais antigo
-            oldest = min(files, key=lambda p: p.stat().st_mtime)
-            oldest_dt = datetime.fromtimestamp(oldest.stat().st_mtime)
+            _, _, oldest_mt = min(infos, key=lambda x: x[2])
+            oldest_dt = datetime.fromtimestamp(oldest_mt)
             age_days = (datetime.now() - oldest_dt).days
 
             try:
@@ -6308,9 +6346,9 @@ class SettingsDialog(tk.Toplevel):
             except Exception:
                 keep_days = 7
             from datetime import timedelta as _td
-            cutoff = datetime.now() - _td(days=keep_days)
-            to_remove = [p for p in files if datetime.fromtimestamp(p.stat().st_mtime) < cutoff]
-            to_remove_mb = sum(p.stat().st_size for p in to_remove) / (1024 * 1024)
+            cutoff_ts = (datetime.now() - _td(days=keep_days)).timestamp()
+            to_remove = [(p, sz) for p, sz, mt in infos if mt < cutoff_ts]
+            to_remove_mb = sum(sz for _, sz in to_remove) / (1024 * 1024)
 
             # Próxima limpeza agendada
             try:
@@ -7056,7 +7094,17 @@ class App(_AppBase):
             print(f"[scheduler] listener falhou: {_e}")
         self.jobs = {}
         # Estado de rede / fila de updates
-        self.net_online = is_online()
+        # v2025.10.11.35 — não bloquear o boot até 2s no is_online() síncrono.
+        # Assume online e confirma em background (on_net_status_change roda na main
+        # thread via after; o net monitor também mantém o estado atualizado depois).
+        self.net_online = True
+        def _initial_net_check():
+            ok = is_online()
+            try:
+                self.after(0, lambda: self.on_net_status_change(ok))
+            except Exception:
+                pass
+        threading.Thread(target=_initial_net_check, daemon=True, name="net-initial").start()
         self._update_processing = False
         self.update_queue = self.data.setdefault("update_queue", [])  # persiste no JSON
         
@@ -8254,6 +8302,30 @@ class App(_AppBase):
         self._set_ui_busy(False)
         self.draw_chart()
     
+    def _shutdown_services(self):
+        """v2025.10.11.35 — encerra serviços de fundo no fechamento (best-effort):
+        scheduler, watchers, monitor do Showtime, timer de pull do Notion e o
+        servidor REST. Antes só o scheduler era parado."""
+        try:
+            self.scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+        for attr, meth in (("_watcher_mgr", "stop_all"),
+                           ("_showtime_monitor", "stop"),
+                           ("notion_sync", "stop_periodic")):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    getattr(obj, meth)()
+                except Exception:
+                    pass
+        srv = getattr(self, "_rest_server", None)
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
+
     def on_close(self):
         # Verifica se há tarefas em execução
         with self.running_lock:
@@ -8310,12 +8382,9 @@ class App(_AppBase):
                     # Aguarda um pouco para as tarefas serem interrompidas
                     time.sleep(1)
                     
-                    # Fecha o agendador
-                    try:
-                        self.scheduler.shutdown(wait=False)
-                    except Exception:
-                        pass
-                    
+                    # Fecha o agendador e demais serviços de fundo
+                    self._shutdown_services()
+
                     # Fecha a janela de progresso e a aplicação (na thread principal)
                     self.after(0, lambda: progress_win.destroy())
                     self.after(100, self.destroy)
@@ -8331,10 +8400,7 @@ class App(_AppBase):
             # sem interromper as tarefas em execução
         
         # Se não houver tarefas em execução ou se o usuário escolheu "Não"
-        try:
-            self.scheduler.shutdown(wait=False)
-        except Exception:
-            pass
+        self._shutdown_services()
         self.destroy()
 
     # ===== agendamento =====
